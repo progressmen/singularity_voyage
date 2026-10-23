@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "license": "MIT",
   "description": "Singularity Voyage: an agent platform composed on the DeepSeek Harness (dsh)",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

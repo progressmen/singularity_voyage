@@ -73,6 +73,7 @@ const MIME: Record<string, string> = {
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
 }
 
 const BODY_LIMIT = 1 << 20
@@ -549,6 +550,10 @@ export function registerSvRoutes(
         }
         if (req.method === 'GET' && path === '/sv/app.css') {
           await serveStatic(res, 'app.css')
+          return
+        }
+        if (req.method === 'GET' && path === '/sv/icon.png') {
+          await serveStatic(res, 'icon.png')
           return
         }
         if (path.startsWith('/sv/api/')) {

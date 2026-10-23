@@ -468,9 +468,3 @@ export function apply(ctx: Context): void {
 - [DeepSeek Harness 文档](https://deepseek-harness.github.io/deepseek-harness/)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - 本地 harness 源码：`~/project/deepseek-harness-dsh-v0.2.1-rc.2`
-
----
-
-## 9. 许可证
-
-本项目采用 [MIT License](LICENSE) 开源。
