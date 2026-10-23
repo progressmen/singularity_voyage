@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Singularity Voyage</title>
+  <script>
+    // 首屏渲染前应用主题，避免深/浅色闪烁（system 按操作系统偏好解析）
+    (function () {
+      try {
+        var pref = localStorage.getItem('sv.theme')
+        var light = pref === 'light' || (pref !== 'dark' && window.matchMedia('(prefers-color-scheme: light)').matches)
+        document.documentElement.dataset.theme = light ? 'light' : 'dark'
+        document.documentElement.style.colorScheme = light ? 'light' : 'dark'
+      } catch (error) { /* localStorage 不可用时保持默认深色 */ }
+    })()
+  </script>
+  <link rel="stylesheet" href="/sv/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="brand-mark">SV</span>
+        <span class="brand-name">Singularity Voyage</span>
+      </div>
+
+      <nav class="side-nav">
+        <button class="nav-item" id="new-chat" data-view="chat">
+          <span class="nav-icon" aria-hidden="true">＋</span>
+          <span class="nav-label">新建会话</span>
+        </button>
+        <button class="nav-item" id="tab-tasks" data-view="tasks">
+          <span class="nav-icon" aria-hidden="true">☑</span>
+          <span class="nav-label">待办</span>
+        </button>
+        <button class="nav-item" id="tab-memory" data-view="memory">
+          <span class="nav-icon" aria-hidden="true">◍</span>
+          <span class="nav-label">记忆</span>
+        </button>
+        <button class="nav-item" id="tab-logs" data-view="logs">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          <span class="nav-label">日志</span>
+        </button>
+      </nav>
+
+      <div class="side-section starred" id="section-starred" hidden>
+        <button class="side-section-head" type="button" id="toggle-starred" aria-expanded="true">
+          <span>星标会话<span class="side-count" id="starred-count"></span></span>
+          <span class="side-caret" aria-hidden="true">▾</span>
+        </button>
+        <nav class="conversations" id="starred-conversations"></nav>
+      </div>
+
+      <div class="side-section" id="section-history">
+        <button class="side-section-head" type="button" id="toggle-history" aria-expanded="true">
+          <span>历史会话<span class="side-count" id="conv-count"></span></span>
+          <span class="side-caret" aria-hidden="true">▾</span>
+        </button>
+        <nav class="conversations" id="conversations"></nav>
+      </div>
+
+      <div class="sidebar-foot">
+        <div class="status-chips">
+          <span class="chip" id="chip-model" title="模型">…</span>
+          <span class="chip" id="chip-search" title="搜索">…</span>
+        </div>
+        <button class="btn btn-ghost" id="open-settings">⚙ 设置</button>
+      </div>
+    </aside>
+
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="btn btn-ghost icon-only" id="toggle-sidebar" title="收起/展开侧栏">☰</button>
+        <div class="topbar-title" id="topbar-title">新对话</div>
+        <div class="topbar-status" id="topbar-status"></div>
+      </header>
+      <section class="messages" id="messages"></section>
+
+      <section class="panel" id="panel-tasks" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>待办与提醒</h2>
+            <label class="panel-toggle"><input type="checkbox" id="tasks-show-done"> 显示已完成</label>
+          </div>
+          <div class="mail-quick">
+            <label class="switch" title="开启/关闭邮件提醒">
+              <input type="checkbox" id="mail-quick-toggle">
+              <span class="switch-track" aria-hidden="true"></span>
+            </label>
+            <span class="mail-quick-label">邮件提醒</span>
+            <span class="mail-quick-status" id="mail-quick-status">检查中…</span>
+            <button type="button" class="btn btn-ghost mail-quick-btn" id="mail-quick-settings">详细设置</button>
+          </div>
+          <form class="panel-form" id="task-form">
+            <input id="task-title" placeholder="要做什么…" maxlength="120" required>
+            <input id="task-due" type="datetime-local">
+            <select id="task-recurrence">
+              <option value="none">不重复</option>
+              <option value="daily">每天</option>
+              <option value="weekly">每周</option>
+            </select>
+            <button class="btn btn-primary" type="submit">添加</button>
+          </form>
+          <div class="panel-list" id="tasks-list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-memory" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>长期记忆</h2>
+            <input id="memory-search" class="memory-search" placeholder="搜索记忆…">
+          </div>
+          <div class="memory-kind-filter" id="memory-kind-filter">
+            <button class="kchip active" data-kind="">全部</button>
+            <button class="kchip" data-kind="fact">事实</button>
+            <button class="kchip" data-kind="preference">偏好</button>
+            <button class="kchip" data-kind="person">人物</button>
+            <button class="kchip" data-kind="project">项目</button>
+            <button class="kchip" data-kind="decision">决定</button>
+          </div>
+          <form class="panel-form" id="memory-form">
+            <select id="memory-kind">
+              <option value="fact">事实</option>
+              <option value="preference">偏好</option>
+              <option value="person">人物</option>
+              <option value="project">项目</option>
+              <option value="decision">决定</option>
+            </select>
+            <input id="memory-text" placeholder="记住一条…（如：住在上海，习惯晚上工作）" maxlength="500" required>
+            <button class="btn btn-primary" type="submit">记住</button>
+          </form>
+          <div class="panel-list" id="memory-list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-logs" hidden>
+        <div class="panel-inner panel-inner-wide">
+          <div class="panel-head">
+            <h2>运行日志</h2>
+            <select id="log-file" class="log-select"></select>
+            <button class="btn btn-ghost" type="button" id="log-refresh">刷新</button>
+            <label class="panel-toggle"><input type="checkbox" id="log-follow" checked> 自动刷新</label>
+          </div>
+          <div class="memory-kind-filter" id="log-level-filter">
+            <button class="kchip active" data-level="">全部</button>
+            <button class="kchip" data-level="error">错误</button>
+            <button class="kchip" data-level="warn">警告</button>
+            <button class="kchip" data-level="info">信息</button>
+            <input id="log-search" class="memory-search" placeholder="搜索日志…">
+          </div>
+          <div class="log-meta" id="log-meta"></div>
+          <pre class="log-view" id="log-view"></pre>
+        </div>
+      </section>
+
+      <footer class="composer" id="composer">
+        <div class="composer-box">
+          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+          <button class="btn btn-primary send" id="send" title="发送">➤</button>
+          <button class="btn btn-danger stop" id="stop" title="停止" hidden>■</button>
+        </div>
+        <div class="composer-hint">回答由 AI 生成，请注意甄别；联网搜索结果由 web_search 工具提供。</div>
+      </footer>
+    </main>
+  </div>
+
+  <dialog class="settings" id="settings">
+    <form method="dialog" class="settings-form">
+      <h2>设置</h2>
+
+      <section class="settings-section">
+        <h3>外观</h3>
+        <label class="field">
+          <span>主题</span>
+          <select id="cfg-theme">
+            <option value="system">跟随系统</option>
+            <option value="dark">深色</option>
+            <option value="light">浅色</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h3>模型（OpenAI 兼容 API）</h3>
+        <label class="field">
+          <span>供应商预设</span>
+          <select id="cfg-llm-provider">
+            <option value="deepseek">DeepSeek</option>
+            <option value="qwen">通义千问（阿里云百炼）</option>
+            <option value="ark">火山方舟（豆包）</option>
+            <option value="openai">OpenAI</option>
+            <option value="custom">自定义（手填端点与模型）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>API 根地址</span>
+          <input id="cfg-llm-base" type="url" placeholder="https://api.deepseek.com" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input id="cfg-llm-key" type="password" placeholder="留空表示不修改" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>模型 ID</span>
+          <input id="cfg-llm-model" list="model-list" placeholder="deepseek-chat" spellcheck="false">
+          <datalist id="model-list"></datalist>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>上下文窗口（可选）</span>
+            <input id="cfg-llm-ctx" type="number" min="1" step="1" placeholder="如 131072">
+          </label>
+          <label class="field">
+            <span>输出上限（可选）</span>
+            <input id="cfg-llm-max" type="number" min="1" step="1" placeholder="如 8192">
+          </label>
+        </div>
+        <div class="section-actions">
+          <button type="button" class="btn btn-ghost" id="test-llm">测试模型连通</button>
+          <button type="button" class="btn btn-ghost" id="fetch-models">拉取模型列表</button>
+          <span class="test-result" id="test-llm-result"></span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Web 搜索</h3>
+        <label class="field">
+          <span>提供方</span>
+          <select id="cfg-search-provider">
+            <option value="tavily">Tavily 兼容 API</option>
+            <option value="bocha">博查（Bocha）原生 API</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>API 根地址</span>
+          <input id="cfg-search-base" type="url" placeholder="https://api.tavily.com" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input id="cfg-search-key" type="password" placeholder="留空表示不修改" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="field" id="cfg-search-freshness-field" hidden>
+          <span>时效过滤（博查 freshness）</span>
+          <select id="cfg-search-freshness">
+            <option value="noLimit">不限</option>
+            <option value="oneDay">一天内</option>
+            <option value="oneWeek">一周内</option>
+            <option value="oneMonth">一月内</option>
+            <option value="oneYear">一年内</option>
+          </select>
+        </label>
+        <details class="advanced">
+          <summary>高级：失败重试（重试耗尽后报错，不静默换通路）</summary>
+          <div class="field-row">
+            <label class="field">
+              <span>额外重试次数</span>
+              <input id="cfg-search-retry" type="number" min="1" step="1" placeholder="2">
+            </label>
+            <label class="field">
+              <span>单次超时（ms）</span>
+              <input id="cfg-search-timeout" type="number" min="1" step="1" placeholder="15000">
+            </label>
+            <label class="field">
+              <span>重试总预算（ms）</span>
+              <input id="cfg-search-budget" type="number" min="1" step="1" placeholder="30000">
+            </label>
+          </div>
+        </details>
+        <div class="section-actions">
+          <button type="button" class="btn btn-ghost" id="test-search">测试搜索（消耗少量配额）</button>
+          <span class="test-result" id="test-search-result"></span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>邮件提醒（SMTP）</h3>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-mail-enabled">
+          <span>启用邮件通知</span>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>SMTP 主机</span>
+            <input id="cfg-mail-host" placeholder="smtp.qq.com" spellcheck="false">
+          </label>
+          <label class="field field-narrow">
+            <span>端口</span>
+            <input id="cfg-mail-port" type="number" min="1" max="65535" step="1" placeholder="465">
+          </label>
+        </div>
+        <label class="field">
+          <span>加密方式</span>
+          <select id="cfg-mail-secure">
+            <option value="ssl">SSL 直连（465）</option>
+            <option value="starttls">STARTTLS（587）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>账号</span>
+          <input id="cfg-mail-user" placeholder="you@qq.com" spellcheck="false" autocomplete="username">
+        </label>
+        <label class="field">
+          <span>应用专用密码</span>
+          <input id="cfg-mail-pass" type="password" placeholder="留空表示不修改" spellcheck="false" autocomplete="off">
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>发件人（可选）</span>
+            <input id="cfg-mail-from" placeholder="默认同账号" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>收件人</span>
+            <input id="cfg-mail-to" placeholder="默认同账号" spellcheck="false">
+          </label>
+        </div>
+        <div class="settings-subhead">提醒类型</div>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-mail-reminder">
+          <span>定时提醒：待办到期时立即发邮件</span>
+        </label>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-mail-digest-enabled">
+          <span>超时提醒：逾期未完成的任务汇总进每日摘要（不单独发信）</span>
+        </label>
+        <label class="field">
+          <span>每日摘要发送时间（需勾选上一项）</span>
+          <input id="cfg-mail-digest" type="time">
+        </label>
+        <div class="section-actions">
+          <button type="button" class="btn btn-ghost" id="test-mail">发送测试邮件</button>
+          <span class="test-result" id="test-mail-result"></span>
+        </div>
+      </section>
+
+      <div class="settings-actions">
+        <span class="settings-error" id="settings-error"></span>
+        <button type="button" class="btn btn-ghost" id="settings-cancel">取消</button>
+        <button type="button" class="btn btn-primary" id="settings-save">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="confirm" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <div class="confirm-panel">
+      <div class="confirm-head">
+        <span class="confirm-icon" aria-hidden="true">!</span>
+        <h2 class="confirm-title" id="confirm-title">确认操作</h2>
+      </div>
+      <p class="confirm-text" id="confirm-text"></p>
+      <div class="confirm-actions">
+        <button type="button" class="btn btn-ghost" id="confirm-cancel">取消</button>
+        <button type="button" class="btn btn-danger" id="confirm-ok">删除</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/sv/trace.js"></script>
+  <script src="/sv/app.js"></script>
+</body>
+</html>

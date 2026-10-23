@@ -1,0 +1,11 @@
+node_modules/
+lib/
+.venv/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.DS_Store
+.env
+.dsh/
+logs/
+.pids/

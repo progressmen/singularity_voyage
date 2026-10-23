@@ -1,0 +1,106 @@
+# Singularity Voyage 组合包：叠放在 dsh-base + dsh-web-app 之上的第三层 patch。
+#
+# patch 按 id 定位条目并替换其整个 `config`（不做深合并）；本文件只改动
+# SV 需要的行，并插入 SV 自己的行。
+
+# 为 SV 会话（无 preset 的 agent）设置产品人格；Web UI 的 preset 会话
+# 拥有自己的 persona，会整体替换这些段落，互不影响。
+- id: system-prompt
+  config:
+    personaPrefix: >-
+      You are Singularity Voyage, a helpful general-purpose agent powered by
+      the {{model}} model. You answer in the user's language, think step by
+      step when needed, and use the web_search tool for questions that benefit
+      from up-to-date information.
+
+# web_search 走 SV 自有的搜索提供方（协议由 SV_SEARCH_PROVIDER / WEB_SEARCH_PROVIDER
+# 环境变量决定：tavily 或 bocha）；web_fetch 继续使用匿名 HTTP 抓取后端。
+- id: web
+  config:
+    searchProvider: sv-search
+    fetchProvider: http
+
+# 不服务 dsh 官方 Web UI：本产品只暴露 /sv 自建前端页面，通过桥接 API
+# （/sv/api/*）与 harness 交互。web-runtime 负责官方前端 dist 与 URL 行，
+# 禁用后 / 根路径由 sv-app 的重定向路由接管。
+- id: web-runtime
+  disabled: true
+
+# harness-dev-context 依赖官方 Web 前端（service: webApp），随其一并禁用。
+- id: harness-dev-context
+  disabled: true
+
+# dsh-web-app 在宿主层禁用了 skill 发现与 skill 工具（官方 Web UI 由 preset
+# 自行挂载）。SV 会话不带 preset，因此这里重新启用宿主层这两行：
+# skill-filesystem 扫描 <projectRoot>/.dsh/skills 与 <projectRoot>/.agents/skills，
+# tool-skill 把 skill 目录与 skill 工具交给模型。
+- id: skill-filesystem
+  disabled: false
+
+- id: tool-skill
+  disabled: false
+
+- insert:
+    # 宿主层的 web 工具，供 SV 会话（无 preset）使用。Web UI 的 preset 会话
+    # 各自挂载作用域内的 tool-web，作用域注册遮蔽同名全局工具，互不冲突。
+    - id: sv-tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        fetch: true
+        searchTimeoutMs: 60000
+
+    # SV 邮件 MCP 服务（Python 标准库实现 stdio，见 mcp/sv-mail-mcp/）。
+    # 模型获得 mcp__sv-mail__send_email / mcp__sv-mail__mail_status 两个工具；
+    # sv-app 的待办提醒与每日摘要复用同一份 mailer.py，配置统一读写
+    # $DSH_HOME/sv/config.json 的 mail 节（/sv 设置页）。
+    # 子进程环境会抹掉 DSH_* 与 KEY/PASSWORD/SECRET/TOKEN 形状的变量，
+    # 因此这里显式透传 SV_HOME 与 SV_MAIL_*。
+    - id: sv-mcp-mail
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sv-mail
+        transport: stdio
+        command: !!js process.env.SV_MAIL_PYTHON || 'python3'
+        args:
+          - mcp/sv-mail-mcp/server.py
+        cwd: !!js process.cwd()
+        failOnStartupError: true
+        env:
+          SV_HOME: !!js process.env.SV_HOME ?? ''
+          DSH_HOME: !!js process.env.DSH_HOME ?? ''
+          SV_MAIL_HOST: !!js process.env.SV_MAIL_HOST ?? ''
+          SV_MAIL_PORT: !!js process.env.SV_MAIL_PORT ?? ''
+          SV_MAIL_SECURE: !!js process.env.SV_MAIL_SECURE ?? ''
+          SV_MAIL_USER: !!js process.env.SV_MAIL_USER ?? ''
+          SV_MAIL_PASSWORD: !!js process.env.SV_MAIL_PASSWORD ?? ''
+          SV_MAIL_FROM: !!js process.env.SV_MAIL_FROM ?? ''
+          SV_MAIL_TO: !!js process.env.SV_MAIL_TO ?? ''
+
+    # SV 股票行情 MCP 服务（Python + akshare，见 mcp/sv-stock-mcp/）。
+    # 模型获得 mcp__sv-stock__stock_search / stock_quote / stock_history /
+    # index_history / market_overview / industry_rank 六个只读工具。
+    # 行情来自公开接口（新浪/腾讯/东财），有几十秒到 1 分钟延迟；
+    # 依赖装在 mcp/sv-stock-mcp/.venv，可用 SV_STOCK_PYTHON 覆盖解释器。
+    - id: sv-mcp-stock
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: sv-stock
+        transport: stdio
+        command: !!js process.env.SV_STOCK_PYTHON || process.cwd() + '/mcp/sv-stock-mcp/.venv/bin/python'
+        args:
+          - mcp/sv-stock-mcp/server.py
+        cwd: !!js process.cwd()
+        failOnStartupError: true
+        toolCallTimeoutMs: 120000
+        env:
+          SV_HOME: !!js process.env.SV_HOME ?? ''
+          DSH_HOME: !!js process.env.DSH_HOME ?? ''
+
+    # SV 宿主插件：自定义 LLM 适配器、搜索提供方、聊天服务与 /sv 页面。
+    - id: sv-app
+      name: '@singularity-voyage/sv-app'
+      config:
+        llmProvider: !!js process.env.SV_LLM_PROVIDER || ''
+        llmBaseURL: !!js process.env.SV_LLM_BASE_URL ?? 'https://api.deepseek.com'
+        llmModel: !!js process.env.SV_LLM_MODEL ?? 'deepseek-chat'
+        searchProvider: !!js process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER ?? 'tavily'

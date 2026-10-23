@@ -1,0 +1,45 @@
+{
+  "name": "@singularity-voyage/sv-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Singularity Voyage bundle: custom OpenAI-compatible LLM adapter, Tavily-compatible web search provider, chat service, and the /sv web surface",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./web/*": "./web/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "web",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/vendor/cordis",
+    "@deepseek-ai/dsh-agent": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/agent",
+    "@deepseek-ai/dsh-host-webserver": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/host/webserver",
+    "@deepseek-ai/dsh-llm": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm",
+    "@deepseek-ai/dsh-session": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session",
+    "@deepseek-ai/dsh-system-prompt": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/system-prompt",
+    "@deepseek-ai/dsh-tools": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/tools",
+    "@deepseek-ai/dsh-web": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/web/web",
+    "@types/node": "^22.20.1",
+    "@types/pg": "^8.23.1",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}

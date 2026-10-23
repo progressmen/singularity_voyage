@@ -1,0 +1,22 @@
+{
+  "name": "singularity-voyage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Singularity Voyage: an agent platform composed on the DeepSeek Harness (dsh)",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @singularity-voyage/sv-app run build",
+    "typecheck": "tsc -p packages/sv-app/tsconfig.json",
+    "test": "node --experimental-transform-types --test packages/sv-app/test/sessions-store.test.ts packages/sv-app/test/config-presets.test.ts packages/sv-app/test/search-retry.test.ts packages/sv-app/test/chat-tool-events.test.ts packages/sv-app/test/memory-store.test.ts packages/sv-app/test/tasks-store.test.ts packages/sv-app/test/memory-extractor.test.ts packages/sv-app/test/mail-notifier.test.ts packages/sv-app/test/log.test.ts packages/sv-app/web/trace.test.mjs",
+    "setup": "node scripts/setup-profile.mjs",
+    "dev": "export DSH_HOME=\"${DSH_HOME:-$(pwd)/.dsh}\"; DSH_SRC=\"${DSH_SRC:-../deepseek-harness-dsh-v0.2.1-rc.2}\"; node \"$DSH_SRC/apps/cli/lib/bin.js\" --profile sv --port 7000 --no-open"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^6.0.3"
+  }
+}

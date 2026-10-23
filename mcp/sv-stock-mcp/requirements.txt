@@ -1,0 +1,2 @@
+# sv-stock-mcp 依赖（固定验证过的 akshare 版本，上游接口变动频繁）
+akshare==1.19.1
