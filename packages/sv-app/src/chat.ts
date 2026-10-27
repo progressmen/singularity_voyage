@@ -16,11 +16,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { defaultContextWindow } from './config-store.ts'
 import type { ConfigStore } from './config-store.ts'
 import { SV_PROVIDER_ID } from './llm-adapter.ts'
 import { svError, svLog } from './log.ts'
-import type { SvSessionStore, TranscriptToolEntry } from './sessions-store.ts'
+import type { SessionUsage, SvSessionStore, TranscriptToolEntry } from './sessions-store.ts'
 
 /** 转发给页面的 SSE 事件。 */
 export type SvChatEvent =
@@ -41,6 +43,7 @@ export type SvChatEvent =
     durationMs?: number
   }
   | { type: 'message'; text: string; reasoning: string }
+  | { type: 'usage'; usage: SessionUsage }
   | { type: 'error'; message: string }
   | { type: 'done' }
 
@@ -65,6 +68,13 @@ function clip(value: unknown, max = CLIP_BYTES): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`
 }
 
+/** 把一段文本追加到累计值；空段忽略，段间以空行分隔。 */
+function appendBlock(target: string, chunk: string): string {
+  const text = chunk.trim()
+  if (text.length === 0) return target
+  return target.length === 0 ? text : `${target}\n\n${text}`
+}
+
 /** 一轮对话结束后的回调输入（用于异步记忆抽取）。 */
 export interface ChatTurnComplete {
   sessionId: string
@@ -83,16 +93,24 @@ interface LiveSession {
   agent: Agent
   sinks: Set<(event: SvChatEvent) => void>
   status: 'running' | 'idle'
+  /** 当前 assistant 消息的文本缓冲（start 帧清空）。 */
   textBuf: string
+  /** 当前 assistant 消息的思考缓冲（start 帧清空）。 */
   reasoningBuf: string
   /** callId → 工具开始信息（name / 起始时间 / 参数摘要）。 */
   pendingTools: Map<string, { name: string; startTs: number; args: string }>
-  /** 本轮 assistant 消息内完成的工具摘要（供 transcript）。 */
+  /** 本轮（用户消息 → agent 空闲）累计的 assistant 文本。 */
+  turnText: string
+  /** 本轮累计的思考过程；多条 assistant 消息之间以空行合并。 */
+  turnReasoning: string
+  /** 本轮完成的工具摘要（跨多条 assistant 消息，供 transcript）。 */
   turnTools: TranscriptToolEntry[]
   /** 本轮开始时间（ms），用于日志里的耗时。 */
   turnStartTs: number
   /** 本轮用户输入字符数（日志只记长度，不记正文）。 */
   turnUserChars: number
+  /** 会话累计 token 统计与上下文占用（resume 时从索引恢复）。 */
+  usage?: SessionUsage
 }
 
 export class ChatManager {
@@ -204,12 +222,43 @@ export class ChatManager {
     }
   }
 
+  /** 当前会话的上下文窗口：设置页配置优先，否则按供应商预设估算。 */
+  private contextWindow(): number | undefined {
+    const configured = this.store.llm.contextWindow
+    if (configured !== undefined && configured > 0) return configured
+    return defaultContextWindow(this.store.llm.provider)
+  }
+
+  /**
+   * 累计一次模型请求的 token 统计并推送快照。
+   * 上下文占用取本次请求的 prompt 总量（非缓存输入 + 缓存读写），
+   * 与 dsh 的 TokenUsage 口径一致（各计数互不包含）。
+   */
+  private accumulateUsage(rec: LiveSession, usage: TokenUsage): void {
+    const prev = rec.usage
+    const cacheRead = usage.cacheReadTokens ?? 0
+    const cacheWrite = usage.cacheWriteTokens ?? 0
+    // provider 未给 total 时按「prompt + completion」口径自行合成
+    const total = usage.totalTokens ?? usage.inputTokens + cacheRead + cacheWrite + usage.outputTokens
+    const contextWindow = this.contextWindow()
+    rec.usage = {
+      inputTokens: (prev?.inputTokens ?? 0) + usage.inputTokens,
+      outputTokens: (prev?.outputTokens ?? 0) + usage.outputTokens,
+      cacheReadTokens: (prev?.cacheReadTokens ?? 0) + cacheRead,
+      totalTokens: (prev?.totalTokens ?? 0) + total,
+      contextTokens: usage.inputTokens + cacheRead + cacheWrite,
+      ...contextWindow === undefined ? {} : { contextWindow },
+      updatedAt: Date.now(),
+    }
+    this.emit(rec, { type: 'usage', usage: rec.usage })
+  }
+
   private onStreamFrame(rec: LiveSession, frame: AssistantStreamFrame): void {
     switch (frame.type) {
       case 'start':
+        // 只清当前消息缓冲；本轮累计（文本 / 思考 / 工具）跨消息保留
         rec.textBuf = ''
         rec.reasoningBuf = ''
-        rec.turnTools = []
         break
       case 'chunk': {
         const chunk = frame.chunk
@@ -224,6 +273,8 @@ export class ChatManager {
           const args = clip(chunk.block.arguments)
           rec.pendingTools.set(callId, { name: chunk.block.name, startTs: Date.now(), args })
           this.emit(rec, { type: 'tool', callId, name: chunk.block.name, phase: 'start', args })
+        } else if (chunk.type === 'usage') {
+          this.accumulateUsage(rec, chunk.usage)
         } else if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
           this.ctx.logger.warn(svLog('chat', 'turn_failed', {
             sessionId: rec.sessionId,
@@ -237,23 +288,11 @@ export class ChatManager {
       }
       case 'end':
         if (frame.outcome.kind === 'committed' && frame.outcome.eventType === 'assistant/message') {
-          this.emit(rec, { type: 'message', text: rec.textBuf, reasoning: rec.reasoningBuf })
-          // 只记元信息（长度、耗时、工具数），不落问答正文。
-          this.ctx.logger.info(svLog('chat', 'turn_completed', {
-            sessionId: rec.sessionId,
-            model: this.store.llm.model,
-            userChars: rec.turnUserChars,
-            replyChars: rec.textBuf.length,
-            tools: rec.turnTools.length,
-            durationMs: rec.turnStartTs === 0 ? 0 : Date.now() - rec.turnStartTs,
-          }))
-          void this.sessions.recordAssistant(rec.sessionId, rec.textBuf, rec.reasoningBuf, rec.turnTools)
-            .catch(error => {
-              this.ctx.logger.warn(svLog('chat', 'transcript_record_failed', {
-                sessionId: rec.sessionId,
-                err: svError(error),
-              }))
-            })
+          // 一轮可能有多条 assistant 消息（工具调用前后各一条）：
+          // 按轮累计文本与思考，页面只看到一段合并后的 assistant 消息。
+          rec.turnText = appendBlock(rec.turnText, rec.textBuf)
+          rec.turnReasoning = appendBlock(rec.turnReasoning, rec.reasoningBuf)
+          this.emit(rec, { type: 'message', text: rec.turnText, reasoning: rec.turnReasoning })
         }
         break
     }
@@ -261,18 +300,25 @@ export class ChatManager {
 
   /** 取得（或创建/恢复）一个 SV 会话。 */
   async ensure(requested?: string): Promise<string> {
-    const newRec = (sessionId: string): LiveSession => ({
-      sessionId,
-      agent: undefined as unknown as Agent,
-      sinks: new Set(),
-      status: 'idle',
-      textBuf: '',
-      reasoningBuf: '',
-      pendingTools: new Map(),
-      turnTools: [],
-      turnStartTs: 0,
-      turnUserChars: 0,
-    })
+    const newRec = (sessionId: string): LiveSession => {
+      // resume 时沿用已持久化的累计统计，避免重启后从 0 重新计
+      const usage = this.sessions.list().find(entry => entry.id === sessionId)?.usage
+      return {
+        sessionId,
+        agent: undefined as unknown as Agent,
+        sinks: new Set(),
+        status: 'idle',
+        textBuf: '',
+        reasoningBuf: '',
+        pendingTools: new Map(),
+        turnText: '',
+        turnReasoning: '',
+        turnTools: [],
+        turnStartTs: 0,
+        turnUserChars: 0,
+        ...usage === undefined ? {} : { usage },
+      }
+    }
     if (requested !== undefined && requested.length > 0) {
       const existing = this.live.get(requested)
       if (existing !== undefined) return requested
@@ -346,6 +392,11 @@ export class ChatManager {
     this.latestUser.set(sessionId, text)
     rec.turnStartTs = Date.now()
     rec.turnUserChars = text.length
+    rec.textBuf = ''
+    rec.reasoningBuf = ''
+    rec.turnText = ''
+    rec.turnReasoning = ''
+    rec.turnTools = []
     void this.sessions.recordUser(sessionId, text).catch(() => {})
 
     const queue: SvChatEvent[] = []
@@ -380,13 +431,41 @@ export class ChatManager {
     } else {
       void rec.agent.whenIdle().then(
         () => {
-          const assistantText = rec.textBuf
+          const assistantText = rec.turnText
           if (assistantText.trim().length > 0) {
             try {
               this.hooks.onTurnComplete?.({ sessionId, userText: text, assistantText })
             } catch (error) {
               this.ctx.logger.warn(svLog('chat', 'turn_hook_failed', { sessionId, err: svError(error) }))
             }
+          }
+          // 只记元信息（长度、耗时、工具数），不落问答正文。
+          this.ctx.logger.info(svLog('chat', 'turn_completed', {
+            sessionId,
+            model: this.store.llm.model,
+            userChars: rec.turnUserChars,
+            replyChars: rec.turnText.length,
+            tools: rec.turnTools.length,
+            durationMs: rec.turnStartTs === 0 ? 0 : Date.now() - rec.turnStartTs,
+          }))
+          // 一轮只落一条 transcript：多条 assistant 消息的思考合并，工具跨消息保留。
+          if (rec.turnText.length > 0 || rec.turnReasoning.length > 0 || rec.turnTools.length > 0) {
+            void this.sessions.recordAssistant(sessionId, rec.turnText, rec.turnReasoning, rec.turnTools)
+              .catch(error => {
+                this.ctx.logger.warn(svLog('chat', 'transcript_record_failed', {
+                  sessionId,
+                  err: svError(error),
+                }))
+              })
+          }
+          // token 统计按轮落盘，供历史会话与重启后的顶栏展示
+          if (rec.usage !== undefined) {
+            void this.sessions.recordUsage(sessionId, rec.usage).catch(error => {
+              this.ctx.logger.warn(svLog('chat', 'usage_record_failed', {
+                sessionId,
+                err: svError(error),
+              }))
+            })
           }
           push({ type: 'done' })
           finished = true

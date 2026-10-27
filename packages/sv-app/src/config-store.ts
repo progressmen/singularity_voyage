@@ -35,6 +35,23 @@ export function inferLlmProvider(baseURL: string): SvLlmProviderId {
   return 'custom'
 }
 
+/**
+ * 各预设供应商常见的上下文窗口（tokens）。
+ * 仅用于「上下文占用比例」的默认估算，设置页填写后以配置值为准；
+ * custom 端点不猜测，返回 undefined（页面只显示占用量，不显示比例）。
+ */
+const DEFAULT_CONTEXT_WINDOWS: Record<Exclude<SvLlmProviderId, 'custom'>, number> = {
+  deepseek: 1_000_000,
+  qwen: 131_072,
+  ark: 262_144,
+  openai: 131_072,
+}
+
+/** 供应商默认上下文窗口；custom 返回 undefined。 */
+export function defaultContextWindow(provider: SvLlmProviderId): number | undefined {
+  return provider === 'custom' ? undefined : DEFAULT_CONTEXT_WINDOWS[provider]
+}
+
 function isLlmProvider(value: unknown): value is SvLlmProviderId {
   return value === 'deepseek' || value === 'qwen' || value === 'ark' || value === 'openai' || value === 'custom'
 }
@@ -56,15 +73,21 @@ export interface SvLlmConfig {
 }
 
 /** Web 搜索提供方支持的协议类型。 */
-export type SvSearchProviderKind = 'tavily' | 'bocha'
+export type SvSearchProviderKind = 'tavily' | 'bocha' | 'deepseek'
 
-/** Web 搜索提供方配置（Tavily 兼容或博查原生 API）。 */
+/**
+ * Web 搜索提供方配置。
+ *
+ * - `tavily`：Tavily 兼容 API；
+ * - `bocha`：博查原生 API；
+ * - `deepseek`：DeepSeek 官方 Search API，未单独配置密钥时复用模型 API Key。
+ */
 export interface SvSearchConfig {
   /** 搜索 API 协议类型，决定请求形状与认证方式。 */
   provider: SvSearchProviderKind
-  /** 搜索 API 根地址（tavily: https://api.tavily.com；bocha: https://api.bochaai.com）。 */
+  /** 搜索 API 根地址（tavily: https://api.tavily.com；bocha: https://api.bochaai.com；deepseek: https://api.deepseek.com）。 */
   baseURL: string
-  /** API 密钥；空字符串表示未配置。 */
+  /** API 密钥；空字符串表示未配置（deepseek 会回落到模型 API Key）。 */
   apiKey: string
   /** 博查专用：时效过滤（oneDay/oneWeek/oneMonth/oneYear/noLimit）。 */
   freshness?: string
@@ -236,7 +259,9 @@ export class ConfigStore {
     }
     if (typeof record.search === 'object' && record.search !== null) {
       const search = record.search
-      if (search.provider === 'tavily' || search.provider === 'bocha') this.state.search.provider = search.provider
+      if (search.provider === 'tavily' || search.provider === 'bocha' || search.provider === 'deepseek') {
+        this.state.search.provider = search.provider
+      }
       if (typeof search.baseURL === 'string' && isHttpUrl(search.baseURL)) this.state.search.baseURL = search.baseURL.replace(/\/+$/, '')
       if (typeof search.apiKey === 'string' && search.apiKey.trim().length > 0) this.state.search.apiKey = search.apiKey.trim()
       if (typeof search.freshness === 'string') {
@@ -341,7 +366,9 @@ export class ConfigStore {
     if (patch.search !== undefined) {
       const search = patch.search
       if (search.provider !== undefined) {
-        if (search.provider !== 'tavily' && search.provider !== 'bocha') throw new Error('搜索 provider 必须是 tavily 或 bocha')
+        if (search.provider !== 'tavily' && search.provider !== 'bocha' && search.provider !== 'deepseek') {
+          throw new Error('搜索 provider 必须是 tavily、bocha 或 deepseek')
+        }
         this.state.search.provider = search.provider
       }
       if (search.baseURL !== undefined) {
@@ -440,7 +467,9 @@ export class ConfigStore {
       search: {
         provider: this.state.search.provider,
         baseURL: this.state.search.baseURL,
-        hasApiKey: this.state.search.apiKey.length > 0,
+        // deepseek 官方搜索复用模型 Key，未单独配置也算「可用」
+        hasApiKey: this.state.search.apiKey.length > 0
+          || (this.state.search.provider === 'deepseek' && this.state.llm.apiKey.length > 0),
         ...this.state.search.freshness === undefined ? {} : { freshness: this.state.search.freshness },
         ...this.state.search.retryAttempts === undefined ? {} : { retryAttempts: this.state.search.retryAttempts },
         ...this.state.search.timeoutMs === undefined ? {} : { timeoutMs: this.state.search.timeoutMs },

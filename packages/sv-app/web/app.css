@@ -122,10 +122,23 @@ html, body {
 }
 .nav-icon {
   flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 18px;
-  text-align: center;
-  font-size: 15px;
+  height: 18px;
   line-height: 1;
+}
+/* 导航图标统一为线性 SVG：同尺寸、同线宽、跟随文字色 */
+.nav-icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .nav-label { flex: 1; min-width: 0; }
 .nav-item .dot {
@@ -349,8 +362,41 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.topbar-status { margin-left: auto; font-size: 12px; color: var(--text-dim); }
+.topbar-meta { margin-left: auto; display: flex; align-items: center; gap: 12px; min-width: 0; }
+.topbar-status { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
 .topbar-status.running { color: var(--accent); }
+/* 顶栏 token 统计：上下文占用 + 累计输入/输出 */
+.topbar-usage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.topbar-usage[hidden] { display: none; }
+.usage-meter {
+  display: block;
+  width: 56px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.usage-meter[hidden] { display: none; }
+.usage-meter-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.usage-meter.warn .usage-meter-fill { background: #d68a1e; }
+.usage-meter.danger .usage-meter-fill { background: var(--danger); }
+.usage-percent { font-family: var(--mono); }
+.usage-tokens { font-family: var(--mono); }
 
 .messages {
   flex: 1;
@@ -463,6 +509,8 @@ html, body {
   font-size: 13px;
 }
 .reasoning summary { cursor: pointer; user-select: none; }
+/* 同一轮多段思考合并后按空行分隔，保留换行结构 */
+.reasoning > div { white-space: pre-wrap; margin-top: 6px; }
 
 /* ── Trace 面板（工具调用步骤） ───────────────────────── */
 .trace-panel { margin: 0 0 10px; display: flex; flex-direction: column; gap: 4px; }
@@ -558,6 +606,9 @@ html, body {
   color: var(--text);
   font: inherit;
   resize: none;
+  line-height: 1.5;
+  /* 默认高度按两行留白，避免单行输入框显得局促 */
+  min-height: 60px;
   max-height: 200px;
   padding: 6px 0;
   /* 输入框默认不显示滚动条（仍可用滚轮/键盘翻看） */
@@ -810,6 +861,7 @@ dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.55); }
 
 .panel-list { display: flex; flex-direction: column; gap: 8px; }
 .panel-empty { color: var(--text-dim); text-align: center; padding: 28px 0; font-size: 13px; }
+.schedule-hint { margin: 10px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-dim); }
 
 .task-item, .memory-item {
   display: flex;
@@ -881,7 +933,7 @@ dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.55); }
 
 /* ── 日志面板 ─────────────────────────────────────────── */
 .panel-inner-wide { max-width: 1100px; height: 100%; min-height: 0; }
-/* 日志面板自身不滚动，滚动交给 .log-view */
+/* 日志面板自身不滚动，滚动交给 .log-table-wrap */
 #panel-logs { overflow: hidden; }
 .log-select {
   background: var(--bg-panel);
@@ -894,34 +946,72 @@ dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.55); }
 }
 .log-select:focus { outline: none; border-color: var(--accent); }
 .log-meta { font-size: 11.5px; color: var(--text-dim); }
-.log-view {
-  margin: 0;
+/* 日志表格：表头吸顶，内容区滚动 */
+.log-table-wrap {
   flex: 1;
   min-height: 240px;
-  max-height: calc(100vh - 300px);
+  max-height: calc(100vh - 320px);
   overflow: auto;
   background: var(--bg-soft);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 10px 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
-  /* 滚动条默认隐藏，悬停时显形 */
   scrollbar-width: thin;
   scrollbar-color: transparent transparent;
 }
-.log-view:hover { scrollbar-color: var(--border) transparent; }
-.log-view::-webkit-scrollbar { width: 8px; height: 8px; }
-.log-view::-webkit-scrollbar-track { background: transparent; }
-.log-view::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; }
-.log-view:hover::-webkit-scrollbar-thumb { background: var(--border); }
-.log-line { display: block; color: var(--text-dim); }
-.log-line.log-info { color: var(--text); }
-.log-line.log-warn { color: #d68a1e; }
-.log-line.log-error { color: var(--danger); }
+.log-table-wrap:hover { scrollbar-color: var(--border) transparent; }
+.log-table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.log-table-wrap::-webkit-scrollbar-track { background: transparent; }
+.log-table-wrap::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; }
+.log-table-wrap:hover::-webkit-scrollbar-thumb { background: var(--border); }
+.log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.log-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.log-table td { padding: 7px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.log-table tbody tr:last-child td { border-bottom: none; }
+.log-row:hover td { background: var(--bg-panel); }
+.log-col-time { width: 150px; white-space: nowrap; color: var(--text-dim); }
+.log-col-level { width: 72px; white-space: nowrap; }
+.log-col-text {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-row.log-warn .log-col-text { color: #d68a1e; }
+.log-row.log-error .log-col-text { color: var(--danger); }
+.log-level {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.log-level-info { color: var(--text-dim); background: var(--bg-panel); }
+.log-level-warn { color: #d68a1e; background: rgba(214, 138, 30, 0.14); }
+.log-level-error { color: var(--danger); background: rgba(255, 90, 90, 0.14); }
+.log-empty { text-align: center; color: var(--text-dim); padding: 28px 12px; }
+.log-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.log-page-info { font-size: 12px; color: var(--text-dim); }
+.log-pager .btn[disabled] { opacity: 0.45; cursor: default; }
 
 .reminder-toast {
   position: fixed;

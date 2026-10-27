@@ -140,7 +140,7 @@ export function registerMemoryTools(ctx: Context, memory: MemoryStore): void {
 export function registerTaskTools(ctx: Context, tasks: TasksStore): void {
   ctx.tools.register(defineTool({
     name: 'task_create',
-    description: '创建一条待办或提醒。用户说「提醒我……」「记得做……」时必须调用；due_at 用带时区的 ISO 8601。',
+    description: '创建一条待办清单项（可勾选完成、支持页面与邮件提醒）。用于长期跟踪「要做的事」；如果用户要在某个时间点被提醒并让助手届时继续处理，改用 schedule_create。',
     parameters: {
       title: { type: 'string', required: true, description: '要做什么（不超过 120 字）' },
       notes: { type: 'string', description: '可选备注' },

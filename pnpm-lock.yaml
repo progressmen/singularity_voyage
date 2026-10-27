@@ -42,6 +42,9 @@ importers:
       '@deepseek-ai/dsh-llm':
         specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm
         version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm
+      '@deepseek-ai/dsh-schedule':
+        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule
+        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule
       '@deepseek-ai/dsh-session':
         specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session
         version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session

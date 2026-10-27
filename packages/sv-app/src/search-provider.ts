@@ -1,10 +1,12 @@
 /**
  * SV Web 搜索提供方：注册到 `ctx.web`（id: `sv-search`）。
  *
- * 支持两种协议（由 {@linkcode SvSearchConfig.provider} 决定）：
+ * 支持三种协议（由 {@linkcode SvSearchConfig.provider} 决定）：
  *  - `tavily`：Tavily 兼容 API（POST {base}/search，api_key 走请求体）；
  *  - `bocha`：博查原生 Web Search API（POST {base}/v1/web-search，
- *    `Authorization: Bearer` 认证，支持 freshness 时效过滤）。
+ *    `Authorization: Bearer` 认证，支持 freshness 时效过滤）；
+ *  - `deepseek`：DeepSeek 官方 Search API（POST {base}/v1/tools/search，
+ *    与模型共用 Bearer 鉴权；未单独配置搜索密钥时复用模型 API Key）。
  *
  * 由 SV 组合包 patch 把 `web` 行的 `searchProvider` 指向本提供方，
  * 模型通过 `web_search` 工具触发；密钥与端点来自 {@linkcode ConfigStore}。
@@ -78,32 +80,52 @@ export async function withSearchRetry<T>(
 export class SvSearchProvider implements WebSearchProvider {
   readonly id = SV_SEARCH_PROVIDER_ID
 
-  constructor(private readonly options: () => SvSearchConfig) {}
+  /**
+   * @param options - 搜索配置读取器（每次调用取最新值）。
+   * @param llmApiKey - 模型 API Key 读取器；deepseek 官方搜索未配独立密钥时复用。
+   */
+  constructor(
+    private readonly options: () => SvSearchConfig,
+    private readonly llmApiKey: () => string = () => '',
+  ) {}
+
+  /** 生效的搜索密钥：独立密钥优先，deepseek 回落到模型 API Key。 */
+  private resolveApiKey(config: SvSearchConfig): string {
+    const direct = config.apiKey.trim()
+    if (direct.length > 0) return direct
+    return config.provider === 'deepseek' ? this.llmApiKey().trim() : ''
+  }
 
   /** 廉价本地检查：仅判断密钥是否已配置，禁止网络调用。 */
   available(): boolean {
-    return this.options().apiKey.trim().length > 0
+    return this.resolveApiKey(this.options()).length > 0
   }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     const config = this.options()
+    const apiKey = this.resolveApiKey(config)
     // 密钥缺失属配置错误，不做重试
-    if (config.apiKey.trim().length === 0) {
-      throw new Error(config.provider === 'bocha'
-        ? 'sv-app: 尚未配置博查 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_SEARCH_BOCHA_API_KEY'
-        : 'sv-app: 尚未配置 Web 搜索 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_SEARCH_API_KEY')
+    if (apiKey.length === 0) {
+      throw new Error(config.provider === 'deepseek'
+        ? 'sv-app: 尚未配置 DeepSeek API key；请在 SV 页面（/sv → 设置）填写模型 API Key（官方搜索复用同一把 Key）'
+        : config.provider === 'bocha'
+          ? 'sv-app: 尚未配置博查 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_SEARCH_BOCHA_API_KEY'
+          : 'sv-app: 尚未配置 Web 搜索 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_SEARCH_API_KEY')
     }
-    return withSearchRetry(inner => config.provider === 'bocha'
-      ? this.searchBocha(config, request, inner)
-      : this.searchTavily(config, request, inner), resolveResilience(config), signal)
+    return withSearchRetry(inner => {
+      if (config.provider === 'deepseek') return this.searchDeepSeek(config, apiKey, request, inner)
+      if (config.provider === 'bocha') return this.searchBocha(config, apiKey, request, inner)
+      return this.searchTavily(config, apiKey, request, inner)
+    }, resolveResilience(config), signal)
   }
 
   /** Tavily 兼容 API：POST {base}/search，api_key 走请求体。 */
-  private async searchTavily(config: SvSearchConfig, request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const apiKey = config.apiKey.trim()
-    if (apiKey.length === 0) {
-      throw new Error('sv-app: 尚未配置 Web 搜索 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_SEARCH_API_KEY')
-    }
+  private async searchTavily(
+    config: SvSearchConfig,
+    apiKey: string,
+    request: WebSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult> {
     const maxResults = clampResults(request.maxResults)
     const res = await postJson(`${config.baseURL.replace(/\/+$/, '')}/search`, {
       'content-type': 'application/json',
@@ -134,11 +156,12 @@ export class SvSearchProvider implements WebSearchProvider {
   }
 
   /** 博查原生 API：POST {base}/v1/web-search，Bearer 认证，data.webPages.value 返回结果。 */
-  private async searchBocha(config: SvSearchConfig, request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
-    const apiKey = config.apiKey.trim()
-    if (apiKey.length === 0) {
-      throw new Error('sv-app: 尚未配置博查 API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 BOCHA_API_KEY')
-    }
+  private async searchBocha(
+    config: SvSearchConfig,
+    apiKey: string,
+    request: WebSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult> {
     const maxResults = clampResults(request.maxResults)
     const freshness = config.freshness !== undefined && BOCHA_FRESHNESS.has(config.freshness) ? config.freshness : 'noLimit'
     const res = await postJson(`${config.baseURL.replace(/\/+$/, '')}/v1/web-search`, {
@@ -171,6 +194,50 @@ export class SvSearchProvider implements WebSearchProvider {
         url,
         ...(typeof name === 'string' && name.length > 0 ? { title: name } : {}),
         ...(text !== undefined && text.length > 0 ? { snippet: text } : {}),
+      })
+    }
+    return cap(sources, maxResults, undefined)
+  }
+
+  /**
+   * DeepSeek 官方 Search API：POST {base}/v1/tools/search，与模型共用 Bearer 鉴权。
+   * 结果优先用 `summary`（面向模型的长摘要），缺失时回落到 `snippet`。
+   */
+  private async searchDeepSeek(
+    config: SvSearchConfig,
+    apiKey: string,
+    request: WebSearchRequest,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult> {
+    const maxResults = clampResults(request.maxResults)
+    const base = config.baseURL.trim().length > 0 ? config.baseURL.replace(/\/+$/, '') : 'https://api.deepseek.com'
+    const res = await postJson(`${base}/v1/tools/search`, {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${apiKey}`,
+    }, JSON.stringify({
+      query: request.query,
+      count: maxResults,
+    }), signal)
+    if (!res.ok) throw await httpError('DeepSeek 搜索', res)
+    const json = await res.json() as { results?: unknown }
+    const entries = Array.isArray(json.results) ? json.results : []
+    const sources: WebSearchSource[] = []
+    for (const entry of entries) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const url = (entry as { url?: unknown }).url
+      if (typeof url !== 'string' || url.length === 0) continue
+      const title = (entry as { title?: unknown }).title
+      const summary = (entry as { summary?: unknown }).summary
+      const snippet = (entry as { snippet?: unknown }).snippet
+      const date = (entry as { date?: unknown }).date
+      const text = typeof summary === 'string' && summary.length > 0
+        ? summary
+        : typeof snippet === 'string' ? snippet : undefined
+      sources.push({
+        url,
+        ...(typeof title === 'string' && title.length > 0 ? { title } : {}),
+        ...(text !== undefined && text.length > 0 ? { snippet: text } : {}),
+        ...(typeof date === 'string' && date.length > 0 ? { publishedAt: date } : {}),
       })
     }
     return cap(sources, maxResults, undefined)

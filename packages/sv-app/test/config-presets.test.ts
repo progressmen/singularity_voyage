@@ -84,6 +84,20 @@ test('update 搜索韧性参数：正整数校验、null 清除', async () => {
   assert.equal(cleared.search.budgetMs, undefined)
 })
 
+test('搜索 provider 接受 deepseek，复用模型 Key 时报告可用', async () => {
+  const store = new ConfigStore(defaults())
+  await store.update({
+    llm: { provider: 'deepseek', apiKey: 'sk-llm' },
+    search: { provider: 'deepseek', baseURL: 'https://api.deepseek.com' },
+  })
+  assert.equal(store.search.provider, 'deepseek')
+  assert.equal(store.search.baseURL, 'https://api.deepseek.com')
+  assert.equal(store.publicState().search.hasApiKey, true)
+  assert.ok(!JSON.stringify(store.publicState()).includes('sk-llm'))
+
+  await assert.rejects(() => store.update({ search: { provider: 'bing' } }), /provider/)
+})
+
 test('publicState 不泄漏密钥明文', async () => {
   const store = new ConfigStore(defaults())
   await store.update({ llm: { apiKey: 'sk-secret' }, search: { apiKey: 'search-secret' } })

@@ -29,6 +29,7 @@
     "@deepseek-ai/dsh-agent": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/agent",
     "@deepseek-ai/dsh-host-webserver": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/host/webserver",
     "@deepseek-ai/dsh-llm": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm",
+    "@deepseek-ai/dsh-schedule": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule",
     "@deepseek-ai/dsh-session": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session",
     "@deepseek-ai/dsh-system-prompt": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/system-prompt",
     "@deepseek-ai/dsh-tools": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/tools",

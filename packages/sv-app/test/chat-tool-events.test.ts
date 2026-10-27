@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { ChatManager, type SvChatEvent } from '../src/chat.ts'
-import type { TranscriptToolEntry } from '../src/sessions-store.ts'
+import type { SessionUsage, TranscriptToolEntry } from '../src/sessions-store.ts'
 
 type AnyRec = {
   sessionId: string
@@ -16,11 +16,15 @@ type AnyRec = {
   textBuf: string
   reasoningBuf: string
   pendingTools: Map<string, { name: string; startTs: number; args: string }>
+  turnText: string
+  turnReasoning: string
   turnTools: TranscriptToolEntry[]
+  usage?: SessionUsage
 }
 
-function makeChat() {
-  const chat = new ChatManager({} as never, {} as never, {} as never)
+function makeChat(llm: Record<string, unknown> = { provider: 'custom', model: 'test-model' }) {
+  const ctx = { logger: { info() {}, warn() {}, debug() {}, error() {} } }
+  const chat = new ChatManager(ctx as never, { llm } as never, {} as never)
   const rec: AnyRec = {
     sessionId: 's1',
     agent: undefined,
@@ -29,6 +33,8 @@ function makeChat() {
     textBuf: '',
     reasoningBuf: '',
     pendingTools: new Map(),
+    turnText: '',
+    turnReasoning: '',
     turnTools: [],
   }
   ;(chat as unknown as { live: Map<string, AnyRec> }).live.set('s1', rec)
@@ -115,28 +121,124 @@ test('transcript 参数摘要截断到 200 字节', () => {
   assert.ok(rec.turnTools[0].args!.endsWith('…'))
 })
 
-test('start 帧重置本轮文本与工具缓存；end 帧触发 transcript 记录', async () => {
+test('end 帧按轮合并思考与文本；start 帧只清当前消息缓冲', () => {
   const { chat, rec, events } = makeChat()
-  const recorded: Array<{ id: string; text: string; tools: TranscriptToolEntry[] }> = []
-  const sessions = { recordAssistant: async (id: string, text: string, _r: string, tools: TranscriptToolEntry[]) => {
-    recorded.push({ id, text, tools })
-  } }
-  ;(chat as unknown as { sessions: unknown }).sessions = sessions
-
   const frameApi = (chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void })
-  rec.turnTools.push({ name: 'leftover' })
+  const commit = () => frameApi.onStreamFrame(rec, {
+    type: 'end',
+    outcome: { kind: 'committed', eventType: 'assistant/message' },
+  })
+
+  rec.turnTools.push({ name: 'web_search', durationMs: 5 })
+  rec.reasoningBuf = '先查一下天气'
+  commit()
+
   frameApi.onStreamFrame(rec, { type: 'start' })
-  assert.deepEqual(rec.turnTools, [])
+  assert.equal(rec.textBuf, '')
+  assert.equal(rec.reasoningBuf, '')
+  assert.equal(rec.turnReasoning, '先查一下天气')
+  assert.deepEqual(rec.turnTools, [{ name: 'web_search', durationMs: 5 }])
 
   rec.textBuf = '最终回答'
+  rec.reasoningBuf = '再整理结论'
+  commit()
+
+  assert.equal(rec.turnText, '最终回答')
+  assert.equal(rec.turnReasoning, '先查一下天气\n\n再整理结论')
+  const messages = events.filter(e => e.type === 'message')
+  assert.equal(messages.length, 2)
+  assert.deepEqual(messages[1], {
+    type: 'message',
+    text: '最终回答',
+    reasoning: '先查一下天气\n\n再整理结论',
+  })
+})
+
+test('一轮结束只写一条 transcript：思考合并、工具跨消息保留', async () => {
+  const { chat, rec } = makeChat()
+  const recorded: Array<{ id: string; text: string; reasoning: string; tools: TranscriptToolEntry[] }> = []
+  ;(chat as unknown as { sessions: unknown }).sessions = {
+    recordUser: async () => {},
+    recordAssistant: async (id: string, text: string, reasoning: string, tools: TranscriptToolEntry[]) => {
+      recorded.push({ id, text, reasoning, tools })
+    },
+  }
+  let finishIdle: () => void = () => {}
+  rec.agent = { followup() {}, whenIdle: () => new Promise<void>(resolve => { finishIdle = resolve }), cancel() {} }
+
+  const iterator = chat.run('s1', '问题')
+  await iterator.next() // 首帧 session；此时 whenIdle 已注册
+
+  const frameApi = (chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void })
+  const commit = () => frameApi.onStreamFrame(rec, {
+    type: 'end',
+    outcome: { kind: 'committed', eventType: 'assistant/message' },
+  })
+  rec.reasoningBuf = '想法一'
+  commit()
+  frameApi.onStreamFrame(rec, { type: 'start' })
+  rec.reasoningBuf = '想法二'
+  rec.textBuf = '最终回答'
   rec.turnTools.push({ name: 'web_search', durationMs: 5 })
-  frameApi.onStreamFrame(rec, { type: 'end', outcome: { kind: 'committed', eventType: 'assistant/message' } })
+  commit()
+
+  finishIdle()
+  for await (const _event of iterator) { /* 消费到 done */ }
   await new Promise(resolve => setImmediate(resolve))
+
   assert.equal(recorded.length, 1)
   assert.equal(recorded[0].id, 's1')
   assert.equal(recorded[0].text, '最终回答')
-  assert.equal(recorded[0].tools.length, 1)
-  assert.equal(events.some(e => e.type === 'message'), true)
+  assert.equal(recorded[0].reasoning, '想法一\n\n想法二')
+  assert.deepEqual(recorded[0].tools, [{ name: 'web_search', durationMs: 5 }])
+})
+
+
+test('usage 帧累计 token 统计并推送上下文占用', () => {
+  const { chat, rec, events } = makeChat()
+  const frameApi = (chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void })
+  const usageFrame = (usage: unknown) => frameApi.onStreamFrame(rec, {
+    type: 'chunk',
+    chunk: { type: 'usage', usage },
+  })
+
+  usageFrame({ inputTokens: 100, outputTokens: 20, cacheReadTokens: 30, totalTokens: 150 })
+  assert.equal(rec.usage?.inputTokens, 100)
+  assert.equal(rec.usage?.outputTokens, 20)
+  assert.equal(rec.usage?.cacheReadTokens, 30)
+  assert.equal(rec.usage?.totalTokens, 150)
+  // 上下文占用 = 非缓存输入 + 缓存命中
+  assert.equal(rec.usage?.contextTokens, 130)
+  // custom 供应商不猜窗口
+  assert.equal(rec.usage?.contextWindow, undefined)
+
+  // 第二次请求未给 total：按 prompt + completion 自行合成
+  usageFrame({ inputTokens: 50, outputTokens: 10 })
+  assert.equal(rec.usage?.inputTokens, 150)
+  assert.equal(rec.usage?.outputTokens, 30)
+  assert.equal(rec.usage?.cacheReadTokens, 30)
+  assert.equal(rec.usage?.totalTokens, 210)
+  assert.equal(rec.usage?.contextTokens, 50)
+
+  const last = events[events.length - 1] as Extract<SvChatEvent, { type: 'usage' }>
+  assert.equal(last.type, 'usage')
+  assert.deepEqual(last.usage, rec.usage)
+})
+
+test('上下文窗口：设置值优先，否则用供应商预设', () => {
+  const preset = makeChat({ provider: 'deepseek', model: 'deepseek-chat' })
+  ;(preset.chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void }).onStreamFrame(preset.rec, {
+    type: 'chunk',
+    chunk: { type: 'usage', usage: { inputTokens: 1000, outputTokens: 100 } },
+  })
+  assert.equal(preset.rec.usage?.contextWindow, 1_000_000)
+
+  const configured = makeChat({ provider: 'deepseek', model: 'deepseek-chat', contextWindow: 32_768 })
+  ;(configured.chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void }).onStreamFrame(configured.rec, {
+    type: 'chunk',
+    chunk: { type: 'usage', usage: { inputTokens: 1000, outputTokens: 100 } },
+  })
+  assert.equal(configured.rec.usage?.contextWindow, 32_768)
 })
 
 test('单个 sink 抛错不影响其他 sink', () => {

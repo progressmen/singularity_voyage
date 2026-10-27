@@ -18,7 +18,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PID_DIR="$REPO_ROOT/.pids"
 LOG_DIR="$REPO_ROOT/logs"
 PID_FILE="$PID_DIR/sv.pid"
-LOG_FILE="$LOG_DIR/sv.log"
+# 进程控制台输出（追加写入，重启不丢）；结构化运行日志由 sv-app 按天写入 logs/sv-YYYY-MM-DD.log
+LOG_FILE="$LOG_DIR/stdout.log"
 DSH_SRC="${DSH_SRC:-$REPO_ROOT/../deepseek-harness-dsh-v0.2.1-rc.2}"
 DSH_BIN="$DSH_SRC/apps/cli/lib/bin.js"
 PORT="${PORT:-7000}"
@@ -183,9 +184,9 @@ cmd_start() {
 
   log "启动 dsh CLI（profile: sv, 端口: ${PORT}）…"
   cd "$REPO_ROOT"
-  # nohup 后台运行，stdout/stderr 重定向到日志；stdin 接 /dev/null 避免终端关闭后进程退出
+  # nohup 后台运行，stdout/stderr 追加到日志（>> 避免重启清空历史）；stdin 接 /dev/null 避免终端关闭后进程退出
   nohup node "$DSH_BIN" --profile sv --port "$PORT" --no-open \
-    < /dev/null > "$LOG_FILE" 2>&1 &
+    < /dev/null >> "$LOG_FILE" 2>&1 &
   pid=$!
   echo "$pid" > "$PID_FILE"
   log "进程 PID: ${pid}，日志: $LOG_FILE"

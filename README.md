@@ -113,7 +113,7 @@ singularity_voyage/
 │       ├── src/
 │       │   ├── index.ts         #   插件入口：注册适配器/搜索提供方/聊天服务/路由
 │       │   ├── llm-adapter.ts   #   SvOpenAiCompatAdapter（ctx.llm，流式 SSE → StreamChunk）
-│       │   ├── search-provider.ts # SvSearchProvider（ctx.web，Tavily 兼容 / 博查原生，带重试韧性）
+│       │   ├── search-provider.ts # SvSearchProvider（ctx.web，DeepSeek 官方 / Tavily 兼容 / 博查原生，带重试韧性）
 │       │   ├── chat.ts          #   会话管理 + agent 事件 → SSE 转发（create/resume，工具事件带 callId 关联）
 │       │   ├── http.ts          #   /sv 静态页面 + /sv/api/*（配置/会话/SSE）
 │       │   ├── config-store.ts  #   token/API 持久化 + 供应商预设（$DSH_HOME/sv/config.json，0600）
@@ -182,6 +182,7 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 <repo>/.dsh/
 ├─ profiles/sv/     # pnpm setup 生成：bundle 清单 + sv-app 的 link
 ├─ sessions/        # harness 写：会话 JSONL
+├─ storages/        # harness 写：storage-domain（定时任务在 schedule.json）
 ├─ logs/            # harness 写：启动诊断（失败时才有文件）
 └─ sv/              # 本项目写：config.json / memory.json / tasks.json / mail-state.json
                     #   （配了 SV_DATABASE_URL 时会话索引与 transcript 落 Postgres）
@@ -198,6 +199,7 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 
 - **记忆**：每轮回答结束后异步抽取候选记忆（事实 / 偏好 / 人物 / 项目 / 决定），去重后写入 `$DSH_HOME/sv/memory.json`；下一轮按当前输入召回 Top-N 注入提示词。页面可搜索、按类型筛选、就地编辑、单条删除——删掉的记忆下一轮立即不再参与。
 - **待办**：说「提醒我明天 10 点交材料」由 `task_create` 创建；进程内每 30 秒扫描到期任务，通过 `/sv/api/events`（SSE）在页面右下角弹出提醒，可直接完成或推迟 10 分钟。支持一次 / 每天 / 每周，重复任务触发后自动滚动到下一次。
+- **定时任务**：与待办分工明确——待办是清单（页面勾选 + 邮件提醒），定时任务由 harness 的 `@deepseek-ai/dsh-schedule` 调度。说「10 秒后提醒我喝水」由 `schedule_create` 创建；到期后宿主把提醒投递回**创建它的会话**并触发模型继续处理。支持一次性 / 固定间隔 / 每天 / 每周 / cron（显式 IANA 时区），进程重启后仍在，周期任务只补发最近一次错过的时点。侧栏「定时任务」可查看目录并删除；宿主不提供暂停，删除即取消后续投递。模型侧工具为 `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`，数据在 `$DSH_HOME/storages/schedule.json`。
 - **邮件提醒**：待办页顶部有快捷开关，可一键开启/关闭（未配置 SMTP 时会引导去设置）。两种提醒：**定时提醒**在任务到期时立即发一封；**超时提醒**不单独发信，逾期未完成的任务在每日摘要里单列一段，主题也会标注逾期数量。发信与模型工具 `mcp__sv-mail__send_email` 共用 [mcp/sv-mail-mcp](mcp/sv-mail-mcp) 里的 `mailer.py`，只有一套 SMTP 实现；摘要发送日期记在 `mail-state.json`，重启不会重复发。
 - 存储都在 `$DSH_HOME/sv/`（0600），与 dsh 会话日志分离：日志存原文与来源，记忆存「当前有效结论」。
 
@@ -205,6 +207,7 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 
 - **Trace 面板**：每条回答上方的工具调用步骤条。按工具名自动分类（MCP 🔎 / 联网 🌐 / 技能 📘 / 文件 📄 / 终端 ⌨ / 工具 🔧），顶部一行显示类型分布；连续同类调用自动折叠，任一失败强制展开并标红。点开任意一行可查看参数与结果摘要（分类逻辑在 [web/trace.js](packages/sv-app/web/trace.js)，双端复用并有独立测试）。
 - **会话历史**：服务端在 `$DSH_HOME/sv/` 维护轻量投影（`sessions.json` 索引 + `transcripts/<id>.jsonl`）。`GET /sv/api/sessions` 列出会话，`GET /sv/api/sessions/:id/messages` 取回历史——前端启动时若本地缺失会自动补齐，清空浏览器缓存后同一台机器上仍能找回对话。`DELETE /sv/api/sessions/:id` 删除投影（dsh 会话 JSONL 不受影响，投影可随时重建）。
+- **Token 与上下文统计**：顶栏右侧显示当前上下文占用（已用 / 窗口，带进度条与百分比）和本次会话累计输入 / 输出 tokens。数据来自适配器上报的 `usage` 分片，每轮结束写入会话索引并随 `/sv/api/sessions` 返回，重启或换浏览器后仍可看到。窗口优先取设置页填写的「上下文窗口」，未填写时按供应商预设估算（DeepSeek 1M，Qwen / OpenAI 128K，火山方舟 256K；custom 不猜，只显示占用量）。
 
 ### 日志
 
@@ -228,18 +231,21 @@ sv-app 的日志统一为单行、可直接 grep 的格式（实现在 [log.ts](
 输出位置：
 
 - `pnpm dev` 直接打到终端 stdout；
-- `./scripts/start.sh start` 重定向到 `logs/sv.log`（`./scripts/start.sh logs` 跟踪）。
+- 服务运行时（含 `./scripts/start.sh start`）按本地日期追加写入 `logs/sv-YYYY-MM-DD.log`，重启不覆盖历史；
+- `./scripts/start.sh start` 的进程控制台输出追加到 `logs/stdout.log`（`./scripts/start.sh logs` 跟踪）。
 
-> dsh 内核默认不把 logger 输出打到控制台，因此 sv-app 在激活时自带一个只输出自身消息的 exporter（[log.ts](packages/sv-app/src/log.ts) 的 `installSvLogSink`）：`error`/`info`/`warn` 走 stdout，`debug`（含堆栈）只留在 logger buffer。dsh 自身日志不带 `[sv-app]` 前缀，按该前缀即可筛出本项目输出。
+> dsh 内核默认不把 logger 输出打到控制台，因此 sv-app 在激活时自带一个只输出自身消息的 exporter（[log.ts](packages/sv-app/src/log.ts) 的 `installSvLogSink`）：`error`/`info`/`warn` 走 stdout 与当天日志文件，`debug`（含堆栈）只留在 logger buffer。dsh 自身日志不带 `[sv-app]` 前缀，按该前缀即可筛出本项目输出。
 
 常用检索：
 
 ```sh
-grep '\[sv-app\]\[http\]' logs/sv.log           # 只看 HTTP 层
-grep 'request_failed' logs/sv.log               # 只看失败请求
-grep 'err=' logs/sv.log | tail -n 20            # 最近的错误行
-grep 'memory_extracted' logs/sv.log             # 记忆写入记录
+grep '\[sv-app\]\[http\]' logs/sv-$(date +%F).log   # 只看今天的 HTTP 层
+grep 'request_failed' logs/sv-*.log                 # 只看失败请求（跨天）
+grep 'err=' logs/sv-$(date +%F).log | tail -n 20    # 最近的错误行
+grep 'memory_extracted' logs/sv-*.log               # 记忆写入记录
 ```
+
+> 页面「运行日志」默认打开最新的日志文件，按时间 / 级别 / 内容表格展示，支持筛选与分页。
 
 > dsh 内核自身的日志不带 `[sv-app]` 前缀，按该前缀即可筛出本项目输出。
 
@@ -248,7 +254,7 @@ grep 'memory_extracted' logs/sv.log             # 记忆写入记录
 打开 `/sv/` 页面右下角 **⚙ 设置**：
 
 - **模型（OpenAI 兼容 API）**：先选供应商预设（DeepSeek / 通义千问 / 火山方舟 / OpenAI / 自定义），切换预设自动回填端点与模型（仍可手改）；再填 API Key。可拉取模型列表、测试连通。密钥留空表示不修改。
-- **Web 搜索**：提供方二选一——Tavily 兼容 API，或博查（Bocha）原生 API（支持 `freshness` 时效过滤）。「高级」折叠区可调韧性参数：失败后的重试次数、单次请求超时、重试阶段总预算（页面配置 > 环境变量 > 内置缺省 2 次 / 15s / 30s）。重试耗尽后 fail loud 报错，不做静默降级。配置后模型的 `web_search` 工具即走该 API。
+- **Web 搜索**：提供方三选一——DeepSeek 官方搜索（复用模型 API Key，走 `POST /v1/tools/search`，无需再配第三方）、Tavily 兼容 API、博查（Bocha）原生 API（支持 `freshness` 时效过滤）。「高级」折叠区可调韧性参数：失败后的重试次数、单次请求超时、重试阶段总预算（页面配置 > 环境变量 > 内置缺省 2 次 / 15s / 30s）。重试耗尽后 fail loud 报错，不做静默降级。配置后模型的 `web_search` 工具即走该 API。
 - **邮件提醒（SMTP）**：填 SMTP 主机、端口与加密方式（SSL 465 / STARTTLS 587）、账号与应用专用密码，收件人默认同账号（即「发给自己」）。提醒类型分两项：**定时提醒**（到期立即发邮件）与**超时提醒**（逾期项汇总进每日摘要，需勾选并设定发送时间）。「发送测试邮件」用已保存的配置立即发一封验证。QQ / 163 / Gmail 需先在邮箱后台开启 SMTP 并生成应用专用密码。
 
 配置持久化到 `$DSH_HOME/sv/config.json`（权限 0600，密钥永不回传前端、不进入 Cordis 配置或日志），保存立即生效、重启自动加载。也可用环境变量预置部署默认值：
@@ -260,8 +266,11 @@ SV_LLM_BASE_URL=https://api.deepseek.com
 SV_LLM_MODEL=deepseek-chat
 SV_LLM_API_KEY=sk-...
 
-# 搜索提供方：tavily（默认）| bocha；也可用 WEB_SEARCH_PROVIDER
-SV_SEARCH_PROVIDER=bocha
+# 搜索提供方：deepseek（官方 Search API，复用 SV_LLM_API_KEY）| tavily | bocha
+# 也可用 WEB_SEARCH_PROVIDER；留空时 DeepSeek 模型默认官方搜索
+SV_SEARCH_PROVIDER=deepseek
+# DeepSeek 官方搜索可选独立密钥（缺省复用模型 Key）
+DEEPSEEK_API_KEY=
 # Tavily 兼容（provider=tavily）
 SV_SEARCH_BASE_URL=https://api.tavily.com
 SV_SEARCH_API_KEY=tvly-...

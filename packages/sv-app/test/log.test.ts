@@ -2,8 +2,11 @@
  * 日志格式单测：前缀、字段顺序、引号规则、err 行尾、异常提取。
  */
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { installSvLogSink, svError, svLog } from '../src/log.ts'
+import { appendSvLogLine, installSvLogSink, svError, svLog, svLogFileName } from '../src/log.ts'
 
 test('svLog：模块前缀 + 事件名', () => {
   assert.equal(svLog('index', 'surface_ready'), '[sv-app][index] surface_ready')
@@ -57,4 +60,27 @@ test('installSvLogSink：只输出 sv-app 的 info/warn/error，跳过 debug 与
   handler({ name: '@deepseek-ai/dsh-base', type: 'error', args: ['kernel boom'] })
 
   assert.deepEqual(lines, ['[sv-app][index] surface_ready path=/sv/', '[sv-app][http] request_failed'])
+})
+
+test('appendSvLogLine：按本地日期追加到 sv-YYYY-MM-DD.log，跨天分文件', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'sv-log-'))
+  const previous = process.env.SV_LOG_DIR
+  process.env.SV_LOG_DIR = dir
+  try {
+    const day1 = new Date(2026, 9, 25, 23, 59)
+    const day2 = new Date(2026, 9, 26, 0, 1)
+    assert.equal(svLogFileName(day1), 'sv-2026-10-25.log')
+    assert.equal(svLogFileName(day2), 'sv-2026-10-26.log')
+
+    await appendSvLogLine('line-1', day1)
+    await appendSvLogLine('line-2', day1)
+    await appendSvLogLine('line-3', day2)
+
+    assert.equal(await readFile(join(dir, 'sv-2026-10-25.log'), 'utf8'), 'line-1\nline-2\n')
+    assert.equal(await readFile(join(dir, 'sv-2026-10-26.log'), 'utf8'), 'line-3\n')
+  } finally {
+    if (previous === undefined) delete process.env.SV_LOG_DIR
+    else process.env.SV_LOG_DIR = previous
+    await rm(dir, { recursive: true, force: true })
+  }
 })

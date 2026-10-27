@@ -138,3 +138,63 @@ test('SvSearchProvider：密钥缺失直接抛错且不重试', async () => {
   )
   assert.equal(calls, 0)
 })
+
+test('SvSearchProvider：deepseek 复用模型 Key 并解析官方结果', async () => {
+  const original = globalThis.fetch
+  const calls: Array<{ url: string; auth: string; body: unknown }> = []
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      auth: String((init?.headers as Record<string, string> | undefined)?.authorization ?? ''),
+      body: JSON.parse(String(init?.body ?? '{}')),
+    })
+    return new Response(JSON.stringify({
+      results: [
+        { title: 'T1', url: 'https://a.example/1', summary: 'S1', snippet: 'X1', date: '2026-06-01T00:00:00+00:00' },
+        { title: 'T2', url: 'https://b.example/2', snippet: 'S2', date: null },
+      ],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+
+  try {
+    const provider = new SvSearchProvider(
+      () => searchConfig({ provider: 'deepseek', baseURL: 'https://api.deepseek.com', apiKey: '' }),
+      () => 'sk-llm',
+    )
+    assert.equal(provider.available(), true)
+
+    const result = await provider.search({ query: 'q', maxResults: 5 } as Parameters<typeof provider.search>[0])
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.url, 'https://api.deepseek.com/v1/tools/search')
+    assert.equal(calls[0]!.auth, 'Bearer sk-llm')
+    assert.deepEqual(calls[0]!.body, { query: 'q', count: 5 })
+    assert.deepEqual(result.sources, [
+      { url: 'https://a.example/1', title: 'T1', snippet: 'S1', publishedAt: '2026-06-01T00:00:00+00:00' },
+      { url: 'https://b.example/2', title: 'T2', snippet: 'S2' },
+    ])
+    assert.equal(result.truncated, false)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('SvSearchProvider：deepseek 独立搜索密钥优先于模型 Key', async () => {
+  const provider = new SvSearchProvider(
+    () => searchConfig({ provider: 'deepseek', baseURL: 'https://api.deepseek.com', apiKey: 'sk-search' }),
+    () => 'sk-llm',
+  )
+  assert.equal(provider.available(), true)
+
+  let auth = ''
+  const original = globalThis.fetch
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    auth = String((init?.headers as Record<string, string> | undefined)?.authorization ?? '')
+    return new Response(JSON.stringify({ results: [] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    await provider.search({ query: 'q' } as Parameters<typeof provider.search>[0])
+    assert.equal(auth, 'Bearer sk-search')
+  } finally {
+    globalThis.fetch = original
+  }
+})

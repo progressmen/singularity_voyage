@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-web'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/dsh-schedule'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { ChatManager } from './chat.ts'
@@ -36,7 +37,7 @@ import { registerMemoryTools, registerTaskTools } from './tools.ts'
 export const name = '@singularity-voyage/sv-app'
 
 /** 等待这些服务就绪后再激活（base/web-app 层提供）。 */
-export const inject = ['llm', 'web', 'agents', 'webServer', 'tools', 'systemPrompt']
+export const inject = ['llm', 'web', 'agents', 'webServer', 'tools', 'systemPrompt', 'schedule']
 
 /** 组合包 patch 行注入的非密钥配置。 */
 export interface Config {
@@ -52,9 +53,12 @@ export interface Config {
 
 const LLM_PROVIDERS = new Set(['deepseek', 'qwen', 'ark', 'openai', 'custom'])
 
-/** 归一化搜索协议；未知取值回退 tavily（页面设置可改）。 */
-function normalizeSearchProvider(value: string | undefined): 'tavily' | 'bocha' {
-  return value !== undefined && value.trim().toLowerCase() === 'bocha' ? 'bocha' : 'tavily'
+/** 归一化搜索协议；unknown 取值回退 tavily（页面设置可改）。 */
+function normalizeSearchProvider(value: string | undefined): 'tavily' | 'bocha' | 'deepseek' {
+  const provider = value?.trim().toLowerCase()
+  if (provider === 'bocha') return 'bocha'
+  if (provider === 'deepseek') return 'deepseek'
+  return 'tavily'
 }
 
 /** 归一化 LLM 预设；未知取值按端点反推。 */
@@ -111,8 +115,13 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
 
   const baseURL = (config.llmBaseURL ?? process.env.SV_LLM_BASE_URL ?? 'https://api.deepseek.com').replace(/\/+$/, '')
   const llmProvider = normalizeLlmProvider(config.llmProvider ?? process.env.SV_LLM_PROVIDER, baseURL)
-  const provider = normalizeSearchProvider(config.searchProvider ?? process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER)
+  const requestedSearch = config.searchProvider ?? process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER
+  // 未显式配置搜索协议时：DeepSeek 模型默认走官方 Search API（复用模型 Key）
+  const provider = requestedSearch === undefined || requestedSearch.trim().length === 0
+    ? (llmProvider === 'deepseek' ? 'deepseek' : 'tavily')
+    : normalizeSearchProvider(requestedSearch)
   const isBocha = provider === 'bocha'
+  const isDeepSeekSearch = provider === 'deepseek'
   const retryAttempts = envPositiveInt('SV_SEARCH_RETRY_ATTEMPTS')
   const searchTimeoutMs = envPositiveInt('SV_SEARCH_API_TIMEOUT_MS')
   const retryBudgetMs = envPositiveInt('SV_SEARCH_RETRY_BUDGET_MS')
@@ -125,13 +134,19 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     },
     search: {
       provider,
+      // SV_SEARCH_BASE_URL 是 Tavily 兼容端点的覆盖项；DeepSeek 官方搜索默认 api.deepseek.com
       baseURL: (isBocha
         ? process.env.SV_SEARCH_BOCHA_BASE_URL ?? 'https://api.bochaai.com'
-        : process.env.SV_SEARCH_BASE_URL ?? 'https://api.tavily.com'
+        : isDeepSeekSearch
+          ? 'https://api.deepseek.com'
+          : process.env.SV_SEARCH_BASE_URL ?? 'https://api.tavily.com'
       ).replace(/\/+$/, ''),
       apiKey: isBocha
         ? process.env.SV_SEARCH_BOCHA_API_KEY ?? process.env.BOCHA_API_KEY ?? ''
-        : process.env.SV_SEARCH_API_KEY ?? '',
+        : isDeepSeekSearch
+          // 独立搜索密钥可选；留空时运行期回落到模型 API Key
+          ? process.env.DEEPSEEK_API_KEY ?? ''
+          : process.env.SV_SEARCH_API_KEY ?? '',
       ...(isBocha && process.env.BOCHA_FRESHNESS !== undefined && process.env.BOCHA_FRESHNESS.length > 0
         ? { freshness: process.env.BOCHA_FRESHNESS }
         : {}),
@@ -192,7 +207,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   })
 
   ctx.llm.registerAdapter([SV_PROVIDER_ID], new SvOpenAiCompatAdapter(() => store.llm))
-  ctx.web.registerSearchProvider(new SvSearchProvider(() => store.search))
+  ctx.web.registerSearchProvider(new SvSearchProvider(() => store.search, () => store.llm.apiKey))
 
   registerMemoryTools(ctx, memory)
   registerTaskTools(ctx, tasks)
@@ -213,6 +228,13 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     },
   })
 
+  ctx.systemPrompt.section({
+    name: 'sv:reminder-routing',
+    order: 9510,
+    interpolate: false,
+    text: () => '提醒与定时任务的选型：用户要在某个时间点收到提醒、或让助手届时继续处理，调用 schedule_create（提醒会回到本会话）；只是记录一件要做的事、需要清单勾选或邮件提醒，调用 task_create。',
+  })
+
   // turn 结束后异步抽取记忆；失败只告警，不影响对话。
   const extract = createMemoryExtractor(ctx, () => ({ provider: SV_PROVIDER_ID, model: store.llm.model }))
   const chat = new ChatManager(ctx, store, sessions, {
@@ -229,6 +251,6 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
         })
     },
   })
-  registerSvRoutes(ctx, chat, store, sessions, memory, tasks, reminders, mailer)
+  registerSvRoutes(ctx, chat, store, sessions, memory, tasks, reminders, mailer, ctx.schedule)
   ctx.logger.info(svLog('index', 'surface_ready', { path: '/sv/' }))
 }

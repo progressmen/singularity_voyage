@@ -13,7 +13,10 @@
  *  - 不打印密钥、完整 header、记忆正文与任务备注（只打 id 与长度）。
  *
  * 级别语义：info = 状态变化与成功写入；warn = 可降级失败；error = 请求/数据无法处理。
+ * 同一批日志同时由 stdout 出口与按天切分的文件（logs/sv-YYYY-MM-DD.log）落盘。
  */
+import { appendFile, mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 
 /** sv-app 的模块标签。 */
 export type SvLogModule = 'index' | 'chat' | 'http' | 'reminders' | 'memory' | 'tasks' | 'mail' | 'tool'
@@ -74,18 +77,62 @@ function timestamp(date: Date = new Date()): string {
     + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+/** 本地日期串 `YYYY-MM-DD`。 */
+function localDate(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** 日志落盘目录：$SV_LOG_DIR 可覆盖，默认仓库根 logs/（运行日志接口读同一目录）。 */
+export function svLogDir(): string {
+  const override = process.env.SV_LOG_DIR?.trim()
+  if (override !== undefined && override.length > 0) return override
+  return join(import.meta.dirname, '..', '..', '..', 'logs')
+}
+
+/** 按天切分的日志文件名，如 `sv-2026-10-26.log`。 */
+export function svLogFileName(date: Date = new Date()): string {
+  return `sv-${localDate(date)}.log`
+}
+
+/** 串行写盘队列：避免并发 append 交错。 */
+let logWriteChain: Promise<void> = Promise.resolve()
+
 /**
- * 为 sv-app 安装 stdout 日志出口。
+ * 追加一行到当天日志文件；跨天自动切到新文件。
+ * 写盘失败静默（日志不能反过来影响主流程）；返回的 Promise 便于测试等待落盘。
+ * @param line - 完整日志行（不含换行）。
+ * @param date - 决定分文件的日期，默认当前时间。
+ */
+export function appendSvLogLine(line: string, date: Date = new Date()): Promise<void> {
+  const dir = svLogDir()
+  const file = join(dir, svLogFileName(date))
+  const text = line.endsWith('\n') ? line : `${line}\n`
+  const next = logWriteChain.then(async () => {
+    await mkdir(dir, { recursive: true })
+    await appendFile(file, text)
+  })
+  logWriteChain = next.catch(() => undefined)
+  return logWriteChain
+}
+
+/**
+ * 为 sv-app 安装 stdout 与文件日志出口。
  *
  * dsh 默认不把 logger 输出打到控制台（只有启动失败时由 boot 自行打印），
  * 因此本插件自带一个只输出自身消息的 exporter：error / info / warn 三类，
- * debug（堆栈）留在 logger buffer 里按需查看。
+ * debug（堆栈）留在 logger buffer 里按需查看。默认写入 stdout，同时按天
+ * 追加到 logs/sv-YYYY-MM-DD.log，服务重启不会覆盖历史日志。
  * @param logger - `ctx.logger`。
- * @param write - 单行输出函数，默认写 stdout 并加时间前缀。
+ * @param write - 单行输出函数；默认写 stdout + 当天日志文件，并加时间前缀。
  */
 export function installSvLogSink(
   logger: SvLogSinkHost,
-  write: (line: string) => void = line => process.stdout.write(`${timestamp()} ${line}\n`),
+  write: (line: string) => void = line => {
+    const text = `${timestamp()} ${line}`
+    process.stdout.write(`${text}\n`)
+    void appendSvLogLine(text)
+  },
 ): void {
   logger.exporter({
     colors: false,

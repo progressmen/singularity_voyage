@@ -44,6 +44,32 @@ test('register / recordUser / recordAssistant 维护索引与标题', async () =
   assert.deepEqual(messages[1].tools, [{ name: 'web_search', args: '{"query":"北京天气"}', durationMs: 120 }])
 })
 
+test('recordUsage 持久化 token 统计且不改变排序时间', async () => {
+  const store = new SessionStore(dir)
+  await store.load()
+  await store.register('s3')
+  await store.recordUser('s3', '统计一下', 3000)
+  const usage = {
+    inputTokens: 1200,
+    outputTokens: 300,
+    cacheReadTokens: 800,
+    totalTokens: 2300,
+    contextTokens: 2000,
+    contextWindow: 131072,
+    updatedAt: 4000,
+  }
+  await store.recordUsage('s3', usage)
+
+  const entry = store.list().find(item => item.id === 's3')
+  assert.deepEqual(entry?.usage, usage)
+  assert.equal(entry?.updatedAt, 3000)
+
+  // 重新载入后统计仍在（跨重启）
+  const reloaded = new SessionStore(dir)
+  await reloaded.load()
+  assert.deepEqual(reloaded.list().find(item => item.id === 's3')?.usage, usage)
+})
+
 test('recordUser 只在首条用户消息时设置标题', async () => {
   const store = new SessionStore(dir)
   await store.load()

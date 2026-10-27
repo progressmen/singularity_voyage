@@ -14,7 +14,8 @@
       from up-to-date information.
 
 # web_search 走 SV 自有的搜索提供方（协议由 SV_SEARCH_PROVIDER / WEB_SEARCH_PROVIDER
-# 环境变量决定：tavily 或 bocha）；web_fetch 继续使用匿名 HTTP 抓取后端。
+# 环境变量或设置页决定：deepseek / tavily / bocha；留空时 DeepSeek 模型默认官方搜索）；
+# web_fetch 继续使用匿名 HTTP 抓取后端。
 - id: web
   config:
     searchProvider: sv-search
@@ -48,6 +49,15 @@
       config:
         fetch: true
         searchTimeoutMs: 60000
+
+    # 宿主定时任务工具：@deepseek-ai/dsh-schedule 服务由 dsh-web-app 层挂载，
+    # 这里把模型侧四个工具（schedule_create / schedule_list / schedule_update /
+    # schedule_delete）注册到 SV 会话（无 preset）的作用域。提醒到期时由宿主
+    # 通过 sessionController 投递回原会话，触发模型继续执行。
+    # 与 sv-app 自建的待办（task_*）分工：待办是清单 + 页面/邮件提醒；
+    # 定时任务是需要按时让 agent 动手的事，到期会回到同一会话。
+    - id: sv-tool-schedule
+      name: '@deepseek-ai/dsh-tool-schedule'
 
     # SV 邮件 MCP 服务（Python 标准库实现 stdio，见 mcp/sv-mail-mcp/）。
     # 模型获得 mcp__sv-mail__send_email / mcp__sv-mail__mail_status 两个工具；
@@ -103,4 +113,4 @@
         llmProvider: !!js process.env.SV_LLM_PROVIDER || ''
         llmBaseURL: !!js process.env.SV_LLM_BASE_URL ?? 'https://api.deepseek.com'
         llmModel: !!js process.env.SV_LLM_MODEL ?? 'deepseek-chat'
-        searchProvider: !!js process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER ?? 'tavily'
+        searchProvider: !!js process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER ?? ''

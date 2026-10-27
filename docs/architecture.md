@@ -755,7 +755,7 @@ sv-app 的日志格式（`packages/sv-app/src/log.ts`）：
 | 级别 | `info` 状态变化与成功写入；`warn` 可降级失败；`error` 请求/数据无法处理；`debug` 堆栈 |
 | 脱敏 | 不记录密钥、完整 header、记忆正文与任务备注（只记 id 与数量） |
 
-dsh 内核默认不输出 logger 到控制台，因此 `sv-app` 自带一个只输出自身消息的 exporter：`error`/`info`/`warn` 走 stdout，`debug` 留在 buffer。这样 `pnpm dev` 的终端与 `scripts/start.sh` 的 `logs/sv.log` 都能用 `grep '\[sv-app\]'` 精确筛出本项目日志。
+dsh 内核默认不输出 logger 到控制台，因此 `sv-app` 自带一个只输出自身消息的 exporter：`error`/`info`/`warn` 走 stdout 并按本地日期追加到 `logs/sv-YYYY-MM-DD.log`，`debug` 留在 buffer。这样终端、日志文件与页面的「运行日志」都能用 `grep '\[sv-app\]'` 精确筛出本项目日志。
 
 ### 10.3 评测体系
 

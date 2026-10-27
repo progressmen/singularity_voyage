@@ -9,9 +9,10 @@
  * 单条会话记录超过上限时删除最旧条目。
  */
 import pg from 'pg'
-import { UNTITLED } from './sessions-store.ts'
+import { normalizeUsage, UNTITLED } from './sessions-store.ts'
 import type {
   SessionIndexEntry,
+  SessionUsage,
   SvSessionStore,
   TranscriptEntry,
   TranscriptToolEntry,
@@ -34,6 +35,7 @@ type SessionRow = {
   created_at: string | number
   updated_at: string | number
   turns: string | number
+  usage: unknown
 }
 
 type MessageRow = {
@@ -79,8 +81,10 @@ export class PgSessionStore implements SvSessionStore {
         title text NOT NULL,
         created_at bigint NOT NULL,
         updated_at bigint NOT NULL,
-        turns integer NOT NULL DEFAULT 0
+        turns integer NOT NULL DEFAULT 0,
+        usage jsonb
       );
+      ALTER TABLE sv_sessions ADD COLUMN IF NOT EXISTS usage jsonb;
       CREATE TABLE IF NOT EXISTS sv_messages (
         id bigserial PRIMARY KEY,
         session_id text NOT NULL REFERENCES sv_sessions(id) ON DELETE CASCADE,
@@ -98,17 +102,19 @@ export class PgSessionStore implements SvSessionStore {
   async load(): Promise<void> {
     await this.schema()
     const { rows } = await this.pool.query<SessionRow>(
-      'SELECT id, title, created_at, updated_at, turns FROM sv_sessions',
+      'SELECT id, title, created_at, updated_at, turns, usage FROM sv_sessions',
     )
     this.index.clear()
     for (const row of rows) {
       if (typeof row.id !== 'string' || row.id.length === 0) continue
+      const usage = normalizeUsage(row.usage)
       this.index.set(row.id, {
         id: row.id,
         title: row.title.length > 0 ? row.title : UNTITLED,
         createdAt: Number(row.created_at),
         updatedAt: Number(row.updated_at),
         turns: Number(row.turns),
+        ...usage === undefined ? {} : { usage },
       })
     }
   }
@@ -211,6 +217,14 @@ export class PgSessionStore implements SvSessionStore {
       out.push(entry)
     }
     return out
+  }
+
+  async recordUsage(id: string, usage: SessionUsage): Promise<void> {
+    if (!SESSION_ID_RE.test(id)) return
+    await this.schema()
+    await this.pool.query('UPDATE sv_sessions SET usage = $2 WHERE id = $1', [id, usage])
+    const entry = this.index.get(id)
+    if (entry !== undefined) entry.usage = usage
   }
 
   async rename(id: string, title: string): Promise<boolean> {

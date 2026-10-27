@@ -8,12 +8,13 @@ import { open, readdir, readFile, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-schedule'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { ChatManager, SvChatEvent } from './chat.ts'
 import type { ConfigStore } from './config-store.ts'
 import { MEMORY_KINDS, memoryView, type MemoryKind, type MemoryPatch, type MemoryStore } from './memory-store.ts'
 import { SV_PROVIDER_ID } from './llm-adapter.ts'
-import { svError, svErrorTrace, svLog } from './log.ts'
+import { svError, svErrorTrace, svLog, svLogDir } from './log.ts'
 import type { MailNotifier } from './mail-notifier.ts'
 import type { ReminderService, SvReminderEvent } from './reminders.ts'
 import { SV_SEARCH_PROVIDER_ID } from './search-provider.ts'
@@ -21,14 +22,12 @@ import type { SvSessionStore } from './sessions-store.ts'
 import { TASK_RECURRENCES, taskView, type TaskRecurrence, type TaskStatus, type TasksStore } from './tasks-store.ts'
 
 const WEB_DIR = join(import.meta.dirname, '..', 'web')
-/** 项目日志目录（仓库根 logs/，由 start.sh 的重定向写入）。 */
-const LOG_DIR = join(WEB_DIR, '..', '..', '..', 'logs')
 /** 单次最多读取的日志尾部字节数，避免大文件占满内存。 */
-const LOG_TAIL_BYTES = 512 * 1024
+const LOG_TAIL_BYTES = 8 * 1024 * 1024
 /** 合法日志文件名（禁止路径穿越）。 */
 const LOG_FILE_RE = /^[A-Za-z0-9._-]{1,64}\.log$/
-/** 日志接口返回的条目上限。 */
-const LOG_LIMIT_MAX = 2000
+/** 日志表格单页条数上限。 */
+const LOG_PAGE_SIZE_MAX = 200
 
 type SvLogLevel = 'error' | 'warn' | 'info'
 
@@ -114,6 +113,7 @@ export function registerSvRoutes(
   tasks: TasksStore,
   reminders: ReminderService,
   mailer: MailNotifier,
+  schedule: Context['schedule'],
 ): void {
   const staticCache = new Map<string, { body: Buffer; type: string }>()
   const serveStatic = async (res: ServerResponse, file: string): Promise<void> => {
@@ -450,29 +450,72 @@ export function registerSvRoutes(
       return
     }
 
-    // GET /sv/api/logs —— 读取项目 logs/ 下的日志（默认 sv.log 尾部）
+    // GET /sv/api/schedules —— 宿主定时任务目录（活动 + 已结束，含会话绑定）
+    if (req.method === 'GET' && path === '/sv/api/schedules') {
+      try {
+        const entries = await schedule.catalog()
+        const now = Date.now()
+        sendJson(res, 200, {
+          schedules: entries.map(entry => ({
+            id: entry.id,
+            kind: entry.kind,
+            title: entry.title,
+            prompt: entry.prompt,
+            scheduledAt: entry.scheduledAt,
+            sessionId: entry.sessionId,
+            status: entry.status,
+            state: entry.status === 'active' && Date.parse(entry.scheduledAt) <= now ? 'overdue' : 'scheduled',
+            ...(entry.lastDelivery === undefined ? {} : { lastDelivery: entry.lastDelivery }),
+          })),
+        })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const scheduleMatch = /^\/sv\/api\/schedules\/([A-Za-z0-9_-]{1,64})$/.exec(path)
+
+    // DELETE /sv/api/schedules/:id —— 删除定时任务（宿主不提供暂停，删除即取消后续投递）
+    if (req.method === 'DELETE' && scheduleMatch !== null) {
+      try {
+        const id = scheduleMatch[1]!
+        const entry = (await schedule.catalog()).find(candidate => candidate.id === id)
+        if (entry === undefined) {
+          sendJson(res, 404, { error: '定时任务不存在' })
+          return
+        }
+        const result = await schedule.delete({ sessionId: entry.sessionId, id: entry.id })
+        sendJson(res, 200, { deleted: result.deleted })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // GET /sv/api/logs —— 分页读取 logs/ 下按天分割的日志（默认最新文件）
     if (req.method === 'GET' && path === '/sv/api/logs') {
       const url = new URL(req.url ?? '/', 'http://sv.local')
-      const file = url.searchParams.get('file') ?? 'sv.log'
-      if (!LOG_FILE_RE.test(file)) {
-        sendJson(res, 400, { error: 'file 非法' })
-        return
-      }
       const level = url.searchParams.get('level') ?? ''
       if (level !== '' && level !== 'error' && level !== 'warn' && level !== 'info') {
         sendJson(res, 400, { error: 'level 必须是 error / warn / info' })
         return
       }
       const keyword = (url.searchParams.get('q') ?? '').trim().toLowerCase()
-      const rawLimit = Number(url.searchParams.get('limit') ?? '500')
-      const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), LOG_LIMIT_MAX) : 500
+      const rawPage = Number(url.searchParams.get('page') ?? '1')
+      const page = Number.isFinite(rawPage) ? Math.max(Math.trunc(rawPage), 1) : 1
+      const rawPageSize = Number(url.searchParams.get('pageSize') ?? '50')
+      const pageSize = Number.isFinite(rawPageSize)
+        ? Math.min(Math.max(Math.trunc(rawPageSize), 1), LOG_PAGE_SIZE_MAX)
+        : 50
 
-      // 可选的日志文件清单（logs/*.log，按修改时间倒序）
+      // 可选的日志文件清单（logs/*.log，按修改时间倒序，最新的在最前）
+      const logDir = svLogDir()
       let files: { name: string; size: number; mtime: number }[] = []
       try {
-        const names = (await readdir(LOG_DIR)).filter(name => LOG_FILE_RE.test(name))
+        const names = (await readdir(logDir)).filter(name => LOG_FILE_RE.test(name))
         files = await Promise.all(names.map(async name => {
-          const info = await stat(join(LOG_DIR, name))
+          const info = await stat(join(logDir, name))
           return { name, size: info.size, mtime: info.mtimeMs }
         }))
         files.sort((a, b) => b.mtime - a.mtime)
@@ -480,11 +523,21 @@ export function registerSvRoutes(
         // 日志目录不存在：按无文件处理
       }
 
+      // 未指定文件时默认最新的那个（按天分割后即当天文件）
+      const requested = url.searchParams.get('file')
+      const file = requested !== null && requested.length > 0 ? requested : files[0]?.name ?? 'sv.log'
+      if (!LOG_FILE_RE.test(file)) {
+        sendJson(res, 400, { error: 'file 非法' })
+        return
+      }
+
       let tail: Awaited<ReturnType<typeof readTail>>
       try {
-        tail = await readTail(join(LOG_DIR, file), LOG_TAIL_BYTES)
+        tail = await readTail(join(logDir, file), LOG_TAIL_BYTES)
       } catch {
-        sendJson(res, 200, { files, file, exists: false, lines: [], total: 0, matched: 0, truncated: false })
+        sendJson(res, 200, {
+          files, file, exists: false, lines: [], total: 0, matched: 0, page, pageSize, truncated: false,
+        })
         return
       }
 
@@ -494,6 +547,9 @@ export function registerSvRoutes(
         if (level.length > 0 && line.level !== level) return false
         return true
       })
+      // 新的在前：表格第一页就是最新日志
+      matched.reverse()
+      const start = (page - 1) * pageSize
       sendJson(res, 200, {
         files,
         file,
@@ -502,8 +558,10 @@ export function registerSvRoutes(
         mtime: tail.mtime,
         total: all.length,
         matched: matched.length,
+        page,
+        pageSize,
         truncated: tail.size > LOG_TAIL_BYTES,
-        lines: matched.slice(-limit),
+        lines: matched.slice(start, start + pageSize),
       })
       return
     }

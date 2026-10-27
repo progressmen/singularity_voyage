@@ -21,6 +21,59 @@ export interface SessionIndexEntry {
   createdAt: number
   updatedAt: number
   turns: number
+  /** token 消耗与上下文占用统计（跨重启保留）。 */
+  usage?: SessionUsage
+}
+
+/**
+ * 会话 token 统计。
+ *
+ * `inputTokens` / `cacheReadTokens` 与 `contextTokens` 口径与 dsh 的
+ * {@link TokenUsage} 一致：输入与缓存命中互不包含，上下文占用取最近一次
+ * 模型请求的 prompt 总量（缓存读写 + 非缓存输入）。
+ */
+export interface SessionUsage {
+  /** 累计非缓存输入 tokens。 */
+  inputTokens: number
+  /** 累计输出 tokens。 */
+  outputTokens: number
+  /** 累计缓存命中输入 tokens。 */
+  cacheReadTokens: number
+  /** 累计总量（含缓存与输出）。 */
+  totalTokens: number
+  /** 最近一次模型请求的 prompt tokens，即当前上下文占用。 */
+  contextTokens: number
+  /** 最近一次统计时的上下文窗口；未知时省略。 */
+  contextWindow?: number
+  /** 统计更新时间（epoch ms）。 */
+  updatedAt: number
+}
+
+/** 解析持久化的 token 统计；关键字段缺失或非法时返回 undefined。 */
+export function normalizeUsage(raw: unknown): SessionUsage | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const value = raw as Record<string, unknown>
+  const count = (key: string): number | undefined => {
+    const item = value[key]
+    return typeof item === 'number' && Number.isFinite(item) && item >= 0 ? item : undefined
+  }
+  const inputTokens = count('inputTokens')
+  const outputTokens = count('outputTokens')
+  const totalTokens = count('totalTokens')
+  const updatedAt = count('updatedAt')
+  if (inputTokens === undefined || outputTokens === undefined
+    || totalTokens === undefined || updatedAt === undefined) return undefined
+  const usage: SessionUsage = {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: count('cacheReadTokens') ?? 0,
+    totalTokens,
+    contextTokens: count('contextTokens') ?? 0,
+    updatedAt,
+  }
+  const contextWindow = count('contextWindow')
+  if (contextWindow !== undefined && contextWindow > 0) usage.contextWindow = contextWindow
+  return usage
 }
 
 /** transcript 中一条工具摘要（kind 由前端按工具名分类，这里不重复存）。 */
@@ -62,6 +115,8 @@ export interface SvSessionStore {
   ): Promise<void>
   /** 读取一个会话的对话记录。 */
   messages(id: string): Promise<TranscriptEntry[]>
+  /** 记录会话的 token 统计（不改变排序时间与轮次）。 */
+  recordUsage(id: string, usage: SessionUsage): Promise<void>
   /** 删除索引条目与对话记录。 */
   remove(id: string): Promise<boolean>
   /** 重命名会话；未知 id 返回 false。 */
@@ -121,12 +176,14 @@ export class SessionStore implements SvSessionStore {
       this.index = new Map()
       for (const entry of parsed.sessions) {
         if (typeof entry?.id === 'string' && entry.id.length > 0) {
+          const usage = normalizeUsage((entry as { usage?: unknown }).usage)
           this.index.set(entry.id, {
             id: entry.id,
             title: typeof entry.title === 'string' && entry.title.length > 0 ? entry.title : UNTITLED,
             createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : 0,
             updatedAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : 0,
             turns: typeof entry.turns === 'number' && entry.turns >= 0 ? entry.turns : 0,
+            ...usage === undefined ? {} : { usage },
           })
         }
       }
@@ -210,6 +267,14 @@ export class SessionStore implements SvSessionStore {
       }
     }
     return out
+  }
+
+  /** 记录会话的 token 统计（不改变排序时间与轮次）。 */
+  async recordUsage(id: string, usage: SessionUsage): Promise<void> {
+    const entry = this.index.get(id)
+    if (entry === undefined) return
+    entry.usage = usage
+    await this.persistIndex()
   }
 
   /** 重命名会话；未知 id 返回 false。 */

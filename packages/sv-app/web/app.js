@@ -41,16 +41,17 @@ let conversations = loadConversations()
 let activeId = localStorage.getItem(ACTIVE_KEY) ?? null
 let streaming = false
 
-/* ── 视图切换（对话 / 待办 / 记忆 / 日志） ───────────────── */
+/* ── 视图切换（对话 / 待办 / 定时任务 / 记忆 / 日志） ───── */
 const VIEW_KEY = 'sv.view.v1'
 let currentView = localStorage.getItem(VIEW_KEY) ?? 'chat'
-if (!['chat', 'tasks', 'memory', 'logs'].includes(currentView)) currentView = 'chat'
+if (!['chat', 'tasks', 'schedules', 'memory', 'logs'].includes(currentView)) currentView = 'chat'
 
 /** 非对话视图的顶栏标题。 */
-const VIEW_TITLES = { tasks: '待办与提醒', memory: '长期记忆', logs: '运行日志' }
+const VIEW_TITLES = { tasks: '待办与提醒', schedules: '定时任务', memory: '长期记忆', logs: '运行日志' }
 
-/** 待办与记忆数据缓存。 */
+/** 待办、定时任务与记忆数据缓存。 */
 let tasksCache = []
+let schedulesCache = []
 let memoriesCache = []
 let memoryKindFilter = ''
 let overdueCount = 0
@@ -64,10 +65,13 @@ function applyView(view) {
   $('messages').hidden = view !== 'chat'
   $('composer').hidden = view !== 'chat'
   $('panel-tasks').hidden = view !== 'tasks'
+  $('panel-schedules').hidden = view !== 'schedules'
   $('panel-memory').hidden = view !== 'memory'
   $('panel-logs').hidden = view !== 'logs'
   $('topbar-title').textContent = VIEW_TITLES[view] ?? (activeConversation()?.title ?? '新对话')
+  renderUsage(activeConversation()?.usage)
   if (view === 'tasks') void loadTasks()
+  if (view === 'schedules') void loadSchedules()
   if (view === 'memory') void loadMemories()
   if (view === 'logs') {
     void loadLogs()
@@ -82,7 +86,10 @@ function loadConversations() {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORE_KEY) ?? '[]')
     if (!Array.isArray(parsed)) return []
-    return parsed.filter(c => c && typeof c.id === 'string' && Array.isArray(c.messages))
+    // 旧版本可能把同一轮的多条 assistant 消息分别存下，载入时一并合并
+    return parsed
+      .filter(c => c && typeof c.id === 'string' && Array.isArray(c.messages))
+      .map(c => ({ ...c, messages: mergeAssistantBatches(c.messages) }))
   } catch {
     return []
   }
@@ -118,6 +125,30 @@ function selectConversation(id) {
   if (conv !== null && conv.messages.length === 0) void hydrateConversation(id)
 }
 
+/**
+ * 合并同一轮内的连续 assistant 条目。
+ * 工具调用前后会产生多条 assistant 消息（各自带一段思考过程），
+ * 历史回显应合并成一条：思考与正文按空行拼接，工具记录按顺序累积。
+ */
+function mergeAssistantBatches(messages) {
+  const out = []
+  for (const message of messages) {
+    const prev = out[out.length - 1]
+    if (message.role === 'assistant' && prev?.role === 'assistant') {
+      if (message.text) prev.text = prev.text ? `${prev.text}\n\n${message.text}` : message.text
+      if (message.reasoning) {
+        prev.reasoning = prev.reasoning ? `${prev.reasoning}\n\n${message.reasoning}` : message.reasoning
+      }
+      if (Array.isArray(message.tools) && message.tools.length > 0) {
+        prev.tools = [...(Array.isArray(prev.tools) ? prev.tools : []), ...message.tools]
+      }
+      continue
+    }
+    out.push({ ...message })
+  }
+  return out
+}
+
 /** 启动时按 id 从服务端恢复历史（本地缺失或为空时），支持清缓存后找回会话。 */
 async function hydrateConversation(id) {
   try {
@@ -137,12 +168,12 @@ async function hydrateConversation(id) {
         conversations.unshift(conv)
       }
     }
-    conv.messages = messages.map(m => ({
+    conv.messages = mergeAssistantBatches(messages.map(m => ({
       role: m.role === 'user' ? 'user' : 'assistant',
       text: m.text ?? '',
       ...(m.reasoning ? { reasoning: m.reasoning } : {}),
       ...(Array.isArray(m.tools) && m.tools.length > 0 ? { tools: m.tools } : {}),
-    }))
+    })))
     const firstUser = messages.find(m => m.role === 'user')
     if (conv.title === '新对话' && firstUser?.text) conv.title = firstUser.text.slice(0, 24)
     conv.updatedAt = messages[messages.length - 1]?.ts ?? Date.now()
@@ -176,6 +207,8 @@ async function syncConversations() {
       // 标题以服务端为准（可能在其他浏览器重命名过），时间取较新值
       if (typeof entry.title === 'string' && entry.title.length > 0) local.title = entry.title
       local.updatedAt = Math.max(local.updatedAt ?? 0, Number(entry.updatedAt) || 0)
+      // token 统计由服务端持久化，换浏览器/重启后仍可展示
+      if (entry.usage !== undefined) local.usage = entry.usage
       merged.push(local)
       continue
     }
@@ -185,6 +218,7 @@ async function syncConversations() {
       title: typeof entry.title === 'string' && entry.title.length > 0 ? entry.title : '新对话',
       messages: [],
       updatedAt: Number(entry.updatedAt) || 0,
+      ...(entry.usage === undefined ? {} : { usage: entry.usage }),
     })
   }
   for (const conv of conversations) {
@@ -290,6 +324,46 @@ function renderSidebar() {
   $('conv-count').textContent = history.length > 0 ? ` (${history.length})` : ''
   const conv = activeConversation() ?? conversations[0]
   $('topbar-title').textContent = VIEW_TITLES[currentView] ?? (conv ? conv.title : '新对话')
+  renderUsage(conv?.usage)
+}
+
+/** token 数缩写：1234 → 1.2K，1234567 → 1.2M。 */
+function formatTokens(value) {
+  const n = Math.max(0, Math.round(Number(value) || 0))
+  if (n < 1000) return String(n)
+  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}K`
+  return `${(n / 1_000_000).toFixed(1)}M`
+}
+
+/** 顶栏的上下文占用与累计 token；非对话视图或没有统计时隐藏。 */
+function renderUsage(usage) {
+  const box = $('topbar-usage')
+  if (!box) return
+  const hasUsage = usage !== undefined && usage !== null
+  if (currentView !== 'chat' || !hasUsage) {
+    box.hidden = true
+    return
+  }
+  const context = Number(usage.contextTokens) || 0
+  const window = Number(usage.contextWindow) || 0
+  const percent = window > 0 ? Math.min(100, (context / window) * 100) : null
+  $('usage-context').textContent = percent === null
+    ? `上下文 ${formatTokens(context)}`
+    : `上下文 ${formatTokens(context)} / ${formatTokens(window)}`
+  $('usage-percent').textContent = percent === null ? '' : `${percent < 10 ? percent.toFixed(1) : Math.round(percent)}%`
+  const meter = $('usage-meter')
+  meter.hidden = percent === null
+  meter.className = 'usage-meter' + (percent !== null && percent >= 90 ? ' danger' : percent !== null && percent >= 70 ? ' warn' : '')
+  $('usage-meter-fill').style.width = percent === null ? '0%' : `${percent.toFixed(1)}%`
+  const input = (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0)
+  $('usage-tokens').textContent = `↑${formatTokens(input)} ↓${formatTokens(usage.outputTokens)}`
+  box.title = [
+    `累计输入 ${formatTokens(input)}（缓存命中 ${formatTokens(usage.cacheReadTokens)}）`,
+    `累计输出 ${formatTokens(usage.outputTokens)}`,
+    `累计总量 ${formatTokens(usage.totalTokens)}`,
+    window > 0 ? `上下文窗口 ${formatTokens(window)}（可在设置中覆盖）` : '未配置上下文窗口',
+  ].join(' · ')
+  box.hidden = false
 }
 
 /* ── 会话操作菜单（星标 / 重命名 / 删除） ───────────────── */
@@ -755,6 +829,16 @@ function renderMailQuick(mail) {
   status.className = 'mail-quick-status' + (mail.enabled === true ? ' on' : '')
 }
 
+/** 各搜索提供方的默认根地址（切换提供方时回填，仍可手改）。 */
+const SEARCH_PRESETS = {
+  deepseek: 'https://api.deepseek.com',
+  tavily: 'https://api.tavily.com',
+  bocha: 'https://api.bochaai.com',
+}
+
+/** 最近一次读取到的搜索密钥配置状态（设置表单占位提示用）。 */
+let searchHasApiKey = false
+
 function fillSettingsForm(state) {
   $('cfg-theme').value = preferredTheme()
   $('cfg-llm-provider').value = state.llm?.provider ?? 'custom'
@@ -764,12 +848,11 @@ function fillSettingsForm(state) {
   $('cfg-llm-max').value = state.llm?.maxTokens ?? ''
   $('cfg-llm-key').value = ''
   $('cfg-llm-key').placeholder = state.llm?.hasApiKey ? '已配置（留空表示不修改）' : '未配置'
-  $('cfg-search-provider').value = state.search?.provider ?? 'tavily'
+  $('cfg-search-provider').value = state.search?.provider ?? 'deepseek'
   $('cfg-search-base').value = state.search?.baseURL ?? ''
   $('cfg-search-key').value = ''
-  $('cfg-search-key').placeholder = state.search?.hasApiKey
-    ? '已配置（留空表示不修改）'
-    : (state.search?.provider === 'bocha' ? '未配置（env: BOCHA_API_KEY）' : '未配置（env: SV_SEARCH_API_KEY）')
+  searchHasApiKey = state.search?.hasApiKey === true
+  applySearchKeyPlaceholder()
   $('cfg-search-freshness').value = state.search?.freshness ?? 'noLimit'
   $('cfg-search-retry').value = state.search?.retryAttempts ?? ''
   $('cfg-search-timeout').value = state.search?.timeoutMs ?? ''
@@ -807,16 +890,27 @@ function fillSettingsForm(state) {
   $('settings-error').textContent = ''
 }
 
-/** 按提供方切换搜索设置：博查显示时效过滤，默认根地址随提供方变化。 */
+/** 搜索密钥输入框占位：DeepSeek 官方搜索默认复用模型 Key。 */
+function applySearchKeyPlaceholder() {
+  const provider = $('cfg-search-provider').value
+  $('cfg-search-key').placeholder = provider === 'deepseek'
+    ? '留空即复用上方模型 API Key'
+    : searchHasApiKey
+      ? '已配置（留空表示不修改）'
+      : (provider === 'bocha' ? '未配置（env: BOCHA_API_KEY）' : '未配置（env: SV_SEARCH_API_KEY）')
+}
+
+/** 按提供方切换搜索设置：回填默认根地址，博查显示时效过滤。 */
 function syncSearchProviderUI() {
-  const bocha = $('cfg-search-provider').value === 'bocha'
+  const provider = $('cfg-search-provider').value
   const base = $('cfg-search-base')
-  if (bocha) {
-    if (base.value.trim().length === 0 || base.value === 'https://api.tavily.com') base.value = 'https://api.bochaai.com'
-  } else if (base.value.trim().length === 0 || base.value === 'https://api.bochaai.com') {
-    base.value = 'https://api.tavily.com'
+  const current = base.value.trim().replace(/\/+$/, '')
+  // 只在空或仍是某个提供方预设默认值时回填，保留用户手填的地址
+  if (current.length === 0 || Object.values(SEARCH_PRESETS).includes(current)) {
+    base.value = SEARCH_PRESETS[provider] ?? ''
   }
-  $('cfg-search-freshness-field').hidden = !bocha
+  $('cfg-search-freshness-field').hidden = provider !== 'bocha'
+  applySearchKeyPlaceholder()
 }
 
 /** 切换 LLM 预设：非 custom 时回填该供应商默认端点与模型（仍可手改）。 */
@@ -1038,6 +1132,11 @@ function handleEvent(conv, assistant, event) {
       assistant.reasoning = event.reasoning || assistant.reasoning
       refreshActiveMessage()
       break
+    case 'usage':
+      conv.usage = event.usage
+      saveConversations()
+      if (conv === activeConversation()) renderUsage(event.usage)
+      break
     case 'status':
       $('topbar-status').textContent = event.status === 'running' ? '● 生成中' : ''
       break
@@ -1226,6 +1325,98 @@ async function submitTask(event) {
   await loadTasks()
 }
 
+/* ── 定时任务（harness schedule） ───────────────────────── */
+
+/** 规则种类 → 中文标签。 */
+const SCHEDULE_KINDS = { after: '一次性', at: '一次性', every: '固定间隔', daily: '每天', weekly: '每周', cron: 'cron' }
+
+async function loadSchedules() {
+  try {
+    const { schedules } = await api('/sv/api/schedules')
+    schedulesCache = Array.isArray(schedules) ? schedules : []
+    renderSchedules()
+  } catch (error) {
+    const list = $('schedules-list')
+    list.innerHTML = ''
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = `加载失败：${error?.message ?? String(error)}`
+    list.appendChild(empty)
+  }
+}
+
+function renderSchedules() {
+  const list = $('schedules-list')
+  list.innerHTML = ''
+  if (schedulesCache.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = '没有定时任务。对我说「10 秒后提醒我喝水」即可创建。'
+    list.appendChild(empty)
+    return
+  }
+  for (const entry of schedulesCache) list.appendChild(scheduleNode(entry))
+}
+
+function scheduleNode(entry) {
+  const el = document.createElement('div')
+  el.className = 'task-item'
+  if (entry.status !== 'active') el.classList.add('done')
+
+  const main = document.createElement('div')
+  main.className = 'task-main'
+  const title = document.createElement('div')
+  title.className = 'task-title'
+  title.textContent = entry.title ?? entry.id
+  main.appendChild(title)
+
+  const meta = document.createElement('div')
+  meta.className = 'task-meta'
+  const at = Date.parse(entry.scheduledAt)
+  const bits = []
+  const when = Number.isFinite(at) ? fmtDue(at) : entry.scheduledAt
+  if (entry.status !== 'active') bits.push(`<span>已结束 · ${when}</span>`)
+  else if (entry.state === 'overdue') bits.push(`<span class="due">已逾期 · ${when}</span>`)
+  else bits.push(`<span>${when}</span>`)
+  bits.push(`<span>${SCHEDULE_KINDS[entry.kind] ?? entry.kind}</span>`)
+  if (entry.lastDelivery?.deliveredAt) {
+    const delivered = Date.parse(entry.lastDelivery.deliveredAt)
+    bits.push(`<span>投递于 ${Number.isFinite(delivered) ? fmtDue(delivered) : entry.lastDelivery.deliveredAt}</span>`)
+  }
+  meta.innerHTML = bits.join('')
+  main.appendChild(meta)
+
+  if (entry.prompt) {
+    const prompt = document.createElement('div')
+    prompt.className = 'task-meta'
+    prompt.textContent = entry.prompt
+    main.appendChild(prompt)
+  }
+  el.appendChild(main)
+
+  const actions = document.createElement('div')
+  actions.className = 'task-actions'
+  const remove = document.createElement('button')
+  remove.type = 'button'
+  remove.className = 'panel-act danger'
+  remove.title = '删除（取消后续投递）'
+  remove.textContent = '✕'
+  remove.addEventListener('click', () => void deleteSchedule(entry.id))
+  actions.appendChild(remove)
+  el.appendChild(actions)
+  return el
+}
+
+async function deleteSchedule(id) {
+  if (!confirm('删除这条定时任务？删除后不会再投递，已进入会话的消息不受影响。')) return
+  try {
+    await api(`/sv/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  } catch (error) {
+    alert(`删除失败：${error?.message ?? error}`)
+  }
+  await loadSchedules()
+}
+
 /* ── 记忆 ─────────────────────────────────────────────── */
 
 async function loadMemories() {
@@ -1384,14 +1575,22 @@ async function submitMemory(event) {
 let logLevelFilter = ''
 let logTimer = null
 let logFilesRendered = ''
+let logPage = 1
 
 const LOG_FOLLOW_MS = 2000
+const LOG_PAGE_SIZE = 50
+const LOG_LEVEL_LABELS = { error: '错误', warn: '警告', info: '信息' }
+/** sv-app 日志行前缀：`YYYY-MM-DD HH:mm:ss 正文`。 */
+const LOG_TIME_RE = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s?([\s\S]*)$/
 
 async function loadLogs() {
   const params = new URLSearchParams({
-    file: $('log-file').value || 'sv.log',
-    limit: '800',
+    page: String(logPage),
+    pageSize: String(LOG_PAGE_SIZE),
   })
+  // 未选文件时不传 file，由服务端默认读取最新的日志文件
+  const file = $('log-file').value
+  if (file) params.set('file', file)
   if (logLevelFilter) params.set('level', logLevelFilter)
   const keyword = $('log-search').value.trim()
   if (keyword) params.set('q', keyword)
@@ -1400,9 +1599,11 @@ async function loadLogs() {
     renderLogFiles(data.files ?? [], data.file)
     renderLogs(data)
   } catch (error) {
-    const view = $('log-view')
-    view.textContent = `加载日志失败：${error?.message ?? error}`
+    const body = $('log-body')
+    body.innerHTML = ''
+    body.appendChild(logEmptyRow(`加载日志失败：${error?.message ?? error}`))
     $('log-meta').textContent = ''
+    $('log-page-info').textContent = ''
   }
 }
 
@@ -1421,47 +1622,80 @@ function renderLogFiles(files, current) {
     }
     if (files.length === 0) {
       const option = document.createElement('option')
-      option.value = 'sv.log'
-      option.textContent = 'sv.log'
+      option.value = ''
+      option.textContent = '暂无日志文件'
       select.appendChild(option)
     }
   }
-  if (current) select.value = current
+  // 选中态以服务端实际读取的文件为准（未指定时即最新的那个）
+  if (current && files.some(file => file.name === current)) select.value = current
+}
+
+function logEmptyRow(text) {
+  const row = document.createElement('tr')
+  const cell = document.createElement('td')
+  cell.colSpan = 3
+  cell.className = 'log-empty'
+  cell.textContent = text
+  row.appendChild(cell)
+  return row
+}
+
+/** 一行日志 → 表格行：时间 + 级别徽章 + 正文。 */
+function logRow(line) {
+  const row = document.createElement('tr')
+  row.className = `log-row log-${line.level}`
+  const match = LOG_TIME_RE.exec(String(line.text ?? ''))
+  const time = document.createElement('td')
+  time.className = 'log-col-time'
+  time.textContent = match ? match[1] : '—'
+  const level = document.createElement('td')
+  level.className = 'log-col-level'
+  const badge = document.createElement('span')
+  badge.className = `log-level log-level-${line.level}`
+  badge.textContent = LOG_LEVEL_LABELS[line.level] ?? line.level
+  level.appendChild(badge)
+  const text = document.createElement('td')
+  text.className = 'log-col-text'
+  text.textContent = match ? match[2] : line.text
+  row.append(time, level, text)
+  return row
 }
 
 function renderLogs(data) {
-  const view = $('log-view')
+  const body = $('log-body')
   const lines = Array.isArray(data.lines) ? data.lines : []
-  const follow = $('log-follow').checked
-  const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 24
-
+  body.innerHTML = ''
   if (data.exists === false) {
-    view.textContent = '日志文件不存在（服务尚未通过 scripts/start.sh 启动过？）'
+    body.appendChild(logEmptyRow('日志文件不存在（服务尚未写入日志？）'))
   } else if (lines.length === 0) {
-    view.textContent = '没有匹配的日志行。'
+    body.appendChild(logEmptyRow('没有匹配的日志行。'))
   } else {
     const frag = document.createDocumentFragment()
-    for (const line of lines) {
-      const row = document.createElement('span')
-      row.className = `log-line log-${line.level}`
-      row.textContent = `${line.text}\n`
-      frag.appendChild(row)
-    }
-    view.textContent = ''
-    view.appendChild(frag)
+    for (const line of lines) frag.appendChild(logRow(line))
+    body.appendChild(frag)
+  }
+
+  const page = data.page ?? 1
+  const pageSize = data.pageSize ?? LOG_PAGE_SIZE
+  const matched = data.matched ?? 0
+  const pages = Math.max(1, Math.ceil(matched / pageSize))
+  $('log-page-info').textContent = `第 ${page} / ${pages} 页 · 共 ${matched} 条`
+  $('log-prev').disabled = page <= 1
+  $('log-next').disabled = page >= pages
+  // 筛选后页数变少时回到第一页
+  if (page > pages) {
+    logPage = 1
+    void loadLogs()
+    return
   }
 
   const bits = []
-  if (typeof data.matched === 'number') bits.push(`${data.matched} 条匹配 / 尾部 ${data.total ?? 0} 行`)
+  if (typeof data.matched === 'number') bits.push(`${data.matched} 条匹配 / 文件共 ${data.total ?? 0} 行`)
   if (typeof data.size === 'number') bits.push(formatBytes(data.size))
   if (data.mtime) bits.push(`更新于 ${new Date(data.mtime).toLocaleTimeString('zh-CN')}`)
-  if (data.truncated) bits.push('仅读取文件尾部 512 KB')
+  if (data.truncated) bits.push('仅读取文件尾部 8 MB')
   $('log-meta').textContent = bits.join(' · ')
-
-  if (follow && (atBottom || view.dataset.loaded !== '1')) {
-    view.scrollTop = view.scrollHeight
-    view.dataset.loaded = '1'
-  }
 }
 
 function formatBytes(size) {
@@ -1547,8 +1781,11 @@ function showReminderToast(task) {
 
 function autosize() {
   const input = $('input')
+  // 与 #input 的 CSS min-height 保持一致：内容再少也保持两行高度
+  const minHeight = 60
+  const maxHeight = 200
   input.style.height = 'auto'
-  input.style.height = `${Math.min(input.scrollHeight, 200)}px`
+  input.style.height = `${Math.min(Math.max(input.scrollHeight, minHeight), maxHeight)}px`
 }
 
 /* ── 初始化 ───────────────────────────────────────────── */
@@ -1599,6 +1836,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
 })
 $('task-form').addEventListener('submit', submitTask)
 $('tasks-show-done').addEventListener('change', () => void loadTasks())
+$('schedule-refresh').addEventListener('click', () => void loadSchedules())
 $('memory-form').addEventListener('submit', submitMemory)
 $('memory-search').addEventListener('input', renderMemories)
 $('memory-kind-filter').addEventListener('click', (event) => {
@@ -1612,12 +1850,22 @@ $('memory-kind-filter').addEventListener('click', (event) => {
 })
 $('log-refresh').addEventListener('click', () => void loadLogs())
 $('log-file').addEventListener('change', () => {
-  delete $('log-view').dataset.loaded
+  logPage = 1
   void loadLogs()
 })
 $('log-follow').addEventListener('change', () => {
   if ($('log-follow').checked) startLogAutoRefresh()
   else stopLogAutoRefresh()
+})
+$('log-prev').addEventListener('click', () => {
+  if (logPage <= 1) return
+  logPage -= 1
+  void loadLogs()
+})
+$('log-next').addEventListener('click', () => {
+  if ($('log-next').disabled) return
+  logPage += 1
+  void loadLogs()
 })
 $('log-level-filter').addEventListener('click', (event) => {
   const chip = event.target.closest('.kchip')
@@ -1626,14 +1874,14 @@ $('log-level-filter').addEventListener('click', (event) => {
   $('log-level-filter').querySelectorAll('.kchip').forEach(node => {
     node.classList.toggle('active', node === chip)
   })
-  delete $('log-view').dataset.loaded
+  logPage = 1
   void loadLogs()
 })
 let logSearchTimer = null
 $('log-search').addEventListener('input', () => {
   if (logSearchTimer !== null) clearTimeout(logSearchTimer)
   logSearchTimer = setTimeout(() => {
-    delete $('log-view').dataset.loaded
+    logPage = 1
     void loadLogs()
   }, 300)
 })
