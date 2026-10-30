@@ -222,6 +222,10 @@ function buildGroup(run) {
   summary.appendChild(meta)
   group.appendChild(summary)
   for (const item of run.items) group.appendChild(buildRow(item))
+  // 折叠状态与右侧文字保持一致，否则点了「展开」看起来像没反应
+  group.addEventListener('toggle', () => {
+    meta.textContent = group.open ? '收起' : '展开'
+  })
   return group
 }
 

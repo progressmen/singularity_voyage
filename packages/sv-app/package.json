@@ -27,6 +27,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/vendor/cordis",
     "@deepseek-ai/dsh-agent": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/agent",
+    "@deepseek-ai/dsh-attachment": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/attachment/attachment",
     "@deepseek-ai/dsh-host-webserver": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/host/webserver",
     "@deepseek-ai/dsh-llm": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm",
     "@deepseek-ai/dsh-schedule": "link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule",

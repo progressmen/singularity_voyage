@@ -19,6 +19,7 @@ import type {
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { SvLlmConfig } from './config-store.ts'
 
 /** 注册到 ctx.llm 的 provider 路由 id。 */
@@ -34,9 +35,14 @@ interface WireToolCall {
   function: { name: string; arguments: string }
 }
 
+/** OpenAI 兼容的 user 内容分片（文本或 data URL 图片）。 */
+type WireContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 interface WireMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string | null
+  content: string | WireContentPart[] | null
   tool_calls?: WireToolCall[]
   tool_call_id?: string
 }
@@ -77,22 +83,72 @@ function toolCallsOfBlocks(content: readonly unknown[]): WireToolCall[] {
   return out
 }
 
-/** 把 harness 消息投影为 OpenAI 兼容 wire 消息（文本 + 工具调用/结果）。 */
-function toWireMessages(options: GenerateOptions): WireMessage[] {
+/** 内容块里的图片引用（image 块携带 durability 附件引用）。 */
+interface WireImageBlock {
+  type: 'image'
+  attachment: ImageAttachmentRef
+  offloaded?: true
+}
+
+function imageBlocksOf(content: readonly unknown[]): WireImageBlock[] {
+  return content.filter((block): block is WireImageBlock => {
+    return typeof block === 'object' && block !== null
+      && (block as { type?: unknown }).type === 'image'
+      && typeof (block as { attachment?: unknown }).attachment === 'object'
+      && (block as { attachment?: unknown }).attachment !== null
+  })
+}
+
+/** 把一张图片读回并编码为 OpenAI 兼容的 data URL 分片。 */
+async function toImagePart(
+  block: WireImageBlock,
+  attachments: AttachmentStore | undefined,
+  signal: AbortSignal,
+): Promise<WireContentPart> {
+  if (block.offloaded === true) {
+    const label = block.attachment.name ?? String(block.attachment.attachmentId)
+    return { type: 'text', text: `[图片已省略：${label}]` }
+  }
+  if (attachments === undefined) {
+    throw new LlmError('sv-app: 当前环境未挂载附件服务，无法发送图片', 'UNSUPPORTED_CONTENT')
+  }
+  const stored = await attachments.readImage(block.attachment, signal)
+  const mediaType = stored.ref.mediaType
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${mediaType};base64,${Buffer.from(stored.data).toString('base64')}` },
+  }
+}
+
+/** 把 harness 消息投影为 OpenAI 兼容 wire 消息（文本 + 工具调用/结果 + 图片）。 */
+async function toWireMessages(
+  options: GenerateOptions,
+  attachments: AttachmentStore | undefined,
+  signal: AbortSignal,
+): Promise<WireMessage[]> {
   const out: WireMessage[] = []
   if (options.system !== undefined && options.system.length > 0) {
     out.push({ role: 'system', content: options.system })
   }
   for (const message of options.messages as readonly (RequestMessage & { content: readonly unknown[] })[]) {
     const text = textOfBlocks(message.content)
+    const images = imageBlocksOf(message.content)
     switch (message.role) {
       case 'system':
       case 'developer':
         out.push({ role: 'system', content: text })
         break
-      case 'user':
-        out.push({ role: 'user', content: text })
+      case 'user': {
+        if (images.length === 0) {
+          out.push({ role: 'user', content: text })
+          break
+        }
+        const parts: WireContentPart[] = []
+        if (text.length > 0) parts.push({ type: 'text', text })
+        for (const block of images) parts.push(await toImagePart(block, attachments, signal))
+        out.push({ role: 'user', content: parts })
         break
+      }
       case 'assistant': {
         const toolCalls = toolCallsOfBlocks(message.content)
         out.push({
@@ -102,13 +158,21 @@ function toWireMessages(options: GenerateOptions): WireMessage[] {
         })
         break
       }
-      case 'tool':
+      case 'tool': {
         out.push({
           role: 'tool',
           tool_call_id: String((message as RequestMessage & { toolCallId?: unknown }).toolCallId ?? ''),
           content: text,
         })
+        // OpenAI 的 tool 消息只能带字符串：工具返回的图片另起一条 user 消息，
+        // 否则截图等图片结果会被静默丢弃。
+        if (images.length > 0) {
+          const parts: WireContentPart[] = []
+          for (const block of images) parts.push(await toImagePart(block, attachments, signal))
+          out.push({ role: 'user', content: parts })
+        }
         break
+      }
     }
   }
   return out
@@ -181,7 +245,11 @@ function toUsage(raw: unknown): TokenUsage | undefined {
 
 /** SV 的 OpenAI 兼容适配器。构造参数是“按请求读取当前配置”的回调。 */
 export class SvOpenAiCompatAdapter extends LlmAdapter {
-  constructor(private readonly options: () => SvLlmConfig) {
+  constructor(
+    private readonly options: () => SvLlmConfig,
+    /** 附件服务：仅在消息含图片时按需读取，缺省时忽略图片。 */
+    private readonly attachments: () => AttachmentStore | undefined = () => undefined,
+  ) {
     super()
   }
 
@@ -241,6 +309,10 @@ export class SvOpenAiCompatAdapter extends LlmAdapter {
       provider: SV_PROVIDER_ID,
       id: model,
       name: model,
+      // SV 是单模型路由，具体模型由用户选择，适配器无法从 /models 得知能力。
+      // 统一声明 text+image：让 computer-use 的原生截图（mode="native"）与
+      // screen_zoom 的能力探测可用。若所选模型不支持图片，上游会返回明确错误。
+      inputModalities: ['text', 'image'] as const,
       ...config.contextWindow === undefined ? {} : { context: { contextWindow: config.contextWindow } },
       ...config.maxTokens === undefined ? {} : { defaultMaxTokens: config.maxTokens },
     }
@@ -270,7 +342,7 @@ export class SvOpenAiCompatAdapter extends LlmAdapter {
       const wireTools = toWireTools(options.tools)
       const body: Record<string, unknown> = {
         model: options.model,
-        messages: toWireMessages(options),
+        messages: await toWireMessages(options, this.attachments(), signal),
         stream: true,
         stream_options: { include_usage: true },
         ...wireTools === undefined ? {} : { tools: wireTools, tool_choice: 'auto' },

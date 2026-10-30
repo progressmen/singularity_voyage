@@ -99,6 +99,7 @@
 | 包 | 类型 | ctx key | 职责 | 阶段 |
 |---|---|---|---|---|
 | `@singularity-voyage/sv-app` | bundle + 宿主插件 | — | 装配下列行；模型适配、搜索、聊天、会话投影、记忆、待办、提醒与 `/sv` 页面 | M0 ✅ |
+| `dsh-computer-use` | 第三方 bundle + 宿主插件 | — | 桌面操作：`app_list` / `screen_observe` / `computer_*`，底层 cua-driver | M1 ✅（固定 `0.3.1`） |
 | `@singularity-voyage/memory` | seam + 服务 | `ctx.memory` | 记忆的写入、去重、冲突、检索、纠正与删除 | M1 ✅（当前内置于 `sv-app/src/memory-store.ts`） |
 | `@singularity-voyage/tasks` | 服务 | `ctx.tasks` | 待办与提醒实体、到期计算、完成与顺延 | M1 ✅（`sv-app/src/tasks-store.ts` + `reminders.ts`） |
 | `@singularity-voyage/memory-local` | provider | — | 本地 JSON + 词面召回；SQLite 待规模需要 | M1 ✅（JSON） |
@@ -303,6 +304,7 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
 | Skill 加载 | `tool-skill` | 直接用 |
 | 子 Agent / 工作流 | `tool-subagent` / `tool-workflow` | 直接用 |
 | 待办、目标、计划 | `tool-todo` / `tool-goal` / `plan-mode` | 直接用 |
+| 桌面观察与操作 | 第三方 `dsh-computer-use`（cua-driver） | 直接用；固定版本，保留其安全护栏 |
 | 知识检索 | 本项目 | 新增 |
 | 记忆与待办提醒 | 本项目 | 新增 |
 | 交付物 | 本项目 | 新增 |
@@ -331,6 +333,7 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
 | `task_create` | 创建待办或提醒 | `ctx.tasks` | 中 | ask | assistant | M1 ✅ |
 | `task_list` | 列出未完成待办与下次触发时间 | `ctx.tasks` | 低 | allow | 全部 | M1 ✅ |
 | `task_complete` | 完成或顺延待办 | `ctx.tasks` | 低 | allow | assistant | M1 ✅ |
+| `app_list` / `app_launch` / `screen_observe` / `screen_zoom` / `computer_*` | 观察并操作本机桌面应用 | 第三方 `dsh-computer-use` + cua-driver | 高 | 观察 allow；有副作用动作按护栏审批 | assistant、operator | M1 ✅ |
 | `knowledge_search` | 混合检索，返回带引用片段 | `ctx.knowledge` | 低 | allow | 全部 | M2 |
 | `knowledge_ingest` | 导入 URL/文件到个人知识库 | `ctx.knowledge` | 中 | ask | researcher、writer | M2 |
 | `artifact_create` | 创建交付物草稿 | `ctx.artifacts` | 低 | allow | writer | M2 |
@@ -695,6 +698,7 @@ M1 已落地（`packages/sv-app/src/memory-store.ts`、`memory-extractor.ts`、`
 | 调用 MCP 写工具 | ask | 按服务器配置 |
 | 修改/删除记忆 | allow | 本人操作，留操作日志 |
 | 读取/创建/完成待办 | allow | 只影响本机日程；`memory_write` 与 `task_create` 在模型侧仍按模式放宽 |
+| 操作桌面应用界面（点击 / 输入） | ask（危险词审批，密码框拒绝） | 第三方 `dsh-computer-use` 护栏；无新鲜快照直接拒绝 |
 | 创建/暂停自动化 | ask | 写操作日志 |
 | 修改凭据 | ask + 二次确认 | 仅本机使用者 |
 | 导出/清空数据 | ask + 二次确认 | 破坏性操作 |

@@ -12,6 +12,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-web'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-schedule'
@@ -31,7 +32,7 @@ import { SessionStore } from './sessions-store.ts'
 import type { SvSessionStore } from './sessions-store.ts'
 import { PgSessionStore } from './sessions-postgres.ts'
 import { TasksStore } from './tasks-store.ts'
-import { registerMemoryTools, registerTaskTools } from './tools.ts'
+import { registerDesktopGuard, registerMemoryTools, registerTaskTools } from './tools.ts'
 
 /** Cordis loader 显示的插件名。 */
 export const name = '@singularity-voyage/sv-app'
@@ -206,11 +207,16 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     reminders.stop()
   })
 
-  ctx.llm.registerAdapter([SV_PROVIDER_ID], new SvOpenAiCompatAdapter(() => store.llm))
+  // attachments 由 dsh-web-app 层提供；缺省时图片消息会被跳过而不是静默发送空内容。
+  ctx.llm.registerAdapter([SV_PROVIDER_ID], new SvOpenAiCompatAdapter(
+    () => store.llm,
+    () => ctx.get('attachments'),
+  ))
   ctx.web.registerSearchProvider(new SvSearchProvider(() => store.search, () => store.llm.apiKey))
 
   registerMemoryTools(ctx, memory)
   registerTaskTools(ctx, tasks)
+  registerDesktopGuard(ctx)
 
   // 每轮 Prompt 组装时注入记忆与待办（system-prompt 注册表，作用于全部会话）。
   const recallQuery = (context: { agent?: { id: unknown } }): string =>
@@ -233,6 +239,23 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     order: 9510,
     interpolate: false,
     text: () => '提醒与定时任务的选型：用户要在某个时间点收到提醒、或让助手届时继续处理，调用 schedule_create（提醒会回到本会话）；只是记录一件要做的事、需要清单勾选或邮件提醒，调用 task_create。',
+  })
+
+  // 桌面操作（dsh-computer-use）：工具由第三方 bundle 注册，这里只给选型与
+  // 安全规则。核心约束是「先观察、再操作、再验证」，窗口变化后重新定位，
+  // 以及有外部副作用的动作先征得用户同意。
+  ctx.systemPrompt.section({
+    name: 'sv:computer-use',
+    order: 9520,
+    interpolate: false,
+    text: () => [
+      '桌面操作：用户要求操作本机应用界面（打开应用、查看窗口、点击、输入、滚动、拖拽）时，用 app_list / app_launch 定位应用，screen_observe 观察目标窗口，再用 computer_click / computer_double_click / computer_right_click / computer_type / computer_key / computer_scroll / computer_drag 操作，最后重新 screen_observe 验证结果。',
+      '打开或前置应用只能用 app_launch：需要立刻看到窗口就传 bring_to_front: true。不要用终端命令（open、osascript、cliclick、AppleScript）启动或操作 GUI 应用，也不要让用户去装 cliclick——桌面操作统一走 computer_* 工具，只有这样才有观察快照校验和审批护栏。',
+      '动作完成后界面可能弹出新窗口、对话框或切换页面：这时必须重新 screen_observe（可传 window="标题子串" 定位新窗口），不要复用旧元素编号。目标窗口不在当前桌面或已最小化时，screen_observe 会自动把它前置到前台；若前置失败，请告诉用户切换桌面。',
+      '坐标与成本：整窗截图每次都会占用图片 token，先定位再动手，不要每点一下都截全屏。观测里的「截图像素 W×H」就是点击坐标的空间，按图内像素估位置（Retina 截图常是窗口逻辑尺寸的 2 倍，不要按 pt 算）。输入数字或短文本优先专用 computer_key（自绘界面没有文本控件，computer_type 会被拒绝）；只在确实看不清时用 screen_zoom 放大局部。',
+      '授权与止损：用户已经明确给出对象与内容（如「给某某发：你好吗？」）就视为已授权，直接执行，不要反复自我确认。同一个工具、同一个错误连续失败 2 次就必须停下：一次说清卡在哪（窗口不在当前桌面 / 缺少文字输入控件 / 元素不在快照里），并告诉用户需要他做什么（切到某应用的桌面、手动打开某个窗口、或提供窗口标题）；不要连续十几次换着花样重试。',
+      '规则：先观察再操作；优先用 element 编号，坐标仅在 AX 不可用时使用；删除、支付、转账、退出登录等不可逆操作先向用户确认（发送消息在用户已指定对象与内容时视为已授权）；密码、验证码与密钥由用户本人输入，不要代为填写。',
+    ].join('\n'),
   })
 
   // turn 结束后异步抽取记忆；失败只告警，不影响对话。

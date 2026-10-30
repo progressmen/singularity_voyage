@@ -4,6 +4,7 @@
 #
 # 用法:
 #   ./scripts/start.sh start     # 安装依赖、构建、初始化 profile，然后后台启动服务
+#   ./scripts/start.sh dev       # 前台运行 pnpm dev（改代码调试用，Ctrl+C 停止）
 #   ./scripts/start.sh stop      # 停止后台服务
 #   ./scripts/start.sh restart   # 重启
 #   ./scripts/start.sh status    # 查看运行状态
@@ -272,18 +273,39 @@ cmd_restart() {
   cmd_start
 }
 
+# 前台运行 package.json 的 dev 脚本：与直接敲 pnpm dev 完全等价。
+# 不 build、不 setup，适合改代码时调试；需要独占端口，且必须 Ctrl+C 结束。
+cmd_dev() {
+  ensure_dirs
+  local pid
+  if pid="$(running_pid)"; then
+    warn "服务已在运行 (PID $pid)；pnpm dev 需要独占端口 ${PORT}，请先 ./scripts/start.sh stop"
+    return 1
+  fi
+  # 端口被其他程序占用时直接失败，避免 pnpm dev 报 EADDRINUSE
+  assert_port_free
+
+  load_env
+  log "前台运行 pnpm dev（端口见 package.json 的 dev 脚本，默认 ${PORT}）…"
+  log "注意：dev 不会执行 build / setup；改过 src 请先 pnpm build，改过插件版本请先 pnpm setup"
+  cd "$REPO_ROOT"
+  exec pnpm dev
+}
+
 # ── 入口 ─────────────────────────────────────────────────────────────────
 case "${1:-start}" in
   start)   cmd_start ;;
+  dev)     cmd_dev ;;
   stop)    cmd_stop ;;
   restart) cmd_restart ;;
   status)  cmd_status ;;
   logs)    cmd_logs ;;
   *)
     cat <<EOF
-用法: $(basename "$0") {start|stop|restart|status|logs}
+用法: $(basename "$0") {start|dev|stop|restart|status|logs}
 
   start    安装依赖 → 构建 → 初始化 profile → 后台启动服务
+  dev      前台运行 pnpm dev（不 build / 不 setup，Ctrl+C 停止）
   stop     停止后台服务
   restart  重启服务
   status   查看运行状态
@@ -291,6 +313,7 @@ case "${1:-start}" in
 
 环境变量:
   DSH_SRC  dsh harness 源码目录（默认: ../deepseek-harness-dsh-v0.2.1-rc.2）
+  PORT     服务端口（默认 7000；dev 的端口由 package.json 的 dev 脚本决定）
 EOF
     exit 1
     ;;

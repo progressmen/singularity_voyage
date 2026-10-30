@@ -12,6 +12,41 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MEMORY_KINDS, memoryView, type MemoryEntry, type MemoryStore, type MemoryKind } from './memory-store.ts'
 import { TASK_RECURRENCES, taskView, type TaskEntry, type TasksStore } from './tasks-store.ts'
 
+/** 通过终端驱动 GUI 的命令：启动应用、执行 AppleScript、模拟鼠标键盘。 */
+const GUI_VIA_TERMINAL: readonly RegExp[] = [
+  /\bosascript\b/i,
+  /\bcliclick\b/i,
+  /\bxdotool\b/i,
+  /\bopen\s+(-\S+\s+)*-a\b/i,
+  /\bopen\b[^\n]*\.app\b/i,
+]
+
+/**
+ * 判断一条 shell 命令是否在绕过 computer-use 直接操作桌面。
+ * @param command - bash 工具收到的命令文本。
+ * @returns 命中时为拒绝原因，否则 undefined。
+ */
+export function desktopViaTerminalReason(command: string): string | undefined {
+  if (!GUI_VIA_TERMINAL.some(pattern => pattern.test(command))) return undefined
+  return '启动或控制桌面应用请用 app_launch / screen_observe / computer_* 工具：它们有观察快照校验、虚拟光标与危险操作审批；'
+    + '终端里的 open / osascript / cliclick 既看不到界面，也无法被护栏约束。'
+}
+
+/**
+ * 注册桌面操作护栏：禁止模型用终端绕过 computer-use。
+ *
+ * 仅拦截「启动应用」与「模拟输入」两类命令；普通 shell 使用不受影响。
+ * @param ctx - 插件上下文。
+ */
+export function registerDesktopGuard(ctx: Context): void {
+  ctx.tools.guard(execution => {
+    if (!/^(bash|sh|shell|exec|terminal)$/i.test(execution.name)) return undefined
+    const args = execution.arguments as { command?: unknown } | undefined
+    if (typeof args?.command !== 'string') return undefined
+    return desktopViaTerminalReason(args.command)
+  })
+}
+
 const memorySchema = {
   type: 'object',
   additionalProperties: false,

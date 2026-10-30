@@ -560,8 +560,8 @@ html, body {
 }
 .trace-group > .trace-row { margin: 0 8px 8px; border-radius: 6px; }
 .trace-group[open] > summary { border-bottom: 1px solid var(--border); }
-.trace-group > summary .trace-meta::after { content: ''; }
-.trace-group[open] > summary .trace-meta { visibility: hidden; }
+/* 展开/收起文字始终可见：展开后隐藏会让点击看起来“没有效果” */
+.trace-group > summary .trace-meta { color: var(--text-dim); }
 
 .error-note {
   color: var(--danger);

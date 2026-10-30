@@ -719,8 +719,36 @@ function messageNode(message) {
   return wrap
 }
 
+/** 收集容器内处于展开状态的 details（按文档顺序编号）。 */
+function openDetails(root) {
+  const open = new Set()
+  root.querySelectorAll('details').forEach((el, index) => {
+    if (el.open) open.add(index)
+  })
+  return open
+}
+
+/**
+ * 重绘后按同序恢复展开状态。
+ * 流式过程中每个 token / 工具事件都会重绘最后一条消息，若不恢复，
+ * 用户点开的「展开」「思考过程」会在下一次增量到达时被吞掉。
+ */
+function applyOpenDetails(root, open) {
+  if (open.size === 0) return
+  root.querySelectorAll('details').forEach((el, index) => {
+    if (open.has(index)) el.open = true
+  })
+}
+
+/** 内容是否已接近底部（用于决定重绘后是否跟随滚动）。 */
+function nearBottom(el, threshold = 120) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+}
+
 function renderMessages() {
   const container = $('messages')
+  const open = openDetails(container)
+  const stick = nearBottom(container) || container.scrollTop === 0
   container.innerHTML = ''
   const conv = activeConversation() ?? conversations[0]
   if (!conv || conv.messages.length === 0) {
@@ -747,7 +775,8 @@ function renderMessages() {
   inner.className = 'messages-inner'
   for (const message of conv.messages) inner.appendChild(messageNode(message))
   container.appendChild(inner)
-  container.scrollTop = container.scrollHeight
+  applyOpenDetails(inner, open)
+  if (stick) container.scrollTop = container.scrollHeight
 }
 
 function refreshActiveMessage() {
@@ -760,12 +789,18 @@ function refreshActiveMessage() {
   if (count === 0 || conv.messages.length === 0) { renderMessages(); return }
   // 只重绘最后一条（流式中的 assistant 消息）
   const last = conv.messages[conv.messages.length - 1]
+  const stick = nearBottom(container)
   if (inner.children[count - 1] && inner.children[count - 1].className.includes(last.role)) {
-    inner.replaceChild(messageNode(last), inner.children[count - 1])
+    // 保留用户在当前消息里展开的区块，否则每次增量都会把它们重新折叠
+    const prev = inner.children[count - 1]
+    const open = openDetails(prev)
+    const node = messageNode(last)
+    applyOpenDetails(node, open)
+    inner.replaceChild(node, prev)
   } else {
     inner.appendChild(messageNode(last))
   }
-  container.scrollTop = container.scrollHeight
+  if (stick) container.scrollTop = container.scrollHeight
 }
 
 /* ── 状态与设置 ───────────────────────────────────────── */

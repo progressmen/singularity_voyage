@@ -13,6 +13,19 @@
       step when needed, and use the web_search tool for questions that benefit
       from up-to-date information.
 
+# 桌面操作（Computer Use）：工具行由第三方 bundle `dsh-computer-use` 插入
+# （profile 的 bundles 里排在 sv-app 之前），这里只覆盖它的配置。
+# 观察快照 45s 内有效，界面变化后模型必须重新 screen_observe；maxElements
+# 控制单次 AX 树返回的元素数量，避免上下文膨胀。allowedApps 为空表示不限制，
+# 可填应用名（如 ["Google Chrome"]）收紧操作范围。
+# 需要 cua-driver 在 PATH 中（或设置 CUA_DRIVER_BIN），并给 CuaDriver.app
+# 授予「辅助功能」与「屏幕录制」权限。
+- id: dsh-computer-use
+  config:
+    ttlMs: 45000
+    maxElements: 400
+    allowedApps: []
+
 # web_search 走 SV 自有的搜索提供方（协议由 SV_SEARCH_PROVIDER / WEB_SEARCH_PROVIDER
 # 环境变量或设置页决定：deepseek / tavily / bocha；留空时 DeepSeek 模型默认官方搜索）；
 # web_fetch 继续使用匿名 HTTP 抓取后端。
@@ -39,6 +52,19 @@
   disabled: false
 
 - id: tool-skill
+  disabled: false
+
+# dsh-web-app 在宿主层同样禁用了 shell 与文件工具（官方 Web UI 由 preset 各自挂载）。
+# SV 会话不带 preset，技能需要执行脚本、读写工作区文件；不启用时模型只能去操作
+# 终端应用跑命令，慢且容易读错输出。这里按 base 的默认实现重新挂回宿主作用域：
+# 仍然受 sandbox-policy（workspace-write + ask）约束，写工作区外会被拒绝。
+- id: tool-bash
+  disabled: false
+
+- id: tool-fs
+  disabled: false
+
+- id: tool-fs-search
   disabled: false
 
 - insert:

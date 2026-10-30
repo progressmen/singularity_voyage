@@ -149,6 +149,7 @@ singularity_voyage/
 - 一个 OpenAI 兼容的模型 API key（默认指向 DeepSeek），可选一个 Tavily 搜索 key
 - 可选：Python 3.9+（邮件 MCP 服务只用标准库，无需 pip 安装）
 - 可选：Python 3.10+ 与 akshare（股票行情 MCP，见 5.2 的安装命令；不装则 `sv-mcp-stock` 启动失败，可临时注释该配置行）
+- 可选：[cua-driver](https://github.com/trycua/cua)（桌面控制；需 macOS「辅助功能」+「屏幕录制」权限，见「电脑控制」一节）
 
 ### 四步启动
 
@@ -165,6 +166,19 @@ pnpm setup
 # 4. 启动（服务持续运行；Ctrl+C 停止）
 pnpm dev
 ```
+
+也可以用启动脚本，它把上面的步骤串起来：
+
+```sh
+./scripts/start.sh start    # 安装 → 构建 → 初始化 profile → 后台启动
+./scripts/start.sh dev      # 前台运行 pnpm dev（不 build / setup，Ctrl+C 停止）
+./scripts/start.sh status   # 查看运行状态
+./scripts/start.sh restart  # 重启（会先跑 build + setup）
+./scripts/start.sh stop     # 停止
+./scripts/start.sh logs     # 跟踪控制台日志
+```
+
+> `pnpm dev` 与 `./scripts/start.sh start` 是两种启动方式，共用端口 7000 与同一份 `.dsh/`，同一时间只能运行一个。
 
 启动后：
 
@@ -202,6 +216,25 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 - **定时任务**：与待办分工明确——待办是清单（页面勾选 + 邮件提醒），定时任务由 harness 的 `@deepseek-ai/dsh-schedule` 调度。说「10 秒后提醒我喝水」由 `schedule_create` 创建；到期后宿主把提醒投递回**创建它的会话**并触发模型继续处理。支持一次性 / 固定间隔 / 每天 / 每周 / cron（显式 IANA 时区），进程重启后仍在，周期任务只补发最近一次错过的时点。侧栏「定时任务」可查看目录并删除；宿主不提供暂停，删除即取消后续投递。模型侧工具为 `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`，数据在 `$DSH_HOME/storages/schedule.json`。
 - **邮件提醒**：待办页顶部有快捷开关，可一键开启/关闭（未配置 SMTP 时会引导去设置）。两种提醒：**定时提醒**在任务到期时立即发一封；**超时提醒**不单独发信，逾期未完成的任务在每日摘要里单列一段，主题也会标注逾期数量。发信与模型工具 `mcp__sv-mail__send_email` 共用 [mcp/sv-mail-mcp](mcp/sv-mail-mcp) 里的 `mailer.py`，只有一套 SMTP 实现；摘要发送日期记在 `mail-state.json`，重启不会重复发。
 - 存储都在 `$DSH_HOME/sv/`（0600），与 dsh 会话日志分离：日志存原文与来源，记忆存「当前有效结论」。
+
+### 电脑控制（桌面操作）
+
+在对话里可以直接让 Agent 操作本机应用界面：打开应用、查看窗口、点击、输入、滚动、拖拽。工具由第三方 bundle `dsh-computer-use` 提供（`pnpm setup` 会把它装进 profile），底层用 [cua-driver](https://github.com/trycua/cua) 驱动桌面。
+
+- **13 个工具**：`app_list` / `app_launch`，`screen_observe` / `screen_zoom` / `computer_aim`，以及 `computer_click` / `computer_double_click` / `computer_right_click` / `computer_type` / `computer_key` / `computer_scroll` / `computer_drag` / `computer_wait`。
+- **操作循环**：观察 → 对准 → 决策 → 执行 → 再观察验证。观察快照 45 秒内有效（[cordis.patch.yml](packages/sv-app/cordis.patch.yml) 的 `ttlMs`），界面变化或弹窗出现后旧元素编号失效，必须重新 `screen_observe`。
+- **全局 + 局部两级看图**：`screen_observe` 给整窗画面与元素树（全局）；`computer_aim` 把虚拟光标对准目标，并返回目标附近的真实屏幕局部图（`screencapture`，**包含虚拟光标本身**）以及光标在图内的坐标，用于点击前校准。光标没压准就按图内偏移换算 `screen_x/screen_y` 重新 aim，对准后 `computer_click(screen_x=, screen_y=)`；有元素编号仍优先用编号点击。系统截图需要宿主有「屏幕录制」权限，失败时自动回退为窗口 `zoom` 图（不含光标）。
+- **多显示器**：`screen_observe` 会标注窗口所在显示器（主屏 / 外接屏、相对位置、分辨率与左上角）和虚拟光标当前屏幕坐标。窗口在外接屏时，光标按绝对屏幕点移动；外接屏若与主屏使用不同 Space，结果会提示先切到窗口所在桌面，否则输入无法送达。
+- **同名窗口与键盘投递**：多个窗口标题都匹配时优先当前桌面上可见的那个，并列出其余候选；要精确指定就传 `window_id`。`computer_key` / `computer_type` 与坐标点击会先 `bring_to_front` 并验证焦点，拿不到焦点就明确拒绝——否则 `cmd+a` / `cmd+v` 会静默发到同一应用的另一个窗口。元素编号点击仍走后台路径，不受前台限制。
+- **虚拟光标常显**：先用 `set_agent_cursor_enabled` 开启 overlay，并把 `idle_hide_ms` 设为 0，避免多步操作间隙光标自动隐藏。cua-driver 自己的截图会排除 overlay，所以校准图改由系统 `screencapture` 抓取；若未授权屏幕录制，则退回"坐标误差"判断。
+- **新窗口不会丢**：窗口列表覆盖所有桌面（含最小化与其它 Space）。`screen_observe` 的 `window` 参数支持 pid、标题子串与 `window_id`；目标窗口不可见时会自动前置，失败则明确告知。点击类工具会在结果里附上该应用当前的窗口清单（含不可见标记），模型据此重新观察新窗口而不是复用旧快照。
+- **安全护栏**：没有新鲜快照的动作直接拒绝；目标标签命中删除 / 支付 / 转账 / 退出登录等危险词时走审批；检测到密码框拒绝自动输入；`allowedApps` 非空时只允许操作白名单应用。另外 [tools.ts](packages/sv-app/src/tools.ts) 注册了终端护栏：`bash` 里出现 `open -a` / `osascript` / `cliclick` / `xdotool` 等 GUI 操作会被拒绝并提示改用 `app_launch` / `computer_*`。
+- **前置条件**：`cua-driver` 在 `PATH` 中（或用 `CUA_DRIVER_BIN` 指定绝对路径），并在系统设置里给 CuaDriver.app 授予「辅助功能」与「屏幕录制」权限。macOS 已验证；Windows / Linux 未验证。**不需要**额外安装 cliclick 之类的点击工具——虚拟光标由 cua-driver 自己维护，外部点击工具既看不到界面，也会绕过快照校验。
+- **观察模式**：默认 `ax` 只读 Accessibility 界面树，不消耗图片 token；计算器这类纯自绘界面常返回 0 个可操作元素，此时自动降级为 `native`（截图直读）。SV 适配器声明 `text+image` 并会把图片转成 `image_url` 下发，实测 deepseek-flash 能直接读图并操作截图坐标。`mode="vision"` 走独立观察者，需要另外配置支持图片的 `visionProvider` / `visionModel`，或设置 `ZHIPU_API_KEY` 走 GLM 免费视觉兜底——走 `native` 时不需要这两者。
+
+> 未安装 cua-driver 时，桌面工具调用会返回「cua-driver not found」，不影响对话、记忆与待办。装好后重启 `pnpm dev` 即可生效。
+>
+> `pnpm setup` 会对已安装的 `dsh-computer-use@0.3.1` 打一组确定性补丁（[setup-profile.mjs](scripts/setup-profile.mjs) 的 `COMPUTER_USE_PATCHES`，大段新增代码放在 [scripts/computer-use-patches](scripts/computer-use-patches)）：补齐 `cua-driver call` 的 `session` 会话标签（否则 `screen_zoom` 与坐标点击报 `screenshot_context_missing`）、窗口列表改为覆盖所有桌面、支持按 `window_id` 观察、不可见窗口自动前置、动作结果附带窗口清单与重新观察提示；新增 `lib/display.js`（JXA 读 `NSScreen` 做多显示器归属）、虚拟光标常显与按屏幕点移动、`computer_aim` 工具、点击 `from_zoom` 支持，以及在观察/局部截图里给出缩放坐标换算。补丁幂等，升级插件版本后如遇结构变化会打印警告并跳过，需要重新确认。
 
 ### Trace 面板与会话历史
 
