@@ -32,7 +32,6 @@ import { SessionStore } from './sessions-store.ts'
 import type { SvSessionStore } from './sessions-store.ts'
 import { PgSessionStore } from './sessions-postgres.ts'
 import { resolveSuperAgentConfig } from './superagent.ts'
-import type { SuperAgentSurface } from './superagent.ts'
 import { createSuperAgentRuntime } from './superagent-runtime.ts'
 import { SuperAgentRunStore } from './superagent-store.ts'
 import { TasksStore } from './tasks-store.ts'
@@ -156,6 +155,8 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   const retryAttempts = envPositiveInt('SV_SEARCH_RETRY_ATTEMPTS')
   const searchTimeoutMs = envPositiveInt('SV_SEARCH_API_TIMEOUT_MS')
   const retryBudgetMs = envPositiveInt('SV_SEARCH_RETRY_BUDGET_MS')
+  // Super-agent 的启动默认值仍支持 patch / 环境变量；页面保存后以 config.json 为准
+  const superAgentDefaults = resolveSuperAgentConfig(config)
   const store = new ConfigStore({
     llm: {
       provider: llmProvider,
@@ -186,6 +187,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
       ...(retryBudgetMs !== undefined ? { budgetMs: retryBudgetMs } : {}),
     },
     mail: mailDefaults(),
+    superAgent: superAgentDefaults,
   })
   try {
     await store.load()
@@ -304,33 +306,34 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
         })
     },
   })
-  // Super-agent 默认关闭：关闭时不创建运行时不注册路由，行为与本版本之前一致。
-  const { enabled: superAgentEnabled, ...superAgentOptions } = resolveSuperAgentConfig(config)
-  let superAgent: SuperAgentSurface | undefined
-  if (superAgentEnabled) {
-    // 运行历史落 $DSH_HOME/sv/superagent-runs.json；进程重启后仍能在页面看到。
-    const runStore = new SuperAgentRunStore()
-    try {
-      await runStore.load()
-    } catch (error) {
-      ctx.logger.warn(svLog('index', 'superagent_history_load_failed', { err: svError(error) }))
-    }
-    superAgent = createSuperAgentRuntime(ctx, store, superAgentOptions, {
-      initialRuns: runStore.list(),
-      onChange: runs => {
-        void runStore.save(runs).catch(error => {
-          ctx.logger.warn(svLog('superagent', 'history_save_failed', { err: svError(error) }))
-        })
-      },
-    })
-    ctx.logger.info(svLog('index', 'superagent_ready', {
-      maxConcurrency: superAgentOptions.maxConcurrency,
-      maxSubtasks: superAgentOptions.maxSubtasks,
-      workerTimeoutMs: superAgentOptions.workerTimeoutMs,
-      retryAttempts: superAgentOptions.retryAttempts,
-      history: runStore.list().length,
-    }))
+  // Super-agent 运行时始终创建，但开关由 config.json 控制（设置页可即时开关/调限额）；
+  // 关闭时 /sv 页面隐藏入口、运行接口返回 404。
+  const { enabled: _superAgentEnabled, ...initialSuperAgentOptions } = store.superAgent
+  // 运行历史落 $DSH_HOME/sv/superagent-runs.json；进程重启后仍能在页面看到。
+  const runStore = new SuperAgentRunStore()
+  try {
+    await runStore.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'superagent_history_load_failed', { err: svError(error) }))
   }
+  const superAgent = createSuperAgentRuntime(ctx, store, initialSuperAgentOptions, {
+    initialRuns: runStore.list(),
+    onChange: runs => {
+      void runStore.save(runs).catch(error => {
+        ctx.logger.warn(svLog('superagent', 'history_save_failed', { err: svError(error) }))
+      })
+    },
+  })
+  // 用 config.json 的最终值覆盖构造时的默认值
+  superAgent.applyConfig(store.superAgent)
+  ctx.logger.info(svLog('index', 'superagent_ready', {
+    enabled: superAgent.enabled,
+    maxConcurrency: superAgent.limits.maxConcurrency,
+    maxSubtasks: superAgent.limits.maxSubtasks,
+    workerTimeoutMs: superAgent.limits.workerTimeoutMs,
+    retryAttempts: superAgent.limits.retryAttempts,
+    history: runStore.list().length,
+  }))
 
   // / 斜杠菜单只展示用户可调用的技能；模型可调用但用户禁用的不出现。
   const listSkills = async (): Promise<SvSkillView[]> => {

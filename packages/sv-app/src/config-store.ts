@@ -12,8 +12,10 @@
  * 密钥永不进入 Cordis 配置面、日志或任何 API 响应体。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { SUPER_AGENT_DEFAULTS, type SvSuperAgentConfig } from './superagent.ts'
 
 /** LLM 供应商预设 id（决定默认 baseURL 与模型，页面可覆盖）。 */
 export type SvLlmProviderId = 'deepseek' | 'qwen' | 'ark' | 'openai' | 'custom'
@@ -72,6 +74,26 @@ export interface SvLlmConfig {
   maxTokens?: number
 }
 
+/** 一份可保存的模型配置（多模型切换的最小单元）。 */
+export interface SvLlmProfile extends SvLlmConfig {
+  /** 稳定 id，用于快速切换与保存时定位。 */
+  id: string
+  /** 展示名称；留空时由模型 id 兜底。 */
+  name: string
+}
+
+/** 脱敏后的模型配置（不含密钥明文）。 */
+export interface SvLlmProfilePublic {
+  id: string
+  name: string
+  provider: SvLlmProviderId
+  baseURL: string
+  model: string
+  hasApiKey: boolean
+  contextWindow?: number
+  maxTokens?: number
+}
+
 /** Web 搜索提供方支持的协议类型。 */
 export type SvSearchProviderKind = 'tavily' | 'bocha' | 'deepseek'
 
@@ -124,7 +146,14 @@ export interface SvMailConfig {
 }
 
 interface SvStoreShape {
+  /** 当前生效的模型配置（始终与 active profile 保持一致）。 */
   llm: SvLlmConfig
+  /** 全部已保存的模型配置。 */
+  models: SvLlmProfile[]
+  /** 当前生效的模型配置 id。 */
+  activeModelId: string
+  /** Super-agent 开关与限额（页面可改）。 */
+  superAgent: SvSuperAgentConfig
   search: SvSearchConfig
   mail: SvMailConfig
 }
@@ -151,6 +180,12 @@ const DIGEST_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/
 /** 脱敏快照：对外 API 只暴露“是否已配置密钥”，绝不回传密钥本身。 */
 export interface SvPublicState {
   llm: { provider: SvLlmProviderId; baseURL: string; model: string; hasApiKey: boolean; contextWindow?: number; maxTokens?: number }
+  /** 全部模型配置（脱敏），供设置页与顶栏快速切换使用。 */
+  llmModels: SvLlmProfilePublic[]
+  /** 当前生效的模型配置 id。 */
+  activeModelId: string
+  /** Super-agent 开关与限额。 */
+  superAgent: SvSuperAgentConfig
   search: {
     provider: SvSearchProviderKind
     baseURL: string
@@ -196,12 +231,57 @@ function positiveInt(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
+/** 读取闭区间整数；越界或非法返回 undefined。 */
+function rangedInt(value: unknown, min: number, max: number): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined
+}
+
+/** 新模型配置的稳定 id。 */
+function newProfileId(): string {
+  return `m_${randomUUID()}`
+}
+
+/** profile → 运行时配置（只保留运行需要的字段）。 */
+function profileConfig(profile: SvLlmProfile): SvLlmConfig {
+  return {
+    provider: profile.provider,
+    baseURL: profile.baseURL,
+    model: profile.model,
+    apiKey: profile.apiKey,
+    ...profile.contextWindow === undefined ? {} : { contextWindow: profile.contextWindow },
+    ...profile.maxTokens === undefined ? {} : { maxTokens: profile.maxTokens },
+  }
+}
+
+/** 把运行时配置写回 profile（含可选字段的增删）。 */
+function applyConfig(profile: SvLlmProfile, llm: SvLlmConfig): void {
+  profile.provider = llm.provider
+  profile.baseURL = llm.baseURL
+  profile.model = llm.model
+  profile.apiKey = llm.apiKey
+  if (llm.contextWindow === undefined) delete profile.contextWindow
+  else profile.contextWindow = llm.contextWindow
+  if (llm.maxTokens === undefined) delete profile.maxTokens
+  else profile.maxTokens = llm.maxTokens
+}
+
 export class ConfigStore {
   private state: SvStoreShape
 
-  constructor(defaults: { llm: SvLlmConfig; search: SvSearchConfig; mail?: SvMailConfig }) {
+  constructor(defaults: {
+    llm: SvLlmConfig
+    search: SvSearchConfig
+    mail?: SvMailConfig
+    /** 启动时的 Super-agent 默认值（来自 patch / 环境变量）。 */
+    superAgent?: SvSuperAgentConfig
+  }) {
+    const llm = { ...defaults.llm }
+    const activeModelId = newProfileId()
     this.state = {
-      llm: { ...defaults.llm },
+      llm,
+      models: [{ id: activeModelId, name: llm.model || '默认模型', ...llm }],
+      activeModelId,
+      superAgent: { enabled: false, ...SUPER_AGENT_DEFAULTS, ...defaults.superAgent },
       search: { ...defaults.search },
       mail: { ...defaultMailConfig(), ...defaults.mail },
     }
@@ -220,6 +300,52 @@ export class ConfigStore {
   /** 当前生效的邮件配置。 */
   get mail(): SvMailConfig {
     return this.state.mail
+  }
+
+  /** Super-agent 开关与限额（保存后即时应用）。 */
+  get superAgent(): SvSuperAgentConfig {
+    return this.state.superAgent
+  }
+
+  /** 按模型配置 id 取运行时配置（含密钥，仅供服务端内部使用）。 */
+  llmConfig(id: string | undefined): SvLlmConfig | undefined {
+    if (id === undefined) return undefined
+    const profile = this.state.models.find(candidate => candidate.id === id)
+    return profile === undefined ? undefined : profileConfig(profile)
+  }
+
+  /** 当前生效的模型配置条目。 */
+  private activeProfile(): SvLlmProfile | undefined {
+    return this.state.models.find(profile => profile.id === this.state.activeModelId) ?? this.state.models[0]
+  }
+
+  /** 把运行时配置写回当前生效条目。 */
+  private syncActiveProfile(): void {
+    const profile = this.activeProfile()
+    if (profile !== undefined) applyConfig(profile, this.state.llm)
+  }
+
+  /** 用指定条目覆盖运行时配置。 */
+  private activateProfile(id: unknown): void {
+    const value = String(id ?? '').trim()
+    const profile = this.state.models.find(candidate => candidate.id === value)
+    if (profile === undefined) throw new Error('模型配置不存在')
+    this.state.activeModelId = profile.id
+    this.state.llm = profileConfig(profile)
+  }
+
+  /** 全部模型配置的脱敏视图。 */
+  private modelViews(): SvLlmProfilePublic[] {
+    return this.state.models.map(profile => ({
+      id: profile.id,
+      name: profile.name,
+      provider: profile.provider,
+      baseURL: profile.baseURL,
+      model: profile.model,
+      hasApiKey: profile.apiKey.length > 0,
+      ...profile.contextWindow === undefined ? {} : { contextWindow: profile.contextWindow },
+      ...profile.maxTokens === undefined ? {} : { maxTokens: profile.maxTokens },
+    }))
   }
 
   private get file(): string {
@@ -241,7 +367,14 @@ export class ConfigStore {
       throw new Error(`sv-app: 无法解析 ${this.file}（请修复或删除该文件）`)
     }
     if (typeof parsed !== 'object' || parsed === null) return
-    const record = parsed as Partial<{ llm: Partial<SvLlmConfig>; search: Partial<SvSearchConfig>; mail: Partial<SvMailConfig> }>
+    const record = parsed as Partial<{
+      llm: Partial<SvLlmConfig>
+      models: unknown
+      activeModelId: unknown
+      superAgent: Partial<SvSuperAgentConfig>
+      search: Partial<SvSearchConfig>
+      mail: Partial<SvMailConfig>
+    }>
     if (typeof record.llm === 'object' && record.llm !== null) {
       const { llm } = record
       if (isLlmProvider(llm.provider)) this.state.llm.provider = llm.provider
@@ -256,6 +389,61 @@ export class ConfigStore {
       if (contextWindow !== undefined) this.state.llm.contextWindow = contextWindow
       const maxTokens = positiveInt(llm.maxTokens)
       if (maxTokens !== undefined) this.state.llm.maxTokens = maxTokens
+    }
+    // 旧配置只有单个 llm：先把它同步到默认条目，再用 models（若有）整体覆盖
+    this.syncActiveProfile()
+    if (!Array.isArray(record.models) || record.models.length === 0) {
+      // 单模型旧配置没有自定义名称，用实际模型 id 作为展示名
+      const active = this.activeProfile()
+      if (active !== undefined && this.state.llm.model.length > 0) active.name = this.state.llm.model
+    }
+    if (Array.isArray(record.models) && record.models.length > 0) {
+      const models: SvLlmProfile[] = []
+      for (const item of record.models) {
+        if (typeof item !== 'object' || item === null) continue
+        const raw = item as Record<string, unknown>
+        if (typeof raw.baseURL !== 'string' || !isHttpUrl(raw.baseURL)) continue
+        if (typeof raw.model !== 'string' || raw.model.trim().length === 0) continue
+        const baseURL = raw.baseURL.replace(/\/+$/, '')
+        const model = raw.model.trim()
+        const provider = isLlmProvider(raw.provider) ? raw.provider : inferLlmProvider(baseURL)
+        const id = typeof raw.id === 'string' && raw.id.trim().length > 0 ? raw.id.trim() : newProfileId()
+        const name = typeof raw.name === 'string' && raw.name.trim().length > 0 ? raw.name.trim().slice(0, 60) : model
+        const profile: SvLlmProfile = {
+          id,
+          name,
+          provider,
+          baseURL,
+          model,
+          apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
+        }
+        const contextWindow = positiveInt(raw.contextWindow)
+        if (contextWindow !== undefined) profile.contextWindow = contextWindow
+        const maxTokens = positiveInt(raw.maxTokens)
+        if (maxTokens !== undefined) profile.maxTokens = maxTokens
+        models.push(profile)
+      }
+      if (models.length > 0) {
+        this.state.models = models
+        const requested = typeof record.activeModelId === 'string' ? record.activeModelId : ''
+        const active = models.find(profile => profile.id === requested) ?? models[0]!
+        this.state.activeModelId = active.id
+        this.state.llm = profileConfig(active)
+      }
+    }
+    if (typeof record.superAgent === 'object' && record.superAgent !== null) {
+      const superAgent = record.superAgent
+      if (typeof superAgent.enabled === 'boolean') this.state.superAgent.enabled = superAgent.enabled
+      const maxConcurrency = rangedInt(superAgent.maxConcurrency, 1, 8)
+      if (maxConcurrency !== undefined) this.state.superAgent.maxConcurrency = maxConcurrency
+      const maxSubtasks = rangedInt(superAgent.maxSubtasks, 1, 12)
+      if (maxSubtasks !== undefined) this.state.superAgent.maxSubtasks = maxSubtasks
+      const workerTimeoutMs = rangedInt(superAgent.workerTimeoutMs, 1_000, 3_600_000)
+      if (workerTimeoutMs !== undefined) this.state.superAgent.workerTimeoutMs = workerTimeoutMs
+      const retryAttempts = rangedInt(superAgent.retryAttempts, 0, 5)
+      if (retryAttempts !== undefined) this.state.superAgent.retryAttempts = retryAttempts
+      const watchdogIntervalMs = rangedInt(superAgent.watchdogIntervalMs, 100, 60_000)
+      if (watchdogIntervalMs !== undefined) this.state.superAgent.watchdogIntervalMs = watchdogIntervalMs
     }
     if (typeof record.search === 'object' && record.search !== null) {
       const search = record.search
@@ -301,6 +489,18 @@ export class ConfigStore {
    */
   async update(patch: {
     llm?: { provider?: unknown; baseURL?: unknown; model?: unknown; apiKey?: unknown; contextWindow?: unknown; maxTokens?: unknown }
+    /** 快速切换：直接指定生效的模型配置 id。 */
+    activeModelId?: unknown
+    /** 设置页保存：整体替换模型配置列表（缺省 apiKey 时按同 id 保留原密钥）。 */
+    llmModels?: { models?: unknown; activeModelId?: unknown }
+    superAgent?: {
+      enabled?: unknown
+      maxConcurrency?: unknown
+      maxSubtasks?: unknown
+      workerTimeoutMs?: unknown
+      retryAttempts?: unknown
+      watchdogIntervalMs?: unknown
+    }
     search?: { baseURL?: unknown; apiKey?: unknown; provider?: unknown; freshness?: unknown; retryAttempts?: unknown; timeoutMs?: unknown; budgetMs?: unknown }
     mail?: {
       enabled?: unknown
@@ -361,6 +561,97 @@ export class ConfigStore {
           if (value === undefined) throw new Error('maxTokens 必须是正整数')
           this.state.llm.maxTokens = value
         }
+      }
+    }
+    // llm 补丁只改「当前生效」条目，随后同步回模型列表
+    this.syncActiveProfile()
+    if (patch.llmModels !== undefined) {
+      const { models: rawModels, activeModelId: rawActive } = patch.llmModels
+      if (rawModels !== undefined) {
+        if (!Array.isArray(rawModels) || rawModels.length === 0) throw new Error('至少保留一个模型配置')
+        if (rawModels.length > 20) throw new Error('模型配置不能超过 20 个')
+        const existing = new Map(this.state.models.map(profile => [profile.id, profile]))
+        const next: SvLlmProfile[] = []
+        const used = new Set<string>()
+        for (const item of rawModels) {
+          if (typeof item !== 'object' || item === null) throw new Error('模型配置格式错误')
+          const raw = item as Record<string, unknown>
+          const id = typeof raw.id === 'string' && raw.id.trim().length > 0 ? raw.id.trim() : newProfileId()
+          if (used.has(id)) throw new Error('模型配置 id 重复')
+          used.add(id)
+          const previous = existing.get(id)
+          const provider = raw.provider === undefined ? previous?.provider ?? 'custom' : raw.provider
+          if (!isLlmProvider(provider)) throw new Error('LLM provider 必须是 deepseek / qwen / ark / openai / custom')
+          const baseURL = raw.baseURL === undefined
+            ? previous?.baseURL ?? ''
+            : String(raw.baseURL ?? '').trim().replace(/\/+$/, '')
+          if (!isHttpUrl(baseURL)) throw new Error('LLM baseURL 必须是 http(s) URL')
+          const model = raw.model === undefined ? previous?.model ?? '' : String(raw.model ?? '').trim()
+          if (model.length === 0) throw new Error('模型 id 不能为空')
+          if (model.length > 200) throw new Error('模型 id 过长')
+          const apiKey = raw.apiKey === undefined ? previous?.apiKey ?? '' : String(raw.apiKey ?? '').trim()
+          if (apiKey.length > 4096) throw new Error('API key 过长')
+          const rawName = raw.name === undefined ? previous?.name ?? model : String(raw.name ?? '').trim()
+          const profile: SvLlmProfile = {
+            id,
+            name: (rawName.length > 0 ? rawName : model).slice(0, 60),
+            provider,
+            baseURL,
+            model,
+            apiKey,
+          }
+          if (raw.contextWindow === undefined) {
+            if (previous?.contextWindow !== undefined) profile.contextWindow = previous.contextWindow
+          } else if (raw.contextWindow !== null) {
+            const value = positiveInt(raw.contextWindow)
+            if (value === undefined) throw new Error('contextWindow 必须是正整数')
+            profile.contextWindow = value
+          }
+          if (raw.maxTokens === undefined) {
+            if (previous?.maxTokens !== undefined) profile.maxTokens = previous.maxTokens
+          } else if (raw.maxTokens !== null) {
+            const value = positiveInt(raw.maxTokens)
+            if (value === undefined) throw new Error('maxTokens 必须是正整数')
+            profile.maxTokens = value
+          }
+          next.push(profile)
+        }
+        this.state.models = next
+        const requested = typeof rawActive === 'string' && rawActive.trim().length > 0
+          ? rawActive.trim()
+          : this.state.activeModelId
+        const active = next.find(profile => profile.id === requested) ?? next[0]!
+        this.state.activeModelId = active.id
+        this.state.llm = profileConfig(active)
+      } else if (rawActive !== undefined) {
+        this.activateProfile(rawActive)
+      }
+    }
+    if (patch.activeModelId !== undefined) this.activateProfile(patch.activeModelId)
+    if (patch.superAgent !== undefined) {
+      const superAgent = patch.superAgent
+      if (superAgent.enabled !== undefined) {
+        if (typeof superAgent.enabled !== 'boolean') throw new Error('Super-agent 开关必须是布尔值')
+        this.state.superAgent.enabled = superAgent.enabled
+      }
+      const limits: Array<[
+        key: 'maxConcurrency' | 'maxSubtasks' | 'workerTimeoutMs' | 'retryAttempts' | 'watchdogIntervalMs',
+        min: number,
+        max: number,
+        label: string,
+      ]> = [
+        ['maxConcurrency', 1, 8, '并发数'],
+        ['maxSubtasks', 1, 12, '子任务上限'],
+        ['workerTimeoutMs', 1_000, 3_600_000, '单次超时（ms）'],
+        ['retryAttempts', 0, 5, '重试次数'],
+        ['watchdogIntervalMs', 100, 60_000, '巡检间隔（ms）'],
+      ]
+      for (const [key, min, max, label] of limits) {
+        const raw = superAgent[key]
+        if (raw === undefined) continue
+        const value = rangedInt(raw, min, max)
+        if (value === undefined) throw new Error(`Super-agent ${label}必须是 ${min}–${max} 的整数`)
+        this.state.superAgent[key] = value
       }
     }
     if (patch.search !== undefined) {
@@ -464,6 +755,9 @@ export class ConfigStore {
         ...this.state.llm.contextWindow === undefined ? {} : { contextWindow: this.state.llm.contextWindow },
         ...this.state.llm.maxTokens === undefined ? {} : { maxTokens: this.state.llm.maxTokens },
       },
+      llmModels: this.modelViews(),
+      activeModelId: this.state.activeModelId,
+      superAgent: { ...this.state.superAgent },
       search: {
         provider: this.state.search.provider,
         baseURL: this.state.search.baseURL,

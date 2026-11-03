@@ -243,6 +243,41 @@ function toUsage(raw: unknown): TokenUsage | undefined {
   return usage
 }
 
+/** 用一份临时配置拉取 /models（设置页未保存的表单也能预览模型列表）。 */
+export async function listModelsWithConfig(
+  config: { baseURL: string; apiKey: string },
+  signal?: AbortSignal,
+): Promise<readonly LlmModelInfo[]> {
+  const apiKey = config.apiKey.trim()
+  if (apiKey.length === 0) {
+    throw new LlmError(
+      'sv-app: 尚未配置 LLM API key；请在 SV 页面（/sv → 设置）填写，或设置环境变量 SV_LLM_API_KEY',
+      'INVALID_CREDENTIAL',
+    )
+  }
+  let res: Response
+  try {
+    res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/models`, {
+      headers: { authorization: `Bearer ${apiKey}`, ...attributionHeaders() },
+      ...signal === undefined ? {} : { signal },
+    })
+  } catch (error) {
+    throw new LlmError(`sv-app: 拉取模型列表失败: ${error instanceof Error ? error.message : String(error)}`, 'TRANSPORT', { cause: error })
+  }
+  if (!res.ok) throw await providerHttpError(res, '拉取模型列表')
+  const json = await res.json() as { data?: unknown }
+  const entries = Array.isArray(json.data) ? json.data : []
+  const models: LlmModelInfo[] = []
+  for (const entry of entries) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const id = (entry as { id?: unknown }).id
+    if (typeof id !== 'string' || id.length === 0) continue
+    const name = (entry as { name?: unknown }).name
+    models.push({ provider: SV_PROVIDER_ID, id, name: typeof name === 'string' && name.length > 0 ? name : id })
+  }
+  return models
+}
+
 /** SV 的 OpenAI 兼容适配器。构造参数是“按请求读取当前配置”的回调。 */
 export class SvOpenAiCompatAdapter extends LlmAdapter {
   constructor(
@@ -273,29 +308,7 @@ export class SvOpenAiCompatAdapter extends LlmAdapter {
   }
 
   override async listModels(_provider: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
-    const config = this.options()
-    const apiKey = this.requireApiKey()
-    let res: Response
-    try {
-      res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/models`, {
-        headers: { authorization: `Bearer ${apiKey}`, ...attributionHeaders() },
-        ...signal === undefined ? {} : { signal },
-      })
-    } catch (error) {
-      throw new LlmError(`sv-app: 拉取模型列表失败: ${error instanceof Error ? error.message : String(error)}`, 'TRANSPORT', { cause: error })
-    }
-    if (!res.ok) throw await providerHttpError(res, '拉取模型列表')
-    const json = await res.json() as { data?: unknown }
-    const entries = Array.isArray(json.data) ? json.data : []
-    const models: LlmModelInfo[] = []
-    for (const entry of entries) {
-      if (typeof entry !== 'object' || entry === null) continue
-      const id = (entry as { id?: unknown }).id
-      if (typeof id !== 'string' || id.length === 0) continue
-      const name = (entry as { name?: unknown }).name
-      models.push({ provider: SV_PROVIDER_ID, id, name: typeof name === 'string' && name.length > 0 ? name : id })
-    }
-    return models
+    return listModelsWithConfig(this.options(), signal)
   }
 
   override async resolveModel(

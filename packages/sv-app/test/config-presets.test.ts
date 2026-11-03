@@ -186,3 +186,95 @@ test('load 读取 mail 节并忽略非法摘要时间', async () => {
   assert.equal(store.mail.digestAt, '')
   assert.equal(store.publicState().mail.hasPassword, true)
 })
+
+test('多模型：整体保存、切换生效，缺省 apiKey 时按 id 保留', async () => {
+  const store = new ConfigStore(defaults())
+  const firstId = store.publicState().activeModelId
+  const saved = await store.update({
+    llmModels: {
+      models: [
+        { id: firstId, name: '日常', provider: 'deepseek', baseURL: SV_LLM_PRESETS.deepseek.baseURL, model: 'deepseek-chat', apiKey: 'sk-a' },
+        { id: 'm-second', name: '长文', provider: 'qwen', baseURL: SV_LLM_PRESETS.qwen.baseURL, model: 'qwen3-max', apiKey: 'sk-b' },
+      ],
+      activeModelId: 'm-second',
+    },
+  })
+  assert.equal(saved.llmModels.length, 2)
+  assert.equal(saved.activeModelId, 'm-second')
+  assert.equal(saved.llm.model, 'qwen3-max')
+  assert.equal(saved.llm.hasApiKey, true)
+  assert.ok(!JSON.stringify(saved).includes('sk-a'))
+
+  // 再次保存时不带 apiKey：按同 id 保留原密钥
+  const again = await store.update({
+    llmModels: {
+      models: [
+        { id: firstId, name: '日常', provider: 'deepseek', baseURL: SV_LLM_PRESETS.deepseek.baseURL, model: 'deepseek-chat' },
+        { id: 'm-second', name: '长文', provider: 'qwen', baseURL: SV_LLM_PRESETS.qwen.baseURL, model: 'qwen3-max' },
+      ],
+      activeModelId: firstId,
+    },
+  })
+  assert.equal(again.activeModelId, firstId)
+  assert.equal(again.llm.model, 'deepseek-chat')
+  assert.equal(again.llmModels.find(model => model.id === 'm-second')?.hasApiKey, true)
+})
+
+test('activeModelId 快速切换生效；未知 id 拒绝', async () => {
+  const store = new ConfigStore(defaults())
+  await store.update({
+    llmModels: {
+      models: [
+        { id: 'a', name: 'A', provider: 'deepseek', baseURL: 'https://api.deepseek.com', model: 'deepseek-chat' },
+        { id: 'b', name: 'B', provider: 'openai', baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+      ],
+      activeModelId: 'a',
+    },
+  })
+  const switched = await store.update({ activeModelId: 'b' })
+  assert.equal(switched.activeModelId, 'b')
+  assert.equal(store.llm.baseURL, 'https://api.openai.com/v1')
+  await assert.rejects(() => store.update({ activeModelId: 'missing' }), /不存在/)
+})
+
+test('load 读取多模型配置与生效项', async () => {
+  await writeFile(join(home, 'config.json'), JSON.stringify({
+    models: [
+      { id: 'a', name: '模型 A', provider: 'deepseek', baseURL: 'https://api.deepseek.com', model: 'deepseek-chat', apiKey: 'k1' },
+      { id: 'b', name: '模型 B', provider: 'openai', baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    ],
+    activeModelId: 'b',
+  }), 'utf8')
+  const store = new ConfigStore(defaults())
+  await store.load()
+  assert.equal(store.publicState().llmModels.length, 2)
+  assert.equal(store.publicState().activeModelId, 'b')
+  assert.equal(store.llm.model, 'gpt-4o-mini')
+})
+
+test('Super-agent 配置：保存、范围校验与持久化回环', async () => {
+  const store = new ConfigStore(defaults())
+  const state = await store.update({
+    superAgent: {
+      enabled: true,
+      maxConcurrency: 5,
+      maxSubtasks: 9,
+      workerTimeoutMs: 120_000,
+      retryAttempts: 2,
+      watchdogIntervalMs: 3_000,
+    },
+  })
+  assert.equal(state.superAgent.enabled, true)
+  assert.equal(state.superAgent.maxConcurrency, 5)
+  assert.equal(state.superAgent.maxSubtasks, 9)
+
+  await assert.rejects(() => store.update({ superAgent: { maxConcurrency: 0 } }), /并发数/)
+  await assert.rejects(() => store.update({ superAgent: { retryAttempts: 6 } }), /重试次数/)
+  await assert.rejects(() => store.update({ superAgent: { enabled: 'yes' } }), /布尔值/)
+
+  const reloaded = new ConfigStore(defaults())
+  await reloaded.load()
+  assert.equal(reloaded.superAgent.enabled, true)
+  assert.equal(reloaded.superAgent.maxSubtasks, 9)
+  assert.equal(reloaded.superAgent.retryAttempts, 2)
+})

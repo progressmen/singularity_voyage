@@ -86,6 +86,11 @@ export interface SuperAgentOptions {
   watchdogIntervalMs: number
 }
 
+/** 可持久化的 Super-agent 配置（/sv 设置页读写，保存在 config.json）。 */
+export interface SvSuperAgentConfig extends SuperAgentOptions {
+  enabled: boolean
+}
+
 /** 运行历史保留上限（内存与持久化一致）。 */
 export const SUPER_AGENT_HISTORY_LIMIT = 20
 
@@ -153,6 +158,8 @@ const PERSIST_EVENTS: ReadonlySet<SuperAgentEvent['type']> = new Set([
 export interface SuperAgentSurface {
   readonly enabled: boolean
   readonly limits: SuperAgentOptions
+  /** 页面保存后即时应用开关与限额（对下一轮运行生效）。 */
+  applyConfig(config: SvSuperAgentConfig): void
   runs(): SuperAgentRunView[]
   run(goal: string, subtasks: readonly string[] | undefined, signal: AbortSignal): AsyncGenerator<SuperAgentEvent>
   /** 手动重试某个已结束运行里的失败 Worker。 */

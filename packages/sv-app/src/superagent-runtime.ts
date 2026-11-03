@@ -290,11 +290,32 @@ function createWorker(
 
 /** Super-agent 服务：实现 /sv 路由与状态查询需要的接口。 */
 export class SuperAgentService implements SuperAgentSurface {
-  readonly enabled = true
+  private currentEnabled = true
   readonly limits: SuperAgentOptions
 
   constructor(private readonly runner: SuperAgentRunner) {
     this.limits = runner.options
+  }
+
+  get enabled(): boolean {
+    return this.currentEnabled
+  }
+
+  /** 页面保存后即时应用：开关对 UI/路由生效，限额对下一轮运行生效。 */
+  applyConfig(config: {
+    enabled: boolean
+    maxConcurrency: number
+    maxSubtasks: number
+    workerTimeoutMs: number
+    retryAttempts: number
+    watchdogIntervalMs: number
+  }): void {
+    this.currentEnabled = config.enabled
+    this.limits.maxConcurrency = config.maxConcurrency
+    this.limits.maxSubtasks = config.maxSubtasks
+    this.limits.workerTimeoutMs = config.workerTimeoutMs
+    this.limits.retryAttempts = config.retryAttempts
+    this.limits.watchdogIntervalMs = config.watchdogIntervalMs
   }
 
   runs(): SuperAgentRunView[] {

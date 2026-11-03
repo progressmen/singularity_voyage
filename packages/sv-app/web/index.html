@@ -98,6 +98,7 @@
         <button class="btn btn-ghost icon-only" id="toggle-sidebar" title="收起/展开侧栏">☰</button>
         <div class="topbar-title" id="topbar-title">新对话</div>
         <div class="topbar-meta">
+          <select class="model-switch" id="model-switch" title="切换模型"></select>
           <div class="topbar-usage" id="topbar-usage" hidden>
             <span class="usage-context" id="usage-context"></span>
             <span class="usage-meter" id="usage-meter"><span class="usage-meter-fill" id="usage-meter-fill"></span></span>
@@ -253,6 +254,13 @@
         <div class="composer-hint">回答由 AI 生成，请注意甄别；联网搜索结果由 web_search 工具提供。</div>
       </footer>
     </main>
+
+    <aside class="file-rail" id="file-rail" hidden>
+      <div class="file-rail-head">
+        <span>生成文件<span class="file-count" id="file-count"></span></span>
+      </div>
+      <div class="file-list" id="file-list"></div>
+    </aside>
   </div>
 
   <dialog class="settings" id="settings">
@@ -273,6 +281,18 @@
 
       <section class="settings-section">
         <h3>模型（OpenAI 兼容 API）</h3>
+        <div class="model-profile-bar">
+          <label class="field">
+            <span>模型配置</span>
+            <select id="cfg-llm-profile"></select>
+          </label>
+          <button type="button" class="btn btn-ghost" id="cfg-llm-add">新增</button>
+          <button type="button" class="btn btn-ghost" id="cfg-llm-remove">删除</button>
+        </div>
+        <label class="field">
+          <span>名称（快速切换时显示）</span>
+          <input id="cfg-llm-name" maxlength="60" placeholder="如 快速问答 / 长文写作">
+        </label>
         <label class="field">
           <span>供应商预设</span>
           <select id="cfg-llm-provider">
@@ -311,6 +331,39 @@
           <button type="button" class="btn btn-ghost" id="fetch-models">拉取模型列表</button>
           <span class="test-result" id="test-llm-result"></span>
         </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Super Agent（Router / Worker）</h3>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-sa-enabled">
+          <span>启用 Super Agent（侧栏显示入口）</span>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>并发 Worker 数</span>
+            <input id="cfg-sa-concurrency" type="number" min="1" max="8" step="1">
+          </label>
+          <label class="field">
+            <span>子任务上限</span>
+            <input id="cfg-sa-subtasks" type="number" min="1" max="12" step="1">
+          </label>
+          <label class="field">
+            <span>失败重试次数</span>
+            <input id="cfg-sa-retry" type="number" min="0" max="5" step="1">
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>单次 Worker 超时（ms）</span>
+            <input id="cfg-sa-timeout" type="number" min="1000" max="3600000" step="1000">
+          </label>
+          <label class="field">
+            <span>watchdog 巡检间隔（ms）</span>
+            <input id="cfg-sa-watchdog" type="number" min="100" max="60000" step="100">
+          </label>
+        </div>
+        <p class="schedule-hint">保存后立即生效，对下一轮运行起作用；关闭后侧栏入口隐藏。</p>
       </section>
 
       <section class="settings-section">
@@ -443,6 +496,19 @@
         <button type="button" class="btn btn-ghost" id="confirm-cancel">取消</button>
         <button type="button" class="btn btn-danger" id="confirm-ok">删除</button>
       </div>
+    </div>
+  </dialog>
+
+  <dialog class="file-preview" id="file-preview" aria-labelledby="file-preview-title">
+    <div class="file-preview-panel">
+      <div class="file-preview-head">
+        <div class="file-preview-heading">
+          <div class="file-preview-title" id="file-preview-title"></div>
+          <div class="file-preview-path" id="file-preview-path"></div>
+        </div>
+        <button type="button" class="btn btn-ghost" id="file-preview-close">关闭</button>
+      </div>
+      <div class="file-preview-body" id="file-preview-body"></div>
     </div>
   </dialog>
 

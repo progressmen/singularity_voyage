@@ -43,6 +43,8 @@ export type SvChatEvent =
     durationMs?: number
   }
   | { type: 'message'; text: string; reasoning: string }
+  /** 本轮产出的文件（文件工具写入成功后的绝对路径）。 */
+  | { type: 'file'; path: string }
   | { type: 'usage'; usage: SessionUsage }
   | { type: 'error'; message: string }
   | { type: 'done' }
@@ -73,6 +75,31 @@ function appendBlock(target: string, chunk: string): string {
   const text = chunk.trim()
   if (text.length === 0) return target
   return target.length === 0 ? text : `${target}\n\n${text}`
+}
+
+/** 产出文件的内置工具：成功结果里的 path 即绝对路径。 */
+const FILE_TOOLS = new Set(['write', 'edit', 'str_replace_editor'])
+
+/** 从工具结果或参数里取出被写入的文件路径。 */
+function producedFilePath(name: string, value: unknown, args: string | undefined): string | undefined {
+  if (!FILE_TOOLS.has(name)) return undefined
+  if (typeof value === 'object' && value !== null) {
+    const path = (value as { path?: unknown }).path
+    if (typeof path === 'string' && path.length > 0) return path
+  }
+  if (args !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(args)
+      if (typeof parsed === 'object' && parsed !== null) {
+        const path = (parsed as { file_path?: unknown; path?: unknown }).file_path
+          ?? (parsed as { path?: unknown }).path
+        if (typeof path === 'string' && path.length > 0) return path
+      }
+    } catch {
+      // 参数不是 JSON（已被截断）：忽略
+    }
+  }
+  return undefined
 }
 
 /** 一轮对话结束后的回调输入（用于异步记忆抽取）。 */
@@ -109,6 +136,10 @@ interface LiveSession {
   turnStartTs: number
   /** 本轮用户输入字符数（日志只记长度，不记正文）。 */
   turnUserChars: number
+  /** 创建/恢复得到的句柄；切换模型时用于销毁旧的 agent。 */
+  handle?: AgentHandle
+  /** 当前 agent 创建时使用的模型 id。 */
+  modelId?: string
   /** 会话累计 token 统计与上下文占用（resume 时从索引恢复）。 */
   usage?: SessionUsage
 }
@@ -168,6 +199,10 @@ export class ChatManager {
       ...(payload === undefined ? {} : { result: clip(payload) }),
       ...(durationMs === undefined ? {} : { durationMs }),
     })
+    if (!result.isError) {
+      const path = producedFilePath(name, result.value, args)
+      if (path !== undefined) this.emit(rec, { type: 'file', path })
+    }
     rec.turnTools.push({
       name,
       args: clip(args, TRANSCRIPT_ARGS_BYTES),
@@ -321,9 +356,17 @@ export class ChatManager {
     }
     if (requested !== undefined && requested.length > 0) {
       const existing = this.live.get(requested)
-      if (existing !== undefined) return requested
+      if (existing !== undefined) {
+        // 模型在页面切换后，空闲会话销毁旧 agent，下一条消息按新模型 resume；
+        // 正在生成时保持旧模型跑完本轮，避免中途断开。
+        if (existing.modelId === undefined || existing.modelId === this.store.llm.model || existing.status === 'running') {
+          return requested
+        }
+        await this.retire(existing)
+      }
       try {
         const rec = newRec(requested)
+        rec.modelId = this.store.llm.model
         const handle: AgentHandle = await this.ctx.agents.resume({
           resumeSessionId: SessionId(requested),
           agentOptions: this.agentOptions(),
@@ -332,6 +375,7 @@ export class ChatManager {
           },
         })
         rec.agent = handle.agent
+        rec.handle = handle
         this.live.set(requested, rec)
         void this.sessions.register(requested).catch(() => {})
         this.ctx.logger.info(svLog('chat', 'session_resumed', { sessionId: requested }))
@@ -345,6 +389,7 @@ export class ChatManager {
     }
     const sessionId = randomUUID()
     const rec = newRec(sessionId)
+    rec.modelId = this.store.llm.model
     const handle: AgentHandle = await this.ctx.agents.create({
       sessionId: SessionId(sessionId),
       meta: { cwd: process.cwd() },
@@ -354,6 +399,7 @@ export class ChatManager {
       },
     })
     rec.agent = handle.agent
+    rec.handle = handle
     this.live.set(sessionId, rec)
     void this.sessions.register(sessionId).catch(() => {})
     this.ctx.logger.info(svLog('chat', 'session_created', {
@@ -361,6 +407,23 @@ export class ChatManager {
       model: this.store.llm.model,
     }))
     return sessionId
+  }
+
+  /** 销毁一个空闲会话的 agent（保留会话数据，下条消息按新模型 resume）。 */
+  private async retire(rec: LiveSession): Promise<void> {
+    const handle = rec.handle
+    delete rec.handle
+    this.live.delete(rec.sessionId)
+    if (handle === undefined) return
+    try {
+      await handle.dispose()
+      this.ctx.logger.info(svLog('chat', 'session_model_switched', { sessionId: rec.sessionId, model: this.store.llm.model }))
+    } catch (error) {
+      this.ctx.logger.warn(svLog('chat', 'session_retire_failed', {
+        sessionId: rec.sessionId,
+        err: svError(error),
+      }))
+    }
   }
 
   /** 当前会话状态；未知会话返回 idle。 */

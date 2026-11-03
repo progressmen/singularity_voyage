@@ -74,6 +74,7 @@ function applyView(view) {
   $('panel-logs').hidden = view !== 'logs'
   $('topbar-title').textContent = VIEW_TITLES[view] ?? (activeConversation()?.title ?? '新对话')
   renderUsage(activeConversation()?.usage)
+  renderFileRail()
   if (view === 'superagent') void loadSuperAgent()
   if (view === 'tasks') void loadTasks()
   if (view === 'schedules') void loadSchedules()
@@ -179,6 +180,8 @@ async function hydrateConversation(id) {
       ...(m.reasoning ? { reasoning: m.reasoning } : {}),
       ...(Array.isArray(m.tools) && m.tools.length > 0 ? { tools: m.tools } : {}),
     })))
+    // 历史回填后重新扫描正文里的文件路径（空会话时可能已标记过）
+    conv.filesScanned = false
     const firstUser = messages.find(m => m.role === 'user')
     if (conv.title === '新对话' && firstUser?.text) conv.title = firstUser.text.slice(0, 24)
     conv.updatedAt = messages[messages.length - 1]?.ts ?? Date.now()
@@ -751,6 +754,7 @@ function nearBottom(el, threshold = 120) {
 }
 
 function renderMessages() {
+  renderFileRail()
   const container = $('messages')
   const open = openDetails(container)
   const stick = nearBottom(container) || container.scrollTop === 0
@@ -782,6 +786,120 @@ function renderMessages() {
   container.appendChild(inner)
   applyOpenDetails(inner, open)
   if (stick) container.scrollTop = container.scrollHeight
+}
+
+/* ── 生成文件列表 ─────────────────────────────────────── */
+
+/** 右侧文件列表可预览的文本文件扩展名。 */
+const PREVIEWABLE_RE = /\.(md|markdown|txt|json|csv|tsv|html?|xml|ya?ml|toml|ini|log|py|js|mjs|cjs|ts|tsx|jsx|css|scss|sh|sql)$/i
+
+/** 从助手正文中提取文件路径（Markdown 链接与裸绝对路径）。 */
+function extractFilePaths(text) {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const found = new Set()
+  const push = (raw) => {
+    let value = String(raw).trim()
+    if (value.startsWith('file://')) {
+      try {
+        value = decodeURIComponent(value.slice('file://'.length))
+      } catch {
+        value = value.slice('file://'.length)
+      }
+    }
+    if (!value.startsWith('/') || value.startsWith('//') || value.includes('://')) return
+    if (value.includes('\n') || !PREVIEWABLE_RE.test(value)) return
+    found.add(value)
+  }
+  for (const match of text.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)) push(match[1])
+  for (const match of text.matchAll(/\/[^\s()<>"'`，。；：、（）]+/g)) push(match[0])
+  return [...found]
+}
+
+/** 取得会话的产出文件；首次访问时从历史消息里补齐。 */
+function conversationFiles(conv = activeConversation()) {
+  if (conv === null || conv === undefined) return []
+  if (!Array.isArray(conv.files)) conv.files = []
+  if (conv.filesScanned !== true) {
+    conv.filesScanned = true
+    let added = false
+    for (const message of conv.messages ?? []) {
+      if (message.role !== 'assistant') continue
+      for (const path of extractFilePaths(message.text ?? '')) {
+        if (addConversationFile(conv, path, false)) added = true
+      }
+    }
+    if (added) saveConversations()
+  }
+  return conv.files
+}
+
+/** 记录一个产出文件；返回是否新增。 */
+function addConversationFile(conv, path, persist = true) {
+  if (conv === null || conv === undefined || typeof path !== 'string' || !path.startsWith('/')) return false
+  if (!Array.isArray(conv.files)) conv.files = []
+  if (conv.files.some(file => file.path === path)) return false
+  conv.files.push({ path, name: path.split('/').pop() || path, addedAt: Date.now() })
+  if (persist) saveConversations()
+  return true
+}
+
+/** 渲染页面右侧的生成文件列表（只在对话视图且有文件时出现）。 */
+function renderFileRail() {
+  const rail = $('file-rail')
+  const files = conversationFiles()
+  const show = currentView === 'chat' && files.length > 0
+  rail.hidden = !show
+  if (!show) return
+  $('file-count').textContent = String(files.length)
+  const list = $('file-list')
+  list.innerHTML = ''
+  for (const file of [...files].reverse()) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'file-item'
+    button.title = file.path
+    const ext = (file.name.includes('.') ? file.name.split('.').pop() : 'file').toUpperCase().slice(0, 4)
+    const dir = file.path.split('/').slice(-2, -1)[0] ?? ''
+    button.innerHTML = `
+      <span class="file-ext" aria-hidden="true"></span>
+      <span class="file-meta">
+        <span class="file-name"></span>
+        <span class="file-sub"></span>
+      </span>`
+    button.querySelector('.file-ext').textContent = ext
+    button.querySelector('.file-name').textContent = file.name
+    button.querySelector('.file-sub').textContent = dir
+    button.addEventListener('click', () => void openFilePreview(file.path))
+    list.appendChild(button)
+  }
+}
+
+/** 打开文件预览弹层。 */
+async function openFilePreview(path) {
+  const dialog = $('file-preview')
+  const body = $('file-preview-body')
+  $('file-preview-title').textContent = path.split('/').pop() || path
+  $('file-preview-path').textContent = path
+  body.innerHTML = '<div class="file-preview-status">加载中…</div>'
+  if (!dialog.open) dialog.showModal()
+  try {
+    const data = await api(`/sv/api/file?path=${encodeURIComponent(path)}`)
+    $('file-preview-title').textContent = data.name ?? path.split('/').pop() ?? path
+    if (data.binary) {
+      body.innerHTML = '<div class="file-preview-status">二进制文件，暂不支持预览。</div>'
+      return
+    }
+    const text = typeof data.text === 'string' ? data.text : ''
+    if (/\.(md|markdown)$/i.test(data.name ?? path)) {
+      const html = globalThis.SvMarkdown?.render(text) ?? `<pre>${escapeHtml(text)}</pre>`
+      body.innerHTML = `<div class="content file-preview-md">${html}</div>`
+    } else {
+      body.innerHTML = `<pre class="file-preview-text">${escapeHtml(text)}</pre>`
+    }
+    if (data.truncated) body.insertAdjacentHTML('beforeend', '<div class="file-preview-status">文件较大，仅显示前 512 KB。</div>')
+  } catch (error) {
+    body.innerHTML = `<div class="file-preview-status error">预览失败：${escapeHtml(error.message ?? String(error))}</div>`
+  }
 }
 
 function refreshActiveMessage() {
@@ -1244,6 +1362,7 @@ async function loadState() {
     const modelChip = $('chip-model')
     modelChip.textContent = state.llm?.model ?? '…'
     modelChip.className = 'chip'
+    renderModelSwitch(state)
     const searchChip = $('chip-search')
     searchChip.textContent = state.search?.hasApiKey ? `搜索 ${state.search?.provider ?? ''} ✓` : '搜索 ✕'
     searchChip.className = 'chip ' + (state.search?.hasApiKey ? 'on' : 'off')
@@ -1303,15 +1422,154 @@ const SEARCH_PRESETS = {
 /** 最近一次读取到的搜索密钥配置状态（设置表单占位提示用）。 */
 let searchHasApiKey = false
 
+/** 设置页的模型配置草稿：保存时整体提交，切换条目不会丢改动。 */
+let llmDrafts = []
+/** 当前正在编辑的条目（只影响表单，不改变运行时生效模型）。 */
+let llmDraftEditId = ''
+/** 当前运行时生效的条目；保存时原样提交。 */
+let llmDraftActiveId = ''
+
+/** 顶栏快速切换的并发保护。 */
+let modelSwitching = false
+
+function newDraftId() {
+  return `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** 重绘设置页的模型配置下拉。 */
+function renderLlmProfileSelect() {
+  const select = $('cfg-llm-profile')
+  select.innerHTML = ''
+  for (const draft of llmDrafts) {
+    const option = document.createElement('option')
+    option.value = draft.id
+    const label = draft.name?.trim() || draft.model || '未命名模型'
+    option.textContent = draft.id === llmDraftActiveId ? `${label}（当前）` : label
+    select.appendChild(option)
+  }
+  select.value = llmDraftEditId
+  $('cfg-llm-remove').disabled = llmDrafts.length <= 1
+}
+
+/** 把当前表单写回选中的草稿（切换条目前调用）。 */
+function commitLlmDraft() {
+  const draft = llmDrafts.find(item => item.id === llmDraftEditId)
+  if (draft === undefined) return
+  draft.name = $('cfg-llm-name').value.trim()
+  draft.provider = $('cfg-llm-provider').value
+  draft.baseURL = $('cfg-llm-base').value.trim()
+  draft.model = $('cfg-llm-model').value.trim()
+  const ctx = $('cfg-llm-ctx').value.trim()
+  const max = $('cfg-llm-max').value.trim()
+  draft.contextWindow = ctx.length > 0 ? Number(ctx) : undefined
+  draft.maxTokens = max.length > 0 ? Number(max) : undefined
+  const key = $('cfg-llm-key').value.trim()
+  if (key.length > 0) {
+    draft.apiKey = key
+    draft.hasApiKey = true
+    $('cfg-llm-key').value = ''
+  }
+}
+
+/** 把选中的草稿填进表单。 */
+function loadLlmDraft() {
+  const draft = llmDrafts.find(item => item.id === llmDraftEditId)
+  if (draft === undefined) return
+  $('cfg-llm-name').value = draft.name ?? ''
+  $('cfg-llm-provider').value = draft.provider ?? 'custom'
+  $('cfg-llm-base').value = draft.baseURL ?? ''
+  $('cfg-llm-model').value = draft.model ?? ''
+  $('cfg-llm-ctx').value = draft.contextWindow ?? ''
+  $('cfg-llm-max').value = draft.maxTokens ?? ''
+  $('cfg-llm-key').value = ''
+  $('cfg-llm-key').placeholder = draft.hasApiKey ? '已配置（留空表示不修改）' : '未配置'
+}
+
+/** 顶栏模型快速切换下拉。 */
+function renderModelSwitch(state) {
+  const select = $('model-switch')
+  const models = Array.isArray(state?.llmModels) ? state.llmModels : []
+  select.innerHTML = ''
+  for (const model of models) {
+    const option = document.createElement('option')
+    option.value = model.id
+    option.textContent = model.name || model.model
+    option.title = `${model.model} · ${model.baseURL}`
+    select.appendChild(option)
+  }
+  if (typeof state?.activeModelId === 'string') select.value = state.activeModelId
+  select.dataset.activeId = state?.activeModelId ?? ''
+  select.hidden = models.length === 0
+}
+
+/** 切换生效模型（立即持久化，下一条消息生效）。 */
+async function switchModel() {
+  const select = $('model-switch')
+  const id = select.value
+  if (modelSwitching || id.length === 0) return
+  const previous = select.dataset.activeId ?? ''
+  modelSwitching = true
+  select.disabled = true
+  const status = $('topbar-status')
+  try {
+    const state = await api('/sv/api/config', { method: 'POST', body: { activeModelId: id } })
+    renderModelSwitch(state)
+    $('chip-model').textContent = state.llm?.model ?? '…'
+    $('chip-model').className = 'chip'
+    status.textContent = `已切换到 ${state.llm?.model ?? id}`
+    status.className = 'topbar-status'
+    window.setTimeout(() => {
+      if (!streaming && status.textContent.startsWith('已切换到')) status.textContent = ''
+    }, 2200)
+  } catch (error) {
+    select.value = previous
+    status.textContent = `切换失败：${error.message ?? String(error)}`
+  } finally {
+    modelSwitching = false
+    select.disabled = false
+  }
+}
+
 function fillSettingsForm(state) {
   $('cfg-theme').value = preferredTheme()
-  $('cfg-llm-provider').value = state.llm?.provider ?? 'custom'
-  $('cfg-llm-base').value = state.llm?.baseURL ?? ''
-  $('cfg-llm-model').value = state.llm?.model ?? ''
-  $('cfg-llm-ctx').value = state.llm?.contextWindow ?? ''
-  $('cfg-llm-max').value = state.llm?.maxTokens ?? ''
-  $('cfg-llm-key').value = ''
-  $('cfg-llm-key').placeholder = state.llm?.hasApiKey ? '已配置（留空表示不修改）' : '未配置'
+  llmDrafts = (Array.isArray(state.llmModels) ? state.llmModels : []).map(profile => ({
+    id: profile.id,
+    name: profile.name ?? '',
+    provider: profile.provider ?? 'custom',
+    baseURL: profile.baseURL ?? '',
+    model: profile.model ?? '',
+    contextWindow: profile.contextWindow,
+    maxTokens: profile.maxTokens,
+    apiKey: '',
+    hasApiKey: profile.hasApiKey === true,
+  }))
+  if (llmDrafts.length === 0) {
+    llmDrafts = [{
+      id: newDraftId(),
+      name: state.llm?.model ?? '',
+      provider: state.llm?.provider ?? 'custom',
+      baseURL: state.llm?.baseURL ?? '',
+      model: state.llm?.model ?? '',
+      contextWindow: state.llm?.contextWindow,
+      maxTokens: state.llm?.maxTokens,
+      apiKey: '',
+      hasApiKey: state.llm?.hasApiKey === true,
+    }]
+  }
+  llmDraftActiveId = llmDrafts.some(draft => draft.id === state.activeModelId)
+    ? state.activeModelId
+    : llmDrafts[0].id
+  llmDraftEditId = llmDraftActiveId
+  renderLlmProfileSelect()
+  loadLlmDraft()
+  const sa = state.superAgent ?? {}
+  const saLimits = sa.limits ?? sa
+  $('cfg-sa-enabled').checked = sa.enabled === true
+  $('cfg-sa-concurrency').value = saLimits.maxConcurrency ?? ''
+  $('cfg-sa-subtasks').value = saLimits.maxSubtasks ?? ''
+  $('cfg-sa-retry').value = saLimits.retryAttempts ?? ''
+  $('cfg-sa-timeout').value = saLimits.workerTimeoutMs ?? ''
+  $('cfg-sa-watchdog').value = saLimits.watchdogIntervalMs ?? ''
   $('cfg-search-provider').value = state.search?.provider ?? 'deepseek'
   $('cfg-search-base').value = state.search?.baseURL ?? ''
   $('cfg-search-key').value = ''
@@ -1387,11 +1645,28 @@ function syncLlmProviderUI() {
 }
 
 async function saveSettings() {
+  commitLlmDraft()
   const body = {
-    llm: {
-      provider: $('cfg-llm-provider').value,
-      baseURL: $('cfg-llm-base').value.trim(),
-      model: $('cfg-llm-model').value.trim(),
+    llmModels: {
+      models: llmDrafts.map(draft => ({
+        id: draft.id,
+        name: draft.name,
+        provider: draft.provider,
+        baseURL: draft.baseURL,
+        model: draft.model,
+        contextWindow: draft.contextWindow ?? null,
+        maxTokens: draft.maxTokens ?? null,
+        ...(draft.apiKey ? { apiKey: draft.apiKey } : {}),
+      })),
+      activeModelId: llmDraftActiveId,
+    },
+    superAgent: {
+      enabled: $('cfg-sa-enabled').checked,
+      maxConcurrency: Number($('cfg-sa-concurrency').value),
+      maxSubtasks: Number($('cfg-sa-subtasks').value),
+      retryAttempts: Number($('cfg-sa-retry').value),
+      workerTimeoutMs: Number($('cfg-sa-timeout').value),
+      watchdogIntervalMs: Number($('cfg-sa-watchdog').value),
     },
     search: {
       provider: $('cfg-search-provider').value,
@@ -1399,14 +1674,7 @@ async function saveSettings() {
     },
   }
   body.search.freshness = $('cfg-search-provider').value === 'bocha' ? $('cfg-search-freshness').value : null
-  if ($('cfg-llm-key').value.trim().length > 0) body.llm.apiKey = $('cfg-llm-key').value.trim()
   if ($('cfg-search-key').value.trim().length > 0) body.search.apiKey = $('cfg-search-key').value.trim()
-  const ctx = $('cfg-llm-ctx').value.trim()
-  const max = $('cfg-llm-max').value.trim()
-  if (ctx.length > 0) body.llm.contextWindow = Number(ctx)
-  if (ctx.length === 0) body.llm.contextWindow = null
-  if (max.length > 0) body.llm.maxTokens = Number(max)
-  if (max.length === 0) body.llm.maxTokens = null
   for (const [key, id] of [['retryAttempts', 'cfg-search-retry'], ['timeoutMs', 'cfg-search-timeout'], ['budgetMs', 'cfg-search-budget']]) {
     const raw = $(id).value.trim()
     body.search[key] = raw.length > 0 ? Number(raw) : null
@@ -1436,12 +1704,24 @@ async function saveSettings() {
   }
 }
 
+/** 当前编辑表单对应的模型配置（测试与拉取模型用，不触发保存）。 */
+function currentLlmForm() {
+  const apiKey = $('cfg-llm-key').value.trim()
+  return {
+    id: llmDraftEditId,
+    baseURL: $('cfg-llm-base').value.trim(),
+    model: $('cfg-llm-model').value.trim(),
+    ...(apiKey.length > 0 ? { apiKey } : {}),
+  }
+}
+
 async function runTest(target) {
   const result = $({ llm: 'test-llm-result', search: 'test-search-result', mail: 'test-mail-result' }[target])
   result.textContent = '测试中…'
   result.className = 'test-result'
   try {
-    const res = await api('/sv/api/test', { method: 'POST', body: { target } })
+    const body = target === 'llm' ? { target, llm: currentLlmForm() } : { target }
+    const res = await api('/sv/api/test', { method: 'POST', body })
     if (res.ok) {
       result.className = 'test-result ok'
       result.textContent = target === 'llm'
@@ -1542,6 +1822,8 @@ async function sendMessage() {
     assistant.error = assistant.error ?? `连接失败：${error.message ?? String(error)}`
   } finally {
     assistant.streaming = false
+    // 兜底：正文里以链接/绝对路径提到的产出文件也补进右侧列表
+    for (const path of extractFilePaths(assistant.text ?? '')) addConversationFile(conv, path, false)
     conv.updatedAt = Date.now()
     conversations.sort((a, b) => b.updatedAt - a.updatedAt)
     saveConversations()
@@ -1596,6 +1878,9 @@ function handleEvent(conv, assistant, event) {
       assistant.text = event.text
       assistant.reasoning = event.reasoning || assistant.reasoning
       refreshActiveMessage()
+      break
+    case 'file':
+      if (addConversationFile(conv, event.path)) renderFileRail()
       break
     case 'usage':
       conv.usage = event.usage
@@ -2537,6 +2822,10 @@ async function openSettings() {
   $('settings').showModal()
 }
 $('open-settings').addEventListener('click', openSettings)
+$('file-preview-close').addEventListener('click', () => $('file-preview').close())
+$('file-preview').addEventListener('click', (event) => {
+  if (event.target === $('file-preview')) $('file-preview').close()
+})
 $('mail-quick-settings').addEventListener('click', () => void openSettings())
 // 待办页快捷开关：只改总开关，其余策略在设置弹窗里；未配置 SMTP 时引导去配置
 $('mail-quick-toggle').addEventListener('change', async event => {
@@ -2570,22 +2859,71 @@ $('settings').addEventListener('click', (event) => {
 })
 $('cfg-search-provider').addEventListener('change', syncSearchProviderUI)
 $('cfg-llm-provider').addEventListener('change', syncLlmProviderUI)
+$('model-switch').addEventListener('change', () => void switchModel())
+$('cfg-llm-profile').addEventListener('change', () => {
+  commitLlmDraft()
+  llmDraftEditId = $('cfg-llm-profile').value
+  renderLlmProfileSelect()
+  loadLlmDraft()
+})
+$('cfg-llm-add').addEventListener('click', () => {
+  commitLlmDraft()
+  const preset = LLM_PRESETS.deepseek
+  const draft = {
+    id: newDraftId(),
+    name: '',
+    provider: 'deepseek',
+    baseURL: preset.baseURL,
+    model: preset.model,
+    apiKey: '',
+    hasApiKey: false,
+  }
+  llmDrafts.push(draft)
+  llmDraftEditId = draft.id
+  renderLlmProfileSelect()
+  loadLlmDraft()
+  $('cfg-llm-name').focus()
+})
+$('cfg-llm-remove').addEventListener('click', () => {
+  if (llmDrafts.length <= 1) return
+  commitLlmDraft()
+  const index = llmDrafts.findIndex(draft => draft.id === llmDraftEditId)
+  llmDrafts.splice(index >= 0 ? index : 0, 1)
+  // 删掉当前生效条目时，生效模型回落到第一个
+  if (!llmDrafts.some(draft => draft.id === llmDraftActiveId)) llmDraftActiveId = llmDrafts[0].id
+  llmDraftEditId = llmDrafts[0].id
+  renderLlmProfileSelect()
+  loadLlmDraft()
+})
 $('cfg-theme').addEventListener('change', () => applyTheme($('cfg-theme').value))
 $('settings-save').addEventListener('click', saveSettings)
 $('test-llm').addEventListener('click', () => runTest('llm'))
 $('test-search').addEventListener('click', () => runTest('search'))
 $('test-mail').addEventListener('click', () => runTest('mail'))
 $('fetch-models').addEventListener('click', async () => {
-  const state = await loadState()
-  if (state) {
-    fillSettingsForm(state)
+  const result = $('test-llm-result')
+  result.textContent = '拉取中…'
+  result.className = 'test-result'
+  try {
+    // 用当前表单的端点/密钥拉取，不依赖已保存的生效配置
+    const res = await api('/sv/api/test', { method: 'POST', body: { target: 'llm', llm: currentLlmForm() } })
+    if (!res.ok) {
+      result.className = 'test-result err'
+      result.textContent = res.error ?? '失败'
+      return
+    }
     const list = $('model-list')
     list.innerHTML = ''
-    for (const id of state.models ?? []) {
+    for (const id of res.models ?? []) {
       const option = document.createElement('option')
       option.value = id
       list.appendChild(option)
     }
+    result.className = 'test-result ok'
+    result.textContent = `已拉取 ${res.models?.length ?? 0} 个模型`
+  } catch (error) {
+    result.className = 'test-result err'
+    result.textContent = error.message ?? String(error)
   }
 })
 

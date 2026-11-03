@@ -6,14 +6,14 @@
  */
 import { open, readdir, readFile, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { extname, join } from 'node:path'
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-schedule'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { ChatManager, SvChatEvent } from './chat.ts'
 import type { ConfigStore } from './config-store.ts'
 import { MEMORY_KINDS, memoryView, type MemoryKind, type MemoryPatch, type MemoryStore } from './memory-store.ts'
-import { SV_PROVIDER_ID } from './llm-adapter.ts'
+import { listModelsWithConfig, SV_PROVIDER_ID } from './llm-adapter.ts'
 import { svError, svErrorTrace, svLog, svLogDir } from './log.ts'
 import type { MailNotifier } from './mail-notifier.ts'
 import type { ReminderService, SvReminderEvent } from './reminders.ts'
@@ -45,6 +45,8 @@ const LOG_TAIL_BYTES = 8 * 1024 * 1024
 const LOG_FILE_RE = /^[A-Za-z0-9._-]{1,64}\.log$/
 /** 日志表格单页条数上限。 */
 const LOG_PAGE_SIZE_MAX = 200
+/** 文件预览单次读取上限，超出部分截断。 */
+const FILE_PREVIEW_BYTES = 512 * 1024
 
 type SvLogLevel = 'error' | 'warn' | 'info'
 
@@ -234,6 +236,8 @@ export function registerSvRoutes(
       try {
         const body = await readJson(req)
         const state = await store.update(body as Parameters<ConfigStore['update']>[0])
+        // Super-agent 开关与限额即时应用（不需要重启）
+        superAgent?.applyConfig(store.superAgent)
         sendJson(res, 200, state)
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
@@ -309,7 +313,21 @@ export function registerSvRoutes(
         const target = body.target
         if (target === 'llm') {
           try {
-            const models = await ctx.llm.listModels(SV_PROVIDER_ID)
+            // 设置页可以带上未保存的表单值：用当前填写的端点/密钥测试，而不是已保存的生效配置
+            const override = typeof body.llm === 'object' && body.llm !== null
+              ? body.llm as Record<string, unknown>
+              : undefined
+            let models: Awaited<ReturnType<typeof listModelsWithConfig>>
+            if (override === undefined) {
+              models = await ctx.llm.listModels(SV_PROVIDER_ID)
+            } else {
+              const saved = store.llmConfig(typeof override.id === 'string' ? override.id : undefined)
+              const pick = (value: unknown, fallback: string | undefined): string =>
+                typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback ?? ''
+              const baseURL = pick(override.baseURL, saved?.baseURL ?? store.llm.baseURL).replace(/\/+$/, '')
+              if (!/^https?:\/\//i.test(baseURL)) throw new Error('API 根地址必须是 http(s) URL')
+              models = await listModelsWithConfig({ baseURL, apiKey: pick(override.apiKey, saved?.apiKey) })
+            }
             sendJson(res, 200, { ok: true, models: models.map(model => model.id).slice(0, 50) })
           } catch (error) {
             sendJson(res, 200, { ok: false, error: error instanceof Error ? error.message : String(error) })
@@ -584,8 +602,8 @@ export function registerSvRoutes(
 
     // POST /sv/api/superagent/run —— SSE：拆解 → 并发 Worker → 汇总
     if (req.method === 'POST' && path === '/sv/api/superagent/run') {
-      if (superAgent === undefined) {
-        sendJson(res, 404, { error: 'Super-agent 未启用（设置 SV_SUPERAGENT_ENABLED=1）' })
+      if (superAgent === undefined || !superAgent.enabled) {
+        sendJson(res, 404, { error: 'Super-agent 未启用（请在设置页开启）' })
         return
       }
       let goal: string
@@ -617,8 +635,8 @@ export function registerSvRoutes(
 
     // POST /sv/api/superagent/retry —— 手动重试单个失败的 Worker（SSE）
     if (req.method === 'POST' && path === '/sv/api/superagent/retry') {
-      if (superAgent === undefined) {
-        sendJson(res, 404, { error: 'Super-agent 未启用' })
+      if (superAgent === undefined || !superAgent.enabled) {
+        sendJson(res, 404, { error: 'Super-agent 未启用（请在设置页开启）' })
         return
       }
       let runId: string
@@ -653,6 +671,60 @@ export function registerSvRoutes(
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
       }
+      return
+    }
+
+    // GET /sv/api/file —— 读取工作区内的文本文件，供右侧文件列表预览
+    if (req.method === 'GET' && path === '/sv/api/file') {
+      const raw = new URL(req.url ?? '/', 'http://sv.local').searchParams.get('path') ?? ''
+      if (raw.trim().length === 0) {
+        sendJson(res, 400, { error: 'path 不能为空' })
+        return
+      }
+      const root = process.cwd()
+      const target = isAbsolute(raw) ? resolve(raw) : resolve(root, raw)
+      const rel = relative(root, target)
+      if (rel.startsWith('..') || isAbsolute(rel)) {
+        sendJson(res, 403, { error: '只能预览工作区内的文件' })
+        return
+      }
+      let info
+      try {
+        info = await stat(target)
+      } catch {
+        sendJson(res, 404, { error: '文件不存在' })
+        return
+      }
+      if (!info.isFile()) {
+        sendJson(res, 400, { error: '不是文件' })
+        return
+      }
+      const length = Math.min(info.size, FILE_PREVIEW_BYTES)
+      const buffer = Buffer.alloc(length)
+      const handle = await open(target, 'r')
+      try {
+        await handle.read(buffer, 0, length, 0)
+      } finally {
+        await handle.close()
+      }
+      const truncated = info.size > FILE_PREVIEW_BYTES
+      const binary = buffer.includes(0)
+      if (binary) {
+        sendJson(res, 200, {
+          path: target, name: basename(target), size: info.size, mtime: info.mtimeMs, binary: true,
+        })
+        return
+      }
+      let text = buffer.toString('utf8')
+      if (truncated && text.endsWith('\uFFFD')) text = text.slice(0, -1)
+      sendJson(res, 200, {
+        path: target,
+        name: basename(target),
+        size: info.size,
+        mtime: info.mtimeMs,
+        text,
+        truncated,
+      })
       return
     }
 
