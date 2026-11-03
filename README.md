@@ -180,13 +180,13 @@ pnpm dev
 ./scripts/start.sh logs     # 跟踪控制台日志
 ```
 
-> `pnpm dev` 与 `./scripts/start.sh start` 是两种启动方式，共用端口 7000 与同一份 `.dsh/`，同一时间只能运行一个。
+> `pnpm dev` 与 `./scripts/start.sh start` 是两种启动方式，共用端口 7001 与同一份 `.dsh/`，同一时间只能运行一个。
 
 启动后：
 
 | 地址 | 内容 |
 |---|---|
-| `http://127.0.0.1:7000/` | **Singularity Voyage 聊天页**（自建前端，重定向到 `/sv/`） |
+| `http://127.0.0.1:7001/` | **Singularity Voyage 聊天页**（自建前端，重定向到 `/sv/`） |
 
 dsh 官方 Web UI 已禁用（patch 中 `web-runtime: disabled`）：本产品前端完全自建，仅通过 `/sv/api/*` 桥接 API 与 harness 交互。
 

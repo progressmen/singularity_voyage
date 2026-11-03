@@ -23,7 +23,7 @@ PID_FILE="$PID_DIR/sv.pid"
 LOG_FILE="$LOG_DIR/stdout.log"
 DSH_SRC="${DSH_SRC:-$REPO_ROOT/../deepseek-harness-dsh-v0.2.1-rc.2}"
 DSH_BIN="$DSH_SRC/apps/cli/lib/bin.js"
-PORT="${PORT:-7000}"
+PORT="${PORT:-7001}"
 HEALTH_URL="http://127.0.0.1:${PORT}/sv/api/state"
 HEALTH_TIMEOUT=30
 
@@ -313,7 +313,7 @@ case "${1:-start}" in
 
 环境变量:
   DSH_SRC  dsh harness 源码目录（默认: ../deepseek-harness-dsh-v0.2.1-rc.2）
-  PORT     服务端口（默认 7000；dev 的端口由 package.json 的 dev 脚本决定）
+  PORT     服务端口（默认 7001；dev 的端口由 package.json 的 dev 脚本决定）
 EOF
     exit 1
     ;;

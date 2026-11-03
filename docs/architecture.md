@@ -796,7 +796,7 @@ pnpm dev（dsh --profile sv --no-open），DSH_HOME 默认 <repo>/.dsh
   │           ├─ sessions.json  会话索引 + transcripts/
   │           ├─ memory.json    长期记忆
   │           └─ tasks.json     待办与提醒
-  └─ 浏览器：127.0.0.1:7000/sv/
+  └─ 浏览器：127.0.0.1:7001/sv/
 ```
 
 > dsh 默认使用 `~/.dsh`；本项目的 `pnpm dev`、`scripts/start.sh`、`scripts/setup-profile.mjs` 都把 `DSH_HOME` 默认指向仓库内 `.dsh/`，实现与机器上其它 dsh 实例隔离且可整体迁移。`.dsh/` 已被 gitignore，其中 `sv/config.json` 含密钥。
