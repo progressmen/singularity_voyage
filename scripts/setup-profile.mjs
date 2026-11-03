@@ -145,6 +145,8 @@ const COMPUTER_USE_PATCHES = [
   {
     label: '不可见窗口自动前置',
     file: 'lib/observe.js',
+    // 不能只用 before 判断：后续补丁会改里面的 frontNote 文案，after 不再整体匹配。
+    marker: 'const verified = (r) => !(r instanceof Error) && Boolean(r) && r.activated === true',
     before: ['  // 3. AX 树（vision / native 模式同时抓截图）'],
     after: [
       '  // 目标窗口不在当前桌面或已最小化时先前置，否则截不到画面（模型会以为窗口没出现）',
@@ -281,6 +283,65 @@ const COMPUTER_USE_PATCHES = [
     file: 'index.js',
     before: ["    description: '启动一个应用（后台启动，不抢焦点；可选 bring_to_front 前置到前台）。用于\"打开应用\"这一步。',"],
     after: ["    description: '启动或前置应用（默认后台启动、不抢焦点；需要立刻看到窗口时传 bring_to_front: true）。打开应用的唯一正确方式——不要用终端 open / osascript / cliclick。',"],
+  },
+  {
+    // 同名多窗口时只传 pid 会让驱动报 ambiguous；按桌面/可见性/面积选主窗口并带 window_id。
+    label: 'app_launch 前置时选主窗口',
+    file: 'lib/actions.js',
+    before: [
+      '  if (args.bring_to_front && pid) {',
+      "    await cuaCall('bring_to_front', { pid })",
+      "    frontNote = ' 已前置'",
+      '  }',
+    ],
+    after: [
+      '  if (args.bring_to_front && pid) {',
+      '    try {',
+      "      const listed = await cuaCall('list_windows', { on_screen_only: false })",
+      '      const windows = Array.isArray(listed) ? listed : (listed?.windows || [])',
+      '      const areaOf = (w) => (w.bounds?.width ?? 0) * (w.bounds?.height ?? 0)',
+      '      const mine = windows',
+      '        .filter((w) => Number(w.pid) === Number(pid))',
+      '        .sort((a, b) => (Number(b.on_current_space !== false) - Number(a.on_current_space !== false))',
+      '          || (Number(b.is_on_screen !== false) - Number(a.is_on_screen !== false))',
+      '          || (areaOf(b) - areaOf(a)))',
+      '      if (mine.length > 0) {',
+      "        await cuaCall('bring_to_front', { pid, window_id: mine[0].window_id })",
+      '        frontNote = ` 已前置 window_id=${mine[0].window_id}`',
+      '      } else {',
+      "        await cuaCall('bring_to_front', { pid })",
+      "        frontNote = ' 已尝试前置（未找到窗口列表）'",
+      '      }',
+      '    } catch (err) {',
+      '      frontNote = ` 前置失败：${err instanceof Error ? err.message : String(err)}`',
+      '    }',
+      '  }',
+    ],
+  },
+  {
+    // is_on_screen=false 可能是最小化/隐藏，也可能在另一个 Space；给模型的建议必须不同。
+    label: '窗口不可见提示区分最小化与另一个桌面',
+    file: 'lib/observe.js',
+    before: [
+      '      frontNote = "\\n注意：目标窗口不在当前桌面，自动前置失败；鼠标/键盘无法送达该窗口。请让用户把该应用切到当前桌面，或指定其它可见窗口；不要反复重试同一坐标点击。"',
+    ],
+    after: [
+      '      const onCurrent = target.on_current_space !== false',
+      '      frontNote = onCurrent',
+      '        ? "\\n注意：窗口在当前桌面但不可见（可能被最小化/隐藏/完全遮挡）；自动前置失败。请让用户取消最小化或在 Dock 点一下该应用，再重新观察；不要反复重试同一坐标点击。"',
+      '        : "\\n注意：目标窗口在另一个桌面/Space；自动前置失败。请让用户切到该窗口所在桌面，或在当前桌面新开一个窗口；不要反复重试同一坐标点击。"',
+    ],
+  },
+  {
+    label: '候选窗口状态区分最小化与另一个桌面',
+    file: 'lib/observe.js',
+    before: [
+      "          const fmt = (w) => `window_id=${w.window_id}「${safeStr(w.title || '(无标题)', 40)}」${w.is_on_screen === false || w.on_current_space === false ? '（不在当前桌面）' : '（当前桌面）'}`",
+    ],
+    after: [
+      "          const winState = (w) => w.on_current_space === false ? '（另一个桌面/Space）' : w.is_on_screen === false ? '（最小化/隐藏/遮挡）' : '（当前桌面）'",
+      "          const fmt = (w) => `window_id=${w.window_id}「${safeStr(w.title || '(无标题)', 40)}」${winState(w)}`",
+    ],
   },
   // ── 多显示器 / 虚拟光标常显 / 局部截图核对 ─────────────────────────────
   {

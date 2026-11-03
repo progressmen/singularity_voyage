@@ -44,10 +44,10 @@ let streaming = false
 /* ── 视图切换（对话 / 待办 / 定时任务 / 记忆 / 日志） ───── */
 const VIEW_KEY = 'sv.view.v1'
 let currentView = localStorage.getItem(VIEW_KEY) ?? 'chat'
-if (!['chat', 'tasks', 'schedules', 'memory', 'logs'].includes(currentView)) currentView = 'chat'
+if (!['chat', 'superagent', 'tasks', 'schedules', 'memory', 'logs'].includes(currentView)) currentView = 'chat'
 
 /** 非对话视图的顶栏标题。 */
-const VIEW_TITLES = { tasks: '待办与提醒', schedules: '定时任务', memory: '长期记忆', logs: '运行日志' }
+const VIEW_TITLES = { superagent: 'Super Agent', tasks: '待办与提醒', schedules: '定时任务', memory: '长期记忆', logs: '运行日志' }
 
 /** 待办、定时任务与记忆数据缓存。 */
 let tasksCache = []
@@ -57,6 +57,9 @@ let memoryKindFilter = ''
 let overdueCount = 0
 
 function applyView(view) {
+  // Super-agent 未启用时导航项是隐藏的，避免停在不可用视图。
+  if (view === 'superagent' && $('tab-superagent').hidden) view = 'chat'
+  hideSlashMenu()
   currentView = view
   localStorage.setItem(VIEW_KEY, view)
   document.querySelectorAll('.nav-item').forEach(item => {
@@ -64,12 +67,14 @@ function applyView(view) {
   })
   $('messages').hidden = view !== 'chat'
   $('composer').hidden = view !== 'chat'
+  $('panel-superagent').hidden = view !== 'superagent'
   $('panel-tasks').hidden = view !== 'tasks'
   $('panel-schedules').hidden = view !== 'schedules'
   $('panel-memory').hidden = view !== 'memory'
   $('panel-logs').hidden = view !== 'logs'
   $('topbar-title').textContent = VIEW_TITLES[view] ?? (activeConversation()?.title ?? '新对话')
   renderUsage(activeConversation()?.usage)
+  if (view === 'superagent') void loadSuperAgent()
   if (view === 'tasks') void loadTasks()
   if (view === 'schedules') void loadSchedules()
   if (view === 'memory') void loadMemories()
@@ -803,6 +808,423 @@ function refreshActiveMessage() {
   if (stick) container.scrollTop = container.scrollHeight
 }
 
+/* ── Super Agent ─────────────────────────────────────── */
+
+const SA_RUN_LABELS = {
+  running: '运行中',
+  succeeded: '完成',
+  partial: '部分完成',
+  failed: '失败',
+  cancelled: '已取消',
+}
+const SA_WORKER_LABELS = {
+  pending: '等待',
+  running: '执行中',
+  succeeded: '完成',
+  failed: '失败',
+  timeout: '超时',
+  cancelled: '已取消',
+}
+
+/** 当前展示的运行（服务端事件回流后的本地副本）。 */
+let saRun = null
+/** 历史运行列表（服务端持久化后返回）。 */
+let saRuns = []
+let saStreaming = false
+let saRetrying = false
+let saRenderScheduled = false
+let saController = null
+
+/** 合并同一帧内的多次增量渲染。 */
+function scheduleSaRender() {
+  if (saRenderScheduled) return
+  saRenderScheduled = true
+  requestAnimationFrame(() => {
+    saRenderScheduled = false
+    renderSuperAgent()
+  })
+}
+
+function saWorker(index) {
+  return saRun?.workers?.find(worker => worker.index === index) ?? null
+}
+
+/** 渲染历史下拉框；当前运行变化时同步选中项。 */
+function renderSaHistory() {
+  const row = $('sa-history-row')
+  const select = $('sa-history')
+  select.innerHTML = ''
+  row.hidden = saRuns.length === 0
+  if (saRuns.length === 0) return
+  for (const run of saRuns) {
+    const option = document.createElement('option')
+    option.value = run.id
+    const date = run.startedAt ? fmtDue(run.startedAt) : ''
+    option.textContent = `${run.goal.slice(0, 36)} · ${SA_RUN_LABELS[run.status] ?? run.status}${date ? ` · ${date}` : ''}`
+    option.title = run.goal
+    select.appendChild(option)
+  }
+  select.value = saRun?.id ?? saRuns[0]?.id ?? ''
+}
+
+/** 把当前运行写回历史列表（同一运行更新，新运行插到最前）。 */
+function syncSaHistory() {
+  if (!saRun?.id) return
+  const index = saRuns.findIndex(run => run.id === saRun.id)
+  if (index >= 0) saRuns[index] = saRun
+  else saRuns.unshift(saRun)
+  saRuns.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
+  if (saRuns.length > 20) saRuns.splice(20)
+  renderSaHistory()
+}
+
+/** 读取 Super-agent 的 SSE 流并逐条应用事件。 */
+async function consumeSaStream(res) {
+  if (!res.body) throw new Error('响应没有 body')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let carry = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    carry += decoder.decode(value, { stream: true })
+    let boundary
+    while ((boundary = carry.indexOf('\n\n')) >= 0) {
+      const frame = carry.slice(0, boundary)
+      carry = carry.slice(boundary + 2)
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue
+        try {
+          applySaEvent(JSON.parse(line.slice(5).trim()))
+        } catch {
+          // 跳过无法解析的行
+        }
+      }
+    }
+  }
+}
+
+/** 处理一条 SSE 事件。 */
+function applySaEvent(event) {
+  if (event.type === 'run-start') {
+    saRun = { id: event.runId, goal: event.goal, status: 'running', startedAt: event.at, workers: [] }
+    syncSaHistory()
+  } else if (event.type === 'retry-start') {
+    if (saRun) {
+      const worker = saWorker(event.index)
+      if (worker) {
+        worker.status = 'running'
+        worker.output = ''
+        worker.error = undefined
+        worker.durationMs = undefined
+      }
+      saRun.status = 'running'
+      saRun.error = undefined
+    }
+  } else if (event.type === 'plan') {
+    if (saRun) {
+      saRun.workers = event.subtasks.map(item => ({
+        index: item.index,
+        title: item.title,
+        status: 'pending',
+        attempts: 0,
+      }))
+    }
+  } else if (event.type === 'worker-start') {
+    const worker = saWorker(event.index)
+    if (worker) {
+      worker.status = 'running'
+      worker.attempts = event.attempt
+    }
+  } else if (event.type === 'worker-session') {
+    const worker = saWorker(event.index)
+    if (worker) worker.sessionId = event.sessionId
+  } else if (event.type === 'worker-delta') {
+    const worker = saWorker(event.index)
+    if (worker) worker.output = `${worker.output ?? ''}${event.text}`
+  } else if (event.type === 'worker-retry') {
+    const worker = saWorker(event.index)
+    if (worker) {
+      worker.status = 'pending'
+      worker.error = event.error
+    }
+  } else if (event.type === 'worker-end') {
+    const worker = saWorker(event.index)
+    if (worker) {
+      worker.status = event.status
+      worker.attempts = event.attempts
+      worker.durationMs = event.durationMs
+      if (event.output !== undefined) worker.output = event.output
+      if (event.error !== undefined) worker.error = event.error
+      if (event.sessionId !== undefined) worker.sessionId = event.sessionId
+    }
+  } else if (event.type === 'summary') {
+    if (saRun) saRun.summary = event.text
+  } else if (event.type === 'run-end') {
+    if (saRun) {
+      saRun.status = event.status
+      saRun.durationMs = event.durationMs
+      saRun.workers = event.workers
+      syncSaHistory()
+    }
+  } else if (event.type === 'error') {
+    if (saRun) saRun.error = saRun.error ? `${saRun.error}\n${event.message}` : event.message
+  } else if (event.type === 'done') {
+    saStreaming = false
+    saRetrying = false
+    $('sa-stop').hidden = true
+    $('sa-submit').disabled = false
+  }
+  scheduleSaRender()
+}
+
+async function submitSuperAgent(event) {
+  event.preventDefault()
+  if (saStreaming) return
+  const goal = $('sa-goal').value.trim()
+  if (goal.length === 0) return
+  const subtasks = $('sa-subtasks').value
+    .split('\n')
+    .map(text => text.trim())
+    .filter(text => text.length > 0)
+
+  saStreaming = true
+  saRetrying = false
+  saController = new AbortController()
+  saRun = { id: '', goal, status: 'running', startedAt: Date.now(), workers: [] }
+  $('sa-submit').disabled = true
+  $('sa-stop').hidden = false
+  scheduleSaRender()
+
+  try {
+    const res = await fetch('/sv/api/superagent/run', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(subtasks.length === 0 ? { goal } : { goal, subtasks }),
+      signal: saController.signal,
+    })
+    if (!res.ok || !res.body) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.error ?? `HTTP ${res.status}`)
+    }
+    await consumeSaStream(res)
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      if (saRun) saRun.error = error?.message ?? String(error)
+      if (saRun && saRun.status === 'running') saRun.status = 'failed'
+      scheduleSaRender()
+    }
+  } finally {
+    saStreaming = false
+    saController = null
+    $('sa-submit').disabled = false
+    $('sa-stop').hidden = true
+    if (saRun && saRun.status === 'running') {
+      saRun.status = 'failed'
+    }
+    scheduleSaRender()
+  }
+}
+
+async function stopSuperAgent() {
+  if (!saStreaming) return
+  $('sa-stop').disabled = true
+  try {
+    const result = saRun?.id
+      ? await api('/sv/api/superagent/stop', { method: 'POST', body: { runId: saRun.id } })
+      : { stopped: false }
+    // 服务端中止后会补发 run-end/done；只有它没接住时才直接断开客户端。
+    if (!result.stopped) saController?.abort()
+  } catch (error) {
+    if (saRun) saRun.error = error?.message ?? String(error)
+    scheduleSaRender()
+  } finally {
+    $('sa-stop').disabled = false
+  }
+}
+
+/** 手动重试单个失败 / 超时 / 取消的 Worker。 */
+async function retrySuperAgentWorker(worker) {
+  if (saStreaming || !saRun?.id) return
+  if (!['failed', 'timeout', 'cancelled'].includes(worker.status)) return
+  saStreaming = true
+  saRetrying = true
+  saController = new AbortController()
+  $('sa-submit').disabled = true
+  $('sa-stop').hidden = false
+  scheduleSaRender()
+
+  try {
+    const res = await fetch('/sv/api/superagent/retry', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runId: saRun.id, index: worker.index }),
+      signal: saController.signal,
+    })
+    if (!res.ok || !res.body) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.error ?? `HTTP ${res.status}`)
+    }
+    await consumeSaStream(res)
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      if (saRun) {
+        saRun.error = error?.message ?? String(error)
+        scheduleSaRender()
+      }
+    }
+  } finally {
+    saStreaming = false
+    saRetrying = false
+    saController = null
+    $('sa-submit').disabled = false
+    $('sa-stop').hidden = true
+    if (saRun && saRun.status === 'running') {
+      saRun.status = 'partial'
+    }
+    scheduleSaRender()
+  }
+}
+
+/** 进入视图时拉取最近一次运行（刷新页面后仍能看到结果）。 */
+async function loadSuperAgent() {
+  if (saStreaming) return
+  try {
+    const state = await api('/sv/api/superagent/state')
+    if (state.enabled !== true) return
+    saRuns = Array.isArray(state.runs) ? state.runs : []
+    if (!saRun || !saRuns.some(run => run.id === saRun.id)) {
+      saRun = saRuns[0] ?? null
+    }
+    renderSaHistory()
+    scheduleSaRender()
+  } catch {
+    // 状态接口失败时保留本地视图
+  }
+}
+
+function renderSuperAgent() {
+  const host = $('sa-runs')
+  const status = $('sa-status')
+  host.innerHTML = ''
+  if (saRun === null) {
+    status.textContent = '就绪'
+    status.className = 'sa-status'
+    $('sa-stop').hidden = true
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = '还没有运行。输入目标后点击「开始」，Router 会拆解并分派 Worker。'
+    host.appendChild(empty)
+    return
+  }
+
+  status.textContent = SA_RUN_LABELS[saRun.status] ?? saRun.status
+  status.className = `sa-status ${saRun.status ?? ''}`
+
+  const card = document.createElement('div')
+  card.className = 'sa-run'
+
+  const goal = document.createElement('div')
+  goal.className = 'sa-goal'
+  goal.textContent = saRun.goal
+  card.appendChild(goal)
+
+  const metaBits = []
+  if (saRun.id) metaBits.push(`run ${saRun.id.slice(0, 8)}`)
+  if (saRun.startedAt) metaBits.push(fmtDue(saRun.startedAt))
+  if (saRun.durationMs !== undefined) metaBits.push(`耗时 ${(saRun.durationMs / 1000).toFixed(1)}s`)
+  metaBits.push(`${saRun.workers?.length ?? 0} 个 Worker`)
+  const meta = document.createElement('div')
+  meta.className = 'sa-meta'
+  meta.textContent = metaBits.join(' · ')
+  card.appendChild(meta)
+
+  if (saRun.error) {
+    const error = document.createElement('div')
+    error.className = 'sa-error'
+    error.textContent = saRun.error
+    card.appendChild(error)
+  }
+
+  const list = document.createElement('div')
+  list.className = 'sa-workers'
+  for (const worker of saRun.workers ?? []) {
+    list.appendChild(saWorkerNode(worker))
+  }
+  card.appendChild(list)
+
+  if (saRun.summary) {
+    const box = document.createElement('div')
+    box.className = 'sa-summary'
+    const title = document.createElement('div')
+    title.className = 'sa-summary-title'
+    title.textContent = 'Router 汇总'
+    const text = document.createElement('div')
+    text.className = 'sa-summary-text'
+    const renderMarkdown = globalThis.SvMarkdown?.render
+    if (typeof renderMarkdown === 'function') text.innerHTML = renderMarkdown(saRun.summary)
+    else text.textContent = saRun.summary
+    box.append(title, text)
+    card.appendChild(box)
+  }
+
+  host.appendChild(card)
+}
+
+function saWorkerNode(worker) {
+  const el = document.createElement('div')
+  el.className = `sa-worker ${worker.status ?? 'pending'}`
+
+  const head = document.createElement('div')
+  head.className = 'sa-worker-head'
+  const title = document.createElement('div')
+  title.className = 'sa-worker-title'
+  title.textContent = `${worker.index + 1}. ${worker.title}`
+  const chip = document.createElement('span')
+  chip.className = `sa-chip ${worker.status ?? 'pending'}`
+  chip.textContent = SA_WORKER_LABELS[worker.status] ?? worker.status
+  const actions = document.createElement('div')
+  actions.className = 'sa-worker-actions'
+  actions.appendChild(chip)
+  const canRetry = saRun?.status !== 'running'
+    && ['failed', 'timeout', 'cancelled'].includes(worker.status)
+  if (canRetry) {
+    const retry = document.createElement('button')
+    retry.type = 'button'
+    retry.className = 'btn btn-ghost sa-retry'
+    retry.textContent = '重试'
+    retry.disabled = saStreaming
+    retry.addEventListener('click', () => void retrySuperAgentWorker(worker))
+    actions.appendChild(retry)
+  }
+  head.append(title, actions)
+  el.appendChild(head)
+
+  const bits = []
+  if (worker.attempts > 0) bits.push(`尝试 ${worker.attempts} 次`)
+  if (worker.durationMs !== undefined) bits.push(`${(worker.durationMs / 1000).toFixed(1)}s`)
+  if (worker.sessionId) bits.push(`会话 ${worker.sessionId.slice(0, 8)}`)
+  if (worker.error) bits.push(worker.error)
+  if (bits.length > 0) {
+    const meta = document.createElement('div')
+    meta.className = 'sa-worker-meta'
+    meta.textContent = bits.join(' · ')
+    el.appendChild(meta)
+  }
+
+  if (worker.output) {
+    const details = document.createElement('details')
+    details.className = 'sa-worker-output'
+    const summary = document.createElement('summary')
+    summary.textContent = worker.status === 'running' ? '实时输出' : '查看输出'
+    const pre = document.createElement('pre')
+    pre.textContent = worker.output
+    details.append(summary, pre)
+    el.appendChild(details)
+  }
+  return el
+}
+
 /* ── 状态与设置 ───────────────────────────────────────── */
 
 async function api(path, options = {}) {
@@ -826,6 +1248,13 @@ async function loadState() {
     searchChip.textContent = state.search?.hasApiKey ? `搜索 ${state.search?.provider ?? ''} ✓` : '搜索 ✕'
     searchChip.className = 'chip ' + (state.search?.hasApiKey ? 'on' : 'off')
     renderMailQuick(state.mail)
+    // Super-agent 由服务端开关控制：关闭时隐藏导航项，保持原页面结构。
+    const saEnabled = state.superAgent?.enabled === true
+    $('tab-superagent').hidden = !saEnabled
+    const storedView = localStorage.getItem(VIEW_KEY)
+    // 首屏 applyView 早于本接口返回；若上次停留在 Super Agent，这里补一次恢复。
+    if (saEnabled && storedView === 'superagent' && currentView !== 'superagent') applyView('superagent')
+    else if (!saEnabled && currentView === 'superagent') applyView('chat')
     return state
   } catch (error) {
     $('chip-model').textContent = '离线'
@@ -1051,6 +1480,7 @@ function setStreaming(value) {
 }
 
 async function sendMessage() {
+  hideSlashMenu()
   const input = $('input')
   const text = input.value.trim()
   if (!text || streaming) return
@@ -1193,6 +1623,146 @@ async function stopStreaming() {
   } catch {
     // 忽略：会话可能尚未建立
   }
+}
+
+/* ── / 斜杠技能与工具 ─────────────────────────────────── */
+
+let slashData = null
+let slashMenuOpen = false
+let slashItems = []
+let slashIndex = 0
+let slashQuery = ''
+
+/** 懒加载技能与工具列表；各自失败时退化为空数组。 */
+async function loadSlashData() {
+  if (slashData !== null) return slashData
+  const [skillState, toolState] = await Promise.all([
+    api('/sv/api/skills').catch(() => ({ skills: [] })),
+    api('/sv/api/tools').catch(() => ({ tools: [] })),
+  ])
+  slashData = {
+    skills: Array.isArray(skillState.skills) ? skillState.skills : [],
+    tools: Array.isArray(toolState.tools) ? toolState.tools : [],
+  }
+  return slashData
+}
+
+/** 按当前输入过滤技能与工具。 */
+function slashCandidates(query) {
+  const q = query.toLowerCase()
+  const skills = (slashData?.skills ?? [])
+    .filter(skill => q.length === 0
+      || skill.name.toLowerCase().includes(q)
+      || String(skill.description ?? '').toLowerCase().includes(q)
+      || String(skill.path ?? '').toLowerCase().includes(q))
+    .map(skill => ({
+      kind: 'skill',
+      label: `/${skill.name}`,
+      description: skill.description || '用户可调用技能',
+      path: skill.path || '',
+      name: skill.name,
+    }))
+  const tools = (slashData?.tools ?? [])
+    .filter(tool => q.length === 0
+      || tool.name.toLowerCase().includes(q)
+      || String(tool.description ?? '').toLowerCase().includes(q))
+    .map(tool => ({
+      kind: 'tool',
+      label: tool.name,
+      description: tool.description || '工具',
+      path: '',
+      name: tool.name,
+    }))
+  return [...skills, ...tools].slice(0, 120)
+}
+
+function hideSlashMenu() {
+  slashMenuOpen = false
+  slashItems = []
+  $('slash-menu').hidden = true
+}
+
+function renderSlashMenu() {
+  const menu = $('slash-menu')
+  slashItems = slashCandidates(slashQuery)
+  if (slashItems.length === 0) {
+    hideSlashMenu()
+    return
+  }
+  menu.innerHTML = ''
+  slashIndex = Math.min(Math.max(slashIndex, 0), slashItems.length - 1)
+  slashItems.forEach((item, index) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = `slash-item${index === slashIndex ? ' active' : ''}`
+    button.dataset.index = String(index)
+    const kind = document.createElement('span')
+    kind.className = 'slash-kind'
+    kind.textContent = item.kind === 'skill' ? '技能' : '工具'
+    const main = document.createElement('span')
+    main.className = 'slash-main'
+    const label = document.createElement('span')
+    label.className = 'slash-label'
+    label.textContent = item.label
+    const desc = document.createElement('span')
+    desc.className = 'slash-desc'
+    desc.textContent = item.description
+    main.append(label, desc)
+    if (item.path) {
+      const path = document.createElement('span')
+      path.className = 'slash-path'
+      path.textContent = item.path
+      path.title = item.path
+      main.appendChild(path)
+    }
+    button.append(kind, main)
+    menu.appendChild(button)
+  })
+  menu.hidden = false
+  slashMenuOpen = true
+  menu.querySelector('.slash-item.active')?.scrollIntoView({ block: 'nearest' })
+}
+
+/** 输入形如 `/query` 时打开菜单；出现空格后关闭。 */
+function updateSlashMenu() {
+  if (currentView !== 'chat') {
+    hideSlashMenu()
+    return
+  }
+  const match = /^\/([^\s]*)$/.exec($('input').value)
+  if (match === null) {
+    hideSlashMenu()
+    return
+  }
+  slashQuery = match[1]
+  slashIndex = 0
+  renderSlashMenu()
+  if (slashData === null) {
+    void loadSlashData().then(() => {
+      if (slashMenuOpen) renderSlashMenu()
+    })
+  }
+}
+
+function moveSlashSelection(delta) {
+  if (!slashMenuOpen || slashItems.length === 0) return
+  slashIndex = (slashIndex + delta + slashItems.length) % slashItems.length
+  const buttons = $('slash-menu').querySelectorAll('.slash-item')
+  buttons.forEach((button, index) => {
+    button.classList.toggle('active', index === slashIndex)
+  })
+  buttons[slashIndex]?.scrollIntoView({ block: 'nearest' })
+}
+
+function selectSlashItem(item) {
+  const input = $('input')
+  input.value = item.kind === 'skill'
+    ? `${item.label} `
+    : `请使用工具 ${item.name} 完成：`
+  hideSlashMenu()
+  input.focus()
+  input.setSelectionRange(input.value.length, input.value.length)
+  autosize()
 }
 
 /* ── 待办与提醒 ───────────────────────────────────────── */
@@ -1842,7 +2412,39 @@ $('new-chat').addEventListener('click', () => {
 $('send').addEventListener('click', sendMessage)
 $('stop').addEventListener('click', stopStreaming)
 $('input').addEventListener('input', autosize)
+$('input').addEventListener('input', updateSlashMenu)
+$('input').addEventListener('blur', () => setTimeout(hideSlashMenu, 120))
+$('slash-menu').addEventListener('mousedown', (event) => {
+  const button = event.target.closest('.slash-item')
+  if (!button) return
+  event.preventDefault()
+  const item = slashItems[Number(button.dataset.index)]
+  if (item) selectSlashItem(item)
+})
 $('input').addEventListener('keydown', (e) => {
+  if (slashMenuOpen) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      moveSlashSelection(1)
+      return
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      moveSlashSelection(-1)
+      return
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      hideSlashMenu()
+      return
+    }
+    if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey && !e.isComposing) {
+      e.preventDefault()
+      const item = slashItems[slashIndex]
+      if (item) selectSlashItem(item)
+      return
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     sendMessage()
@@ -1868,6 +2470,15 @@ function closeSidebarDrawer() {
 document.querySelectorAll('.nav-item').forEach(item => {
   if (item.id === 'new-chat') return
   item.addEventListener('click', () => applyView(item.dataset.view ?? 'chat'))
+})
+$('sa-form').addEventListener('submit', submitSuperAgent)
+$('sa-stop').addEventListener('click', () => void stopSuperAgent())
+$('sa-history').addEventListener('change', event => {
+  const run = saRuns.find(candidate => candidate.id === event.target.value)
+  if (run) {
+    saRun = run
+    scheduleSaRender()
+  }
 })
 $('task-form').addEventListener('submit', submitTask)
 $('tasks-show-done').addEventListener('change', () => void loadTasks())

@@ -34,6 +34,12 @@
           </span>
           <span class="nav-label">新建会话</span>
         </button>
+        <button class="nav-item" id="tab-superagent" data-view="superagent" hidden>
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 3l2.2 5.3L20 10.5l-5.8 2.2L12 18l-2.2-5.3L4 10.5l5.8-2.2z"/><path d="M18.5 16.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
+          </span>
+          <span class="nav-label">Super Agent</span>
+        </button>
         <button class="nav-item" id="tab-tasks" data-view="tasks">
           <span class="nav-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24"><path d="M9 11l3 3L21.5 4.5"/><path d="M21 12.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
@@ -175,6 +181,32 @@
         </div>
       </section>
 
+      <section class="panel" id="panel-superagent" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>Super Agent</h2>
+            <span class="sa-status" id="sa-status">就绪</span>
+            <button class="btn btn-ghost sa-stop" type="button" id="sa-stop" hidden>停止</button>
+          </div>
+          <p class="schedule-hint">
+            Router 负责拆解目标与汇总结果，Worker 在相互隔离的会话中并行执行。
+            子任务留空时由 Router 自动拆解；每行一个可手动指定（最多 8 个）。
+          </p>
+          <form class="panel-form sa-form" id="sa-form">
+            <textarea id="sa-goal" rows="2" maxlength="10000" placeholder="目标：例如「调研三个竞品并给出对比结论」" required></textarea>
+            <textarea id="sa-subtasks" rows="2" maxlength="4000" placeholder="可选：每行一个子任务（留空由 Router 拆解）"></textarea>
+            <div class="sa-form-actions">
+              <button class="btn btn-primary" type="submit" id="sa-submit">开始</button>
+            </div>
+          </form>
+          <div class="sa-history-row" id="sa-history-row" hidden>
+            <span>历史记录</span>
+            <select id="sa-history" aria-label="Super Agent 历史运行"></select>
+          </div>
+          <div class="panel-list" id="sa-runs"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-logs" hidden>
         <div class="panel-inner panel-inner-wide">
           <div class="panel-head">
@@ -213,9 +245,10 @@
 
       <footer class="composer" id="composer">
         <div class="composer-box">
-          <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+          <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行；输入 / 选择技能或工具"></textarea>
           <button class="btn btn-primary send" id="send" title="发送">➤</button>
           <button class="btn btn-danger stop" id="stop" title="停止" hidden>■</button>
+          <div class="slash-menu" id="slash-menu" hidden></div>
         </div>
         <div class="composer-hint">回答由 AI 生成，请注意甄别；联网搜索结果由 web_search 工具提供。</div>
       </footer>
@@ -414,6 +447,7 @@
   </dialog>
 
   <script src="/sv/trace.js"></script>
+  <script src="/sv/markdown.js"></script>
   <script src="/sv/app.js"></script>
 </body>
 </html>

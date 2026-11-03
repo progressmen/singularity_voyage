@@ -159,7 +159,7 @@ Python 仅用于 **MCP 查数服务模板**（与参考项目同款定位）；�
 ## 验证
 
 1. `pnpm build && pnpm typecheck` 通过；`pnpm test` 全绿。
-2. `pip3 install -r mcp/requirements.txt` 后 `pnpm setup && pnpm dev`：dsh 启动不报 MCP 错（failOnStartupError 生效验证：临时把 server.py 路径改错，应启动失败——验证后改回）。
+2. `pip3 install -r mcp/requirements.txt` 后 `pnpm run setup && pnpm dev`：dsh 启动不报 MCP 错（failOnStartupError 生效验证：临时把 server.py 路径改错，应启动失败——验证后改回）。
 3. 浏览器 `http://127.0.0.1:3080/sv/`：
    - 设置面板切换 provider 预设、配置搜索 key、测试连通
    - 发「现在几点」→ 模型调用 `mcp__sv-demo__now`；trace 面板出现 🔎 分布行、可展开看到 args/result JSON、耗时

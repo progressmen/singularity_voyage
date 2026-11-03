@@ -2,7 +2,7 @@
 
 以 [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/)（`dsh`）为编排内核的**个人 Agent**：记住你的偏好与进行中的事，按时提醒，把笔记、写作与信息巡检收在同一个入口。
 
-> **当前状态：M0 对话底座 + M1 个人助理（记忆 / 待办提醒）已跑通。** 自定义模型路由、Web 搜索、聊天页面与 SSE 流式对话、长期记忆与待办提醒均已实现并验证；下一步是 M2 个人知识。路线图见[架构设计 · 里程碑](docs/architecture.md#12-里程碑)。
+> **当前状态：M0 对话底座 + M1 个人助理（记忆 / 待办提醒）已跑通。** 自定义模型路由、Web 搜索、聊天页面与 SSE 流式对话、长期记忆与待办提醒均已实现并验证；另提供默认关闭的 **Super-agent（Router / Worker）** 并行任务能力。下一步是 M2 个人知识。路线图见[架构设计 · 里程碑](docs/architecture.md#12-里程碑)。
 
 [整体架构](docs/architecture.md) · [上游文档](https://deepseek-harness.github.io/deepseek-harness/) · [MCP 规范](https://modelcontextprotocol.io/)
 
@@ -124,7 +124,9 @@ singularity_voyage/
 │       │   ├── mail-notifier.ts #   邮件通道：到期提醒 + 每日待办摘要（调用 sv-mail 的 mailer.py）
 │       │   ├── tools.ts         #   memory_search/_write、task_create/_list/_complete 工具
 │       │   ├── log.ts           #   统一日志格式（[sv-app][module] event k=v ... err=）
-│       │   └── sessions-store.ts#   会话索引 + transcript 投影（$DSH_HOME/sv/sessions.json、transcripts/）
+│       │   ├── sessions-store.ts#   会话索引 + transcript 投影（$DSH_HOME/sv/sessions.json、transcripts/）
+│       │   ├── superagent.ts    #   Super-agent 纯编排：拆解/分派/重试/超时/watchdog/汇总
+│       │   └── superagent-runtime.ts # Router 模型调用 + Worker 隔离会话（ctx.agents）
 │       ├── web/                 #   前端（无依赖单页：index.html / app.js / app.css / trace.js）
 │       └── test/                #   单元测试（node:test，覆盖 store/config/retry/chat 事件）
 ├── mcp/
@@ -161,7 +163,7 @@ pnpm install
 pnpm build
 
 # 3. 初始化 dsh profile（默认写入 <repo>/.dsh/profiles/sv，可重复执行）
-pnpm setup
+pnpm run setup
 
 # 4. 启动（服务持续运行；Ctrl+C 停止）
 pnpm dev
@@ -194,17 +196,18 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 
 ```text
 <repo>/.dsh/
-├─ profiles/sv/     # pnpm setup 生成：bundle 清单 + sv-app 的 link
+├─ profiles/sv/     # pnpm run setup 生成：bundle 清单 + sv-app 的 link
 ├─ sessions/        # harness 写：会话 JSONL
 ├─ storages/        # harness 写：storage-domain（定时任务在 schedule.json）
 ├─ logs/            # harness 写：启动诊断（失败时才有文件）
 └─ sv/              # 本项目写：config.json / memory.json / tasks.json / mail-state.json
+                    #   / superagent-runs.json（Super-agent 运行历史）
                     #   （配了 SV_DATABASE_URL 时会话索引与 transcript 落 Postgres）
 ```
 
 - `pnpm dev` 与 `scripts/start.sh` 都会把 `DSH_HOME` 默认设为 `<repo>/.dsh`；显式 `export DSH_HOME=/path/to/home` 可覆盖。
 - 不要写进 `.env`：`DSH_*` 前缀被 dsh 保留，启动时会报错。
-- 从 `~/.dsh` 迁移：把 `profiles/sv`、`sessions`、`sv` 三个目录拷进 `.dsh/`，再执行一次 `pnpm setup` 即可。
+- 从 `~/.dsh` 迁移：把 `profiles/sv`、`sessions`、`sv` 三个目录拷进 `.dsh/`，再执行一次 `pnpm run setup` 即可。
 - `.dsh/sv/config.json` 含模型与搜索密钥（0600），不要提交到版本库。
 
 ### 记忆与待办
@@ -217,9 +220,19 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 - **邮件提醒**：待办页顶部有快捷开关，可一键开启/关闭（未配置 SMTP 时会引导去设置）。两种提醒：**定时提醒**在任务到期时立即发一封；**超时提醒**不单独发信，逾期未完成的任务在每日摘要里单列一段，主题也会标注逾期数量。发信与模型工具 `mcp__sv-mail__send_email` 共用 [mcp/sv-mail-mcp](mcp/sv-mail-mcp) 里的 `mailer.py`，只有一套 SMTP 实现；摘要发送日期记在 `mail-state.json`，重启不会重复发。
 - 存储都在 `$DSH_HOME/sv/`（0600），与 dsh 会话日志分离：日志存原文与来源，记忆存「当前有效结论」。
 
+### 斜杠菜单（技能 / 工具）
+
+对话输入框输入 `/` 打开菜单：
+
+- **技能**：来自 `ctx.skills` 的用户可调用技能，显示名称、描述与 `SKILL.md` 绝对路径。选中后插入 `/skill-name `，harness 会在下一轮把技能正文注入为 instructions，不需要额外改写提示词。
+- **工具**：列出当前可见工具，包含 `screen_observe` / `computer_click` 等 computer-use 工具，以及 MCP 与内置工具。选中后插入 `请使用工具 <name> 完成：`，由模型决定是否调用。
+- 菜单只展示技能与工具，不包含内置 UI 命令；支持按名称/描述/路径过滤，`↑` / `↓` 选择，`Enter` / `Tab` 确认，`Esc` 关闭。
+
 ### 电脑控制（桌面操作）
 
-在对话里可以直接让 Agent 操作本机应用界面：打开应用、查看窗口、点击、输入、滚动、拖拽。工具由第三方 bundle `dsh-computer-use` 提供（`pnpm setup` 会把它装进 profile），底层用 [cua-driver](https://github.com/trycua/cua) 驱动桌面。
+在对话里可以直接让 Agent 操作本机应用界面：打开应用、查看窗口、点击、输入、滚动、拖拽。工具由第三方 bundle `dsh-computer-use` 提供（`pnpm run setup` 会把它装进 profile），底层用 [cua-driver](https://github.com/trycua/cua) 驱动桌面。
+
+> 通用桌面操作流程（窗口 / Space、坐标校准、输入、失败止损）集中在 [.agents/skills/computer-use/SKILL.md](.agents/skills/computer-use/SKILL.md)；任务 skill（如日报）只补充业务专属步骤。系统提示词里的桌面安全红线始终生效。
 
 - **13 个工具**：`app_list` / `app_launch`，`screen_observe` / `screen_zoom` / `computer_aim`，以及 `computer_click` / `computer_double_click` / `computer_right_click` / `computer_type` / `computer_key` / `computer_scroll` / `computer_drag` / `computer_wait`。
 - **操作循环**：观察 → 对准 → 决策 → 执行 → 再观察验证。观察快照 45 秒内有效（[cordis.patch.yml](packages/sv-app/cordis.patch.yml) 的 `ttlMs`），界面变化或弹窗出现后旧元素编号失效，必须重新 `screen_observe`。
@@ -234,7 +247,19 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 
 > 未安装 cua-driver 时，桌面工具调用会返回「cua-driver not found」，不影响对话、记忆与待办。装好后重启 `pnpm dev` 即可生效。
 >
-> `pnpm setup` 会对已安装的 `dsh-computer-use@0.3.1` 打一组确定性补丁（[setup-profile.mjs](scripts/setup-profile.mjs) 的 `COMPUTER_USE_PATCHES`，大段新增代码放在 [scripts/computer-use-patches](scripts/computer-use-patches)）：补齐 `cua-driver call` 的 `session` 会话标签（否则 `screen_zoom` 与坐标点击报 `screenshot_context_missing`）、窗口列表改为覆盖所有桌面、支持按 `window_id` 观察、不可见窗口自动前置、动作结果附带窗口清单与重新观察提示；新增 `lib/display.js`（JXA 读 `NSScreen` 做多显示器归属）、虚拟光标常显与按屏幕点移动、`computer_aim` 工具、点击 `from_zoom` 支持，以及在观察/局部截图里给出缩放坐标换算。补丁幂等，升级插件版本后如遇结构变化会打印警告并跳过，需要重新确认。
+> `pnpm run setup` 会对已安装的 `dsh-computer-use@0.3.1` 打一组确定性补丁（[setup-profile.mjs](scripts/setup-profile.mjs) 的 `COMPUTER_USE_PATCHES`，大段新增代码放在 [scripts/computer-use-patches](scripts/computer-use-patches)）：补齐 `cua-driver call` 的 `session` 会话标签（否则 `screen_zoom` 与坐标点击报 `screenshot_context_missing`）、窗口列表改为覆盖所有桌面、支持按 `window_id` 观察、不可见窗口自动前置、动作结果附带窗口清单与重新观察提示；新增 `lib/display.js`（JXA 读 `NSScreen` 做多显示器归属）、虚拟光标常显与按屏幕点移动、`computer_aim` 工具、点击 `from_zoom` 支持，以及在观察/局部截图里给出缩放坐标换算。补丁幂等，升级插件版本后如遇结构变化会打印警告并跳过，需要重新确认。
+
+### Super-agent（Router / Worker）
+
+默认关闭。开启后侧栏出现 **Super Agent** 入口：输入目标即可由 Router 拆解为子任务，多个 Worker 在相互隔离的会话中并行执行，最后由 Router 汇总。
+
+- **开关**：`SV_SUPERAGENT_ENABLED=1`（[cordis.patch.yml](packages/sv-app/cordis.patch.yml) 读取后注入 `superAgent`）。关闭时不创建运行时、不注册任何相关路由，页面行为与之前完全一致。
+- **显式子任务**：面板里的「每行一个子任务」可跳过模型拆解，适合已知拆分方式的场景；留空则由 Router 输出 JSON 计划。
+- **限额**（环境变量）：`SV_SUPERAGENT_MAX_CONCURRENCY`（默认 3）、`SV_SUPERAGENT_MAX_SUBTASKS`（8）、`SV_SUPERAGENT_WORKER_TIMEOUT_MS`（180000）、`SV_SUPERAGENT_RETRY_ATTEMPTS`（1）、`SV_SUPERAGENT_WATCHDOG_INTERVAL_MS`（5000）。
+- **可靠性**：Worker 失败或超时都会按重试次数重跑（每次尝试使用全新会话）；认证/余额类错误（401/402/403）不重试，直接提示更换 API Key 或充值；单次尝试超时由定时器 + watchdog 双重兜底，取消沿 `AbortSignal` 传到模型请求；单个 Worker 失败不影响其他 Worker，汇总仍会产出。
+- **手动重试**：运行结束后，失败 / 超时 / 已取消的 Worker 卡片上会出现「重试」按钮。点击后在原运行内原地重跑该子任务（`POST /sv/api/superagent/retry`），追加尝试次数并重新生成 Router 汇总，不需要重新拆解整个目标。
+- **历史持久化**：运行历史写入 `$DSH_HOME/sv/superagent-runs.json`（0600，最近 20 轮），重启后仍能在页面看到目标、Worker 状态、输出与汇总。进程重启时仍在 `running` 的记录会降级为失败，未完成 Worker 标记为「服务重启，执行已中断」。
+- **实现**：[superagent.ts](packages/sv-app/src/superagent.ts) 是纯编排（可单测），[superagent-runtime.ts](packages/sv-app/src/superagent-runtime.ts) 负责 Router 的模型调用与 Worker 会话创建；Worker 复用当前 Agent Loop、工具与模型配置，完成后 dispose。
 
 ### Trace 面板与会话历史
 

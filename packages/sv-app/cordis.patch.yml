@@ -133,6 +133,13 @@
           DSH_HOME: !!js process.env.DSH_HOME ?? ''
 
     # SV 宿主插件：自定义 LLM 适配器、搜索提供方、聊天服务与 /sv 页面。
+    # Super-agent（Router / Worker）：默认关闭，关闭时不注册任何相关路由。
+    # 开关：SV_SUPERAGENT_ENABLED=1|true；限额也可用环境变量覆盖：
+    #   SV_SUPERAGENT_MAX_CONCURRENCY        Worker 并发上限（默认 3）
+    #   SV_SUPERAGENT_MAX_SUBTASKS           单轮最多子任务数（默认 8）
+    #   SV_SUPERAGENT_WORKER_TIMEOUT_MS      单个 Worker 单次超时（默认 180000）
+    #   SV_SUPERAGENT_RETRY_ATTEMPTS         失败后的额外重试次数（默认 1）
+    #   SV_SUPERAGENT_WATCHDOG_INTERVAL_MS   watchdog 巡检间隔（默认 5000）
     - id: sv-app
       name: '@singularity-voyage/sv-app'
       config:
@@ -140,3 +147,4 @@
         llmBaseURL: !!js process.env.SV_LLM_BASE_URL ?? 'https://api.deepseek.com'
         llmModel: !!js process.env.SV_LLM_MODEL ?? 'deepseek-chat'
         searchProvider: !!js process.env.SV_SEARCH_PROVIDER ?? process.env.WEB_SEARCH_PROVIDER ?? ''
+        superAgent: !!js (process.env.SV_SUPERAGENT_ENABLED ?? '').toLowerCase() === '1' || (process.env.SV_SUPERAGENT_ENABLED ?? '').toLowerCase() === 'true'

@@ -132,8 +132,8 @@ prepare() {
   pnpm build
 
   # 初始化 dsh profile
-  log "初始化 dsh profile (pnpm setup)…"
-  pnpm setup
+  log "初始化 dsh profile (pnpm run setup)…"
+  pnpm run setup
 }
 
 # ── 健康检查 ─────────────────────────────────────────────────────────────
@@ -287,7 +287,7 @@ cmd_dev() {
 
   load_env
   log "前台运行 pnpm dev（端口见 package.json 的 dev 脚本，默认 ${PORT}）…"
-  log "注意：dev 不会执行 build / setup；改过 src 请先 pnpm build，改过插件版本请先 pnpm setup"
+  log "注意：dev 不会执行 build / setup；改过 src 请先 pnpm build，改过插件版本请先 pnpm run setup"
   cd "$REPO_ROOT"
   exec pnpm dev
 }

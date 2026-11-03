@@ -19,7 +19,24 @@ import type { MailNotifier } from './mail-notifier.ts'
 import type { ReminderService, SvReminderEvent } from './reminders.ts'
 import { SV_SEARCH_PROVIDER_ID } from './search-provider.ts'
 import type { SvSessionStore } from './sessions-store.ts'
+import type { SuperAgentEvent, SuperAgentSurface } from './superagent.ts'
 import { TASK_RECURRENCES, taskView, type TaskRecurrence, type TaskStatus, type TasksStore } from './tasks-store.ts'
+
+/** `/sv/api/skills` 返回的技能条目（只暴露斜杠菜单需要的元信息）。 */
+export interface SvSkillView {
+  name: string
+  description: string
+  whenToUse?: string
+  source?: string
+  /** 技能指令文件的绝对路径。 */
+  path?: string
+}
+
+/** `/sv/api/tools` 返回的工具条目。 */
+export interface SvToolView {
+  name: string
+  description: string
+}
 
 const WEB_DIR = join(import.meta.dirname, '..', 'web')
 /** 单次最多读取的日志尾部字节数，避免大文件占满内存。 */
@@ -114,6 +131,9 @@ export function registerSvRoutes(
   reminders: ReminderService,
   mailer: MailNotifier,
   schedule: Context['schedule'],
+  listSkills: () => Promise<SvSkillView[]>,
+  listTools: () => Promise<SvToolView[]>,
+  superAgent?: SuperAgentSurface,
 ): void {
   const staticCache = new Map<string, { body: Buffer; type: string }>()
   const serveStatic = async (res: ServerResponse, file: string): Promise<void> => {
@@ -126,6 +146,44 @@ export function registerSvRoutes(
     }
     res.writeHead(200, { 'content-type': entry.type, 'cache-control': 'no-cache' })
     res.end(entry.body)
+  }
+
+  /** 把 Super-agent 事件流写成 SSE；连接关闭时中止上游。 */
+  const pipeSuperAgent = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    open: (signal: AbortSignal) => AsyncGenerator<SuperAgentEvent>,
+  ): Promise<void> => {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    })
+    res.flushHeaders?.()
+    let closed = false
+    const controller = new AbortController()
+    // 客户端断开时 req/res 谁先触发都行；res 的 close 在代理/浏览器中止时更可靠。
+    const onClose = (): void => {
+      closed = true
+      controller.abort()
+    }
+    req.on('close', onClose)
+    res.on('close', onClose)
+    const send = (event: unknown): void => {
+      if (closed) return
+      res.write(`data: ${JSON.stringify(event)}\n\n`)
+    }
+    try {
+      for await (const event of open(controller.signal)) {
+        if (closed) break
+        send(event)
+      }
+    } catch (error) {
+      send({ type: 'error', runId: '', message: error instanceof Error ? error.message : String(error) })
+      send({ type: 'done' })
+    }
+    res.end()
   }
 
   const handleApi = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
@@ -144,7 +202,30 @@ export function registerSvRoutes(
         searchProvider: SV_SEARCH_PROVIDER_ID,
         ...store.publicState(),
         ...(models === null ? { modelsError } : { models }),
+        superAgent: superAgent === undefined
+          ? { enabled: false }
+          : { enabled: superAgent.enabled, limits: superAgent.limits },
       })
+      return
+    }
+
+    // GET /sv/api/skills —— 可供 / 斜杠菜单选择的用户可调用技能
+    if (req.method === 'GET' && path === '/sv/api/skills') {
+      try {
+        sendJson(res, 200, { skills: await listSkills() })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // GET /sv/api/tools —— 可供 / 斜杠菜单查看的工具（含 computer-use）
+    if (req.method === 'GET' && path === '/sv/api/tools') {
+      try {
+        sendJson(res, 200, { tools: await listTools() })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
       return
     }
 
@@ -493,6 +574,88 @@ export function registerSvRoutes(
       return
     }
 
+    // GET /sv/api/superagent/state —— 运行状态、限额与最近运行
+    if (req.method === 'GET' && path === '/sv/api/superagent/state') {
+      sendJson(res, 200, superAgent === undefined
+        ? { enabled: false, runs: [] }
+        : { enabled: superAgent.enabled, limits: superAgent.limits, runs: superAgent.runs() })
+      return
+    }
+
+    // POST /sv/api/superagent/run —— SSE：拆解 → 并发 Worker → 汇总
+    if (req.method === 'POST' && path === '/sv/api/superagent/run') {
+      if (superAgent === undefined) {
+        sendJson(res, 404, { error: 'Super-agent 未启用（设置 SV_SUPERAGENT_ENABLED=1）' })
+        return
+      }
+      let goal: string
+      let subtasks: string[] | undefined
+      try {
+        const body = await readJson(req)
+        goal = typeof body.goal === 'string' ? body.goal.trim() : ''
+        if (goal.length === 0) throw new Error('goal 不能为空')
+        if (goal.length > 10_000) throw new Error('goal 过长')
+        if (body.subtasks !== undefined) {
+          if (!Array.isArray(body.subtasks)) throw new Error('subtasks 必须是字符串数组')
+          subtasks = body.subtasks
+            .filter((item): item is string => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(item => item.length > 0)
+          if (subtasks.some(item => item.length > 2_000)) throw new Error('单个子任务不能超过 2000 个字符')
+          if (subtasks.length > superAgent.limits.maxSubtasks) {
+            throw new Error(`子任务不能超过 ${superAgent.limits.maxSubtasks} 个`)
+          }
+        }
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        return
+      }
+
+      await pipeSuperAgent(req, res, signal => superAgent.run(goal, subtasks, signal))
+      return
+    }
+
+    // POST /sv/api/superagent/retry —— 手动重试单个失败的 Worker（SSE）
+    if (req.method === 'POST' && path === '/sv/api/superagent/retry') {
+      if (superAgent === undefined) {
+        sendJson(res, 404, { error: 'Super-agent 未启用' })
+        return
+      }
+      let runId: string
+      let index: number
+      try {
+        const body = await readJson(req)
+        runId = typeof body.runId === 'string' ? body.runId.trim() : ''
+        if (runId.length === 0) throw new Error('runId 不能为空')
+        if (typeof body.index !== 'number' || !Number.isInteger(body.index) || body.index < 0) {
+          throw new Error('index 必须是非负整数')
+        }
+        index = body.index
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      await pipeSuperAgent(req, res, signal => superAgent.retry(runId, index, signal))
+      return
+    }
+
+    // POST /sv/api/superagent/stop —— 中止一轮运行或手动重试
+    if (req.method === 'POST' && path === '/sv/api/superagent/stop') {
+      if (superAgent === undefined) {
+        sendJson(res, 404, { error: 'Super-agent 未启用' })
+        return
+      }
+      try {
+        const body = await readJson(req)
+        const runId = body.runId
+        if (typeof runId !== 'string' || runId.length === 0) throw new Error('runId 不能为空')
+        sendJson(res, 200, { stopped: superAgent.stop(runId) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
     // GET /sv/api/logs —— 分页读取 logs/ 下按天分割的日志（默认最新文件）
     if (req.method === 'GET' && path === '/sv/api/logs') {
       const url = new URL(req.url ?? '/', 'http://sv.local')
@@ -579,7 +742,7 @@ export function registerSvRoutes(
       const unsubscribe = reminders.subscribe((event: SvReminderEvent) => {
         res.write(`data: ${JSON.stringify(event)}\n\n`)
       })
-      req.on('close', unsubscribe)
+      res.on('close', unsubscribe)
       return
     }
 
@@ -604,6 +767,10 @@ export function registerSvRoutes(
         }
         if (req.method === 'GET' && path === '/sv/trace.js') {
           await serveStatic(res, 'trace.js')
+          return
+        }
+        if (req.method === 'GET' && path === '/sv/markdown.js') {
+          await serveStatic(res, 'markdown.js')
           return
         }
         if (req.method === 'GET' && path === '/sv/app.css') {

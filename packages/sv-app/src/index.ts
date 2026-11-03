@@ -20,7 +20,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { ChatManager } from './chat.ts'
 import { ConfigStore, inferLlmProvider, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
-import { registerSvRoutes } from './http.ts'
+import { registerSvRoutes, type SvSkillView, type SvToolView } from './http.ts'
 import { SV_PROVIDER_ID, SvOpenAiCompatAdapter } from './llm-adapter.ts'
 import { svError, svErrorTrace, svLog, installSvLogSink } from './log.ts'
 import { MailNotifier } from './mail-notifier.ts'
@@ -31,8 +31,26 @@ import { SvSearchProvider } from './search-provider.ts'
 import { SessionStore } from './sessions-store.ts'
 import type { SvSessionStore } from './sessions-store.ts'
 import { PgSessionStore } from './sessions-postgres.ts'
+import { resolveSuperAgentConfig } from './superagent.ts'
+import type { SuperAgentSurface } from './superagent.ts'
+import { createSuperAgentRuntime } from './superagent-runtime.ts'
+import { SuperAgentRunStore } from './superagent-store.ts'
 import { TasksStore } from './tasks-store.ts'
 import { registerDesktopGuard, registerMemoryTools, registerTaskTools } from './tools.ts'
+
+/** 技能注册表的最小结构；不把 sv-app 绑死到具体 skill 包的版本。 */
+interface SkillSummaryLike {
+  readonly name: string
+  readonly description: string
+  readonly whenToUse?: string
+  readonly source?: string
+  readonly path?: string
+  readonly invocation?: { readonly userInvocable?: boolean }
+}
+
+interface SkillRegistryLike {
+  list(options?: { cwd?: string }): Promise<readonly SkillSummaryLike[]>
+}
 
 /** Cordis loader 显示的插件名。 */
 export const name = '@singularity-voyage/sv-app'
@@ -50,6 +68,18 @@ export interface Config {
   llmModel: string
   /** 搜索提供方协议：tavily | bocha（也可经 SV_SEARCH_PROVIDER / WEB_SEARCH_PROVIDER 环境变量给出）。 */
   searchProvider?: string
+  /** Super-agent 开关；缺省读 SV_SUPERAGENT_ENABLED，默认关闭。 */
+  superAgent?: boolean
+  /** Super-agent Worker 并发上限（默认 3）。 */
+  superAgentMaxConcurrency?: number
+  /** Router 单轮最多拆出的子任务数（默认 8）。 */
+  superAgentMaxSubtasks?: number
+  /** 单个 Worker 单次尝试的超时毫秒（默认 180000）。 */
+  superAgentWorkerTimeoutMs?: number
+  /** Worker 失败后的额外重试次数（默认 1）。 */
+  superAgentRetryAttempts?: number
+  /** watchdog 巡检间隔毫秒（默认 5000）。 */
+  superAgentWatchdogIntervalMs?: number
 }
 
 const LLM_PROVIDERS = new Set(['deepseek', 'qwen', 'ark', 'openai', 'custom'])
@@ -274,6 +304,64 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
         })
     },
   })
-  registerSvRoutes(ctx, chat, store, sessions, memory, tasks, reminders, mailer, ctx.schedule)
+  // Super-agent 默认关闭：关闭时不创建运行时不注册路由，行为与本版本之前一致。
+  const { enabled: superAgentEnabled, ...superAgentOptions } = resolveSuperAgentConfig(config)
+  let superAgent: SuperAgentSurface | undefined
+  if (superAgentEnabled) {
+    // 运行历史落 $DSH_HOME/sv/superagent-runs.json；进程重启后仍能在页面看到。
+    const runStore = new SuperAgentRunStore()
+    try {
+      await runStore.load()
+    } catch (error) {
+      ctx.logger.warn(svLog('index', 'superagent_history_load_failed', { err: svError(error) }))
+    }
+    superAgent = createSuperAgentRuntime(ctx, store, superAgentOptions, {
+      initialRuns: runStore.list(),
+      onChange: runs => {
+        void runStore.save(runs).catch(error => {
+          ctx.logger.warn(svLog('superagent', 'history_save_failed', { err: svError(error) }))
+        })
+      },
+    })
+    ctx.logger.info(svLog('index', 'superagent_ready', {
+      maxConcurrency: superAgentOptions.maxConcurrency,
+      maxSubtasks: superAgentOptions.maxSubtasks,
+      workerTimeoutMs: superAgentOptions.workerTimeoutMs,
+      retryAttempts: superAgentOptions.retryAttempts,
+      history: runStore.list().length,
+    }))
+  }
+
+  // / 斜杠菜单只展示用户可调用的技能；模型可调用但用户禁用的不出现。
+  const listSkills = async (): Promise<SvSkillView[]> => {
+    const registry = ctx.get('skills') as SkillRegistryLike | undefined
+    if (registry === undefined) return []
+    try {
+      const skills = await registry.list({ cwd: process.cwd() })
+      return skills
+        .filter(skill => skill.invocation?.userInvocable === true)
+        .map(skill => ({
+          name: skill.name,
+          description: skill.description,
+          ...skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse },
+          ...skill.source === undefined ? {} : { source: String(skill.source) },
+          ...skill.path === undefined ? {} : { path: skill.path },
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    } catch (error) {
+      ctx.logger.warn(svLog('index', 'skills_list_failed', { err: svError(error) }))
+      return []
+    }
+  }
+
+  // / 斜杠菜单的工具列表：直接取当前可见工具，包含 computer-use / MCP / 内置工具。
+  const listTools = async (): Promise<SvToolView[]> => {
+    return ctx.tools.schemas()
+      .filter(tool => tool.name !== 'skill')
+      .map(tool => ({ name: tool.name, description: tool.description }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  registerSvRoutes(ctx, chat, store, sessions, memory, tasks, reminders, mailer, ctx.schedule, listSkills, listTools, superAgent)
   ctx.logger.info(svLog('index', 'surface_ready', { path: '/sv/' }))
 }
