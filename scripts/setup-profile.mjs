@@ -821,7 +821,7 @@ async function patchComputerUse(targetRoot = join(profileDir, 'node_modules', 'd
 await patchComputerUse(patchOnlyRoot || undefined)
 if (patchOnlyRoot) process.exit(0)
 
-const dshSrc = process.env.DSH_SRC ?? join(repoRoot, '..', 'deepseek-harness-dsh-v0.2.1-rc.2')
+const dshSrc = process.env.DSH_SRC ?? process.env.SV_DSH_SRC ?? join(repoRoot, '..', 'deepseek-harness')
 console.log('')
 console.log('[sv] 就绪。启动（或直接 pnpm dev）：')
 console.log(`      node "${join(dshSrc, 'apps', 'cli', 'lib', 'bin.js')}" --profile sv --port 7001 --no-open`)

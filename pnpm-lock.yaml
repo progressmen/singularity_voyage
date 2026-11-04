@@ -22,35 +22,35 @@ importers:
         version: 8.23.1
     devDependencies:
       '@deepseek-ai/cordis':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/vendor/cordis
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/vendor/cordis
+        specifier: link:../../../deepseek-harness/vendor/cordis
+        version: link:../../../deepseek-harness/vendor/cordis
       '@deepseek-ai/dsh-agent':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/agent
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/agent
+        specifier: link:../../../deepseek-harness/packages/core/agent
+        version: link:../../../deepseek-harness/packages/core/agent
       '@deepseek-ai/dsh-attachment':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/attachment/attachment
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/attachment/attachment
+        specifier: link:../../../deepseek-harness/packages/attachment/attachment
+        version: link:../../../deepseek-harness/packages/attachment/attachment
       '@deepseek-ai/dsh-host-webserver':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/host/webserver
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/host/webserver
+        specifier: link:../../../deepseek-harness/packages/host/webserver
+        version: link:../../../deepseek-harness/packages/host/webserver
       '@deepseek-ai/dsh-llm':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/llm/llm
+        specifier: link:../../../deepseek-harness/packages/llm/llm
+        version: link:../../../deepseek-harness/packages/llm/llm
       '@deepseek-ai/dsh-schedule':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/schedule/schedule
+        specifier: link:../../../deepseek-harness/packages/schedule/schedule
+        version: link:../../../deepseek-harness/packages/schedule/schedule
       '@deepseek-ai/dsh-session':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/session
+        specifier: link:../../../deepseek-harness/packages/core/session
+        version: link:../../../deepseek-harness/packages/core/session
       '@deepseek-ai/dsh-system-prompt':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/system-prompt
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/system-prompt
+        specifier: link:../../../deepseek-harness/packages/core/system-prompt
+        version: link:../../../deepseek-harness/packages/core/system-prompt
       '@deepseek-ai/dsh-tools':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/tools
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/core/tools
+        specifier: link:../../../deepseek-harness/packages/core/tools
+        version: link:../../../deepseek-harness/packages/core/tools
       '@deepseek-ai/dsh-web':
-        specifier: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/web/web
-        version: link:../../../deepseek-harness-dsh-v0.2.1-rc.2/packages/web/web
+        specifier: link:../../../deepseek-harness/packages/web/web
+        version: link:../../../deepseek-harness/packages/web/web
       '@types/node':
         specifier: ^22.20.1
         version: 22.20.5

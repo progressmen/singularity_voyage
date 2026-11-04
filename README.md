@@ -147,7 +147,7 @@ singularity_voyage/
 ### 前置条件
 
 - Node.js `^22.19.0 || >=24.0.0`、pnpm
-- 本地 harness 源码：`~/project/deepseek-harness-dsh-v0.2.1-rc.2`（需已完成 `pnpm install && pnpm run build`）
+- 本地 harness 源码：`~/project/deepseek-harness`（需已完成 `pnpm install && pnpm run build`）
 - 一个 OpenAI 兼容的模型 API key（默认指向 DeepSeek），可选一个 Tavily 搜索 key
 - 可选：Python 3.9+（邮件 MCP 服务只用标准库，无需 pip 安装）
 - 可选：Python 3.10+ 与 akshare（股票行情 MCP，见 5.2 的安装命令；不装则 `sv-mcp-stock` 启动失败，可临时注释该配置行）
@@ -534,4 +534,4 @@ export function apply(ctx: Context): void {
 
 - [DeepSeek Harness 文档](https://deepseek-harness.github.io/deepseek-harness/)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- 本地 harness 源码：`~/project/deepseek-harness-dsh-v0.2.1-rc.2`
+- 本地 harness 源码：`~/project/deepseek-harness`

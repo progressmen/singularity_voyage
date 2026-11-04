@@ -10,7 +10,7 @@
 #   ./scripts/start.sh status    # 查看运行状态
 #   ./scripts/start.sh logs      # 跟踪日志
 #
-# 默认 dsh harness 源码位置：../deepseek-harness-dsh-v0.2.1-rc.2
+# 默认 dsh harness 源码位置：../deepseek-harness
 # 可用环境变量 DSH_SRC 覆盖。
 set -euo pipefail
 
@@ -21,8 +21,6 @@ LOG_DIR="$REPO_ROOT/logs"
 PID_FILE="$PID_DIR/sv.pid"
 # 进程控制台输出（追加写入，重启不丢）；结构化运行日志由 sv-app 按天写入 logs/sv-YYYY-MM-DD.log
 LOG_FILE="$LOG_DIR/stdout.log"
-DSH_SRC="${DSH_SRC:-$REPO_ROOT/../deepseek-harness-dsh-v0.2.1-rc.2}"
-DSH_BIN="$DSH_SRC/apps/cli/lib/bin.js"
 PORT="${PORT:-7001}"
 HEALTH_URL="http://127.0.0.1:${PORT}/sv/api/state"
 HEALTH_TIMEOUT=30
@@ -49,6 +47,18 @@ load_env() {
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
   set +a
+}
+
+# 解析 dsh 源码目录：启动环境导出的 DSH_SRC > .env 里的 SV_DSH_SRC > 相邻目录默认值。
+# dsh 只接受启动环境导出的 DSH_SRC（且禁止 .env 出现 DSH_ 前缀变量），所以 .env 里用 SV_DSH_SRC 中转。
+resolve_dsh_src() {
+  local src="${DSH_SRC:-${SV_DSH_SRC:-$REPO_ROOT/../deepseek-harness}}"
+  # 相对路径统一按仓库根目录解析，避免受调用时 cwd 影响
+  [[ "$src" = /* ]] || src="$REPO_ROOT/$src"
+  DSH_SRC="$src"
+  export DSH_SRC
+  DSH_BIN="$DSH_SRC/apps/cli/lib/bin.js"
+  [[ -f "$DSH_BIN" ]] || die "找不到 dsh CLI: $DSH_BIN（请检查 .env 中的 SV_DSH_SRC）"
 }
 
 # PID 文件里的进程号（不校验存活）
@@ -179,6 +189,7 @@ cmd_start() {
   assert_port_free
 
   load_env
+  resolve_dsh_src
   # dsh 数据目录默认放在仓库内，便于隔离与迁移（可用 DSH_HOME 覆盖）
   export DSH_HOME="${DSH_HOME:-$REPO_ROOT/.dsh}"
   prepare
@@ -286,6 +297,7 @@ cmd_dev() {
   assert_port_free
 
   load_env
+  resolve_dsh_src
   log "前台运行 pnpm dev（端口见 package.json 的 dev 脚本，默认 ${PORT}）…"
   log "注意：dev 不会执行 build / setup；改过 src 请先 pnpm build，改过插件版本请先 pnpm run setup"
   cd "$REPO_ROOT"
@@ -312,7 +324,8 @@ case "${1:-start}" in
   logs     跟踪服务日志（tail -f）
 
 环境变量:
-  DSH_SRC  dsh harness 源码目录（默认: ../deepseek-harness-dsh-v0.2.1-rc.2）
+  SV_DSH_SRC   dsh harness 源码目录（在 .env 中配置，默认: ../deepseek-harness）
+  DSH_SRC      同上，但仅支持启动环境 export（dsh 禁止 .env 出现 DSH_ 前缀变量）
   PORT     服务端口（默认 7001；dev 的端口由 package.json 的 dev 脚本决定）
 EOF
     exit 1
