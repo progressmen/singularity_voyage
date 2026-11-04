@@ -246,11 +246,17 @@
 
       <footer class="composer" id="composer">
         <div class="composer-box">
-          <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行；输入 / 选择技能或工具"></textarea>
+          <div class="composer-main">
+            <div class="image-strip" id="image-strip" hidden></div>
+            <textarea id="input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行；输入 / 选择技能或工具"></textarea>
+          </div>
+          <button class="btn btn-ghost attach" id="attach" type="button" title="添加图片（也可直接粘贴截图）">＋</button>
+          <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
           <button class="btn btn-primary send" id="send" title="发送">➤</button>
           <button class="btn btn-danger stop" id="stop" title="停止" hidden>■</button>
           <div class="slash-menu" id="slash-menu" hidden></div>
         </div>
+        <div class="composer-error" id="composer-error" hidden></div>
         <div class="composer-hint">回答由 AI 生成，请注意甄别；联网搜索结果由 web_search 工具提供。</div>
       </footer>
     </main>

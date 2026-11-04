@@ -8,6 +8,8 @@ import { open, readdir, readFile, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import { isAttachmentError } from '@deepseek-ai/dsh-attachment'
+import type { EncodedImageAttachment, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-schedule'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { ChatManager, SvChatEvent } from './chat.ts'
@@ -95,6 +97,18 @@ const MIME: Record<string, string> = {
 }
 
 const BODY_LIMIT = 1 << 20
+/** 聊天请求体上限：4 张 10MB 图片经 base64 膨胀后仍留有余量。 */
+const CHAT_BODY_LIMIT = 64 * 1024 * 1024
+/** 单条消息最多附带的图片数。 */
+const MAX_CHAT_IMAGES = 4
+/** 单张图片的编码前体积上限。 */
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+const IMAGE_MEDIA_TYPES: ReadonlySet<string> = new Set<ImageMediaType>([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+])
 
 function sendJson(res: ServerResponse, code: number, value: unknown): void {
   const body = JSON.stringify(value)
@@ -102,24 +116,108 @@ function sendJson(res: ServerResponse, code: number, value: unknown): void {
   res.end(body)
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage, limit = BODY_LIMIT): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     const buffer = chunk as Buffer
     size += buffer.length
-    if (size > BODY_LIMIT) throw new Error('请求体过大')
+    if (size > limit) throw new Error('请求体过大')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req)
+async function readJson(req: IncomingMessage, limit = BODY_LIMIT): Promise<Record<string, unknown>> {
+  const raw = await readBody(req, limit)
   if (raw.trim().length === 0) return {}
   const parsed: unknown = JSON.parse(raw)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('请求体必须是 JSON 对象')
   return parsed as Record<string, unknown>
+}
+
+/** 解析聊天请求里的图片上传；格式与体积先做快速校验，解码校验交给附件服务。 */
+function parseChatImages(value: unknown): EncodedImageAttachment[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('images 必须是数组')
+  if (value.length > MAX_CHAT_IMAGES) throw new Error(`单次最多 ${MAX_CHAT_IMAGES} 张图片`)
+  const out: EncodedImageAttachment[] = []
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) throw new Error('图片格式非法')
+    const record = item as { mediaType?: unknown; data?: unknown; name?: unknown }
+    if (typeof record.mediaType !== 'string' || !IMAGE_MEDIA_TYPES.has(record.mediaType)) {
+      throw new Error('仅支持 PNG / JPEG / WebP / GIF 图片')
+    }
+    if (typeof record.data !== 'string' || record.data.length === 0) throw new Error('图片数据为空')
+    // base64 长度换算：4 字符对应 3 字节；先按编码长度预检，避免为超大图分配内存。
+    const padding = record.data.endsWith('==') ? 2 : record.data.endsWith('=') ? 1 : 0
+    const bytes = Math.floor(record.data.length * 3 / 4) - padding
+    if (bytes > MAX_CHAT_IMAGE_BYTES) throw new Error('单张图片不能超过 10MB')
+    const name = typeof record.name === 'string' ? record.name.slice(0, 255) : undefined
+    out.push({
+      mediaType: record.mediaType as ImageMediaType,
+      data: record.data,
+      ...name === undefined ? {} : { name },
+    })
+  }
+  return out
+}
+
+/** 把附件服务的错误码翻译成页面可直接展示的中文提示。 */
+function imageErrorMessage(error: unknown): string {
+  if (!isAttachmentError(error)) return error instanceof Error ? error.message : String(error)
+  switch (error.code) {
+    case 'TOO_MANY_IMAGES':
+    case 'IMAGES_TOO_LARGE':
+      return '图片数量或总大小超出限制'
+    case 'IMAGE_TOO_LARGE':
+      return '单张图片体积超出限制'
+    case 'UNSUPPORTED_IMAGE_TYPE':
+    case 'IMAGE_TYPE_MISMATCH':
+      return '仅支持 PNG / JPEG / WebP / GIF 图片'
+    case 'INVALID_IMAGE':
+    case 'INVALID_IMAGE_BASE64':
+      return '图片数据无效'
+    case 'IMAGE_TOO_MANY_PIXELS':
+    case 'IMAGE_DIMENSION_TOO_LARGE':
+      return '图片分辨率过大'
+    default:
+      return `图片处理失败：${error.message}`
+  }
+}
+
+/** 校验前端回传的图片引用，避免把任意头部值带进响应。 */
+function parseImageRef(value: unknown): ImageAttachmentRef {
+  if (typeof value !== 'object' || value === null) throw new Error('图片引用非法')
+  const record = value as Record<string, unknown>
+  const positiveInt = (item: unknown): item is number => typeof item === 'number' && Number.isSafeInteger(item) && item > 0
+  if (typeof record.attachmentId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(record.attachmentId)) {
+    throw new Error('图片引用非法')
+  }
+  if (typeof record.mediaType !== 'string' || !IMAGE_MEDIA_TYPES.has(record.mediaType)) {
+    throw new Error('图片引用非法')
+  }
+  if (!positiveInt(record.bytes) || !positiveInt(record.width) || !positiveInt(record.height)) {
+    throw new Error('图片引用非法')
+  }
+  const original = record.originalDimensions
+  const originalRecord = typeof original === 'object' && original !== null
+    ? original as Record<string, unknown>
+    : undefined
+  const originalWidth = originalRecord?.width
+  const originalHeight = originalRecord?.height
+  const originalDimensions = positiveInt(originalWidth) && positiveInt(originalHeight)
+    ? { width: originalWidth, height: originalHeight }
+    : undefined
+  return {
+    attachmentId: record.attachmentId as ImageAttachmentRef['attachmentId'],
+    mediaType: record.mediaType as ImageMediaType,
+    bytes: record.bytes,
+    width: record.width,
+    height: record.height,
+    ...typeof record.name !== 'string' ? {} : { name: record.name },
+    ...originalDimensions === undefined ? {} : { originalDimensions },
+  }
 }
 
 /** 注册 /sv 前缀路由。 */
@@ -202,12 +300,49 @@ export function registerSvRoutes(
       sendJson(res, 200, {
         provider: SV_PROVIDER_ID,
         searchProvider: SV_SEARCH_PROVIDER_ID,
+        // 图片消息依赖宿主层挂载的附件服务；未挂载时前端禁用图片入口。
+        attachments: ctx.get('attachments') !== undefined,
         ...store.publicState(),
         ...(models === null ? { modelsError } : { models }),
         superAgent: superAgent === undefined
           ? { enabled: false }
           : { enabled: superAgent.enabled, limits: superAgent.limits },
       })
+      return
+    }
+
+    // GET /sv/api/attachments?ref=<JSON> —— 读取历史消息里的图片附件
+    if (req.method === 'GET' && path === '/sv/api/attachments') {
+      const attachments = ctx.get('attachments')
+      if (attachments === undefined) {
+        sendJson(res, 404, { error: '附件服务未启用' })
+        return
+      }
+      let ref: ImageAttachmentRef
+      try {
+        const raw = new URL(req.url ?? '/', 'http://sv.local').searchParams.get('ref')
+        if (raw === null || raw.length === 0 || raw.length > 2048) throw new Error('图片引用非法')
+        ref = parseImageRef(JSON.parse(raw))
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      try {
+        const stored = await attachments.readImage(ref)
+        res.writeHead(200, {
+          'content-type': stored.ref.mediaType,
+          'content-length': stored.data.byteLength,
+          // 附件按内容哈希寻址，同一引用永远对应同一份字节。
+          'cache-control': 'private, max-age=31536000, immutable',
+        })
+        res.end(Buffer.from(stored.data))
+      } catch (error) {
+        ctx.logger.warn(svLog('http', 'attachment_read_failed', {
+          attachmentId: ref.attachmentId,
+          err: svError(error),
+        }))
+        sendJson(res, 404, { error: '图片不可用或已丢失' })
+      }
       return
     }
 
@@ -245,23 +380,36 @@ export function registerSvRoutes(
       return
     }
 
-    // POST /sv/api/chat —— SSE 聊天流
+    // POST /sv/api/chat —— SSE 聊天流（文本 + 可选图片）
     if (req.method === 'POST' && path === '/sv/api/chat') {
       let sessionId: string | undefined
       let text: string
+      let images: ImageAttachmentRef[] = []
       try {
-        const body = await readJson(req)
+        const body = await readJson(req, CHAT_BODY_LIMIT)
         const rawSession = body.sessionId
         if (rawSession !== undefined && (typeof rawSession !== 'string' || rawSession.length > 128)) {
           throw new Error('sessionId 非法')
         }
         sessionId = rawSession
         const rawText = body.text
-        if (typeof rawText !== 'string' || rawText.trim().length === 0) throw new Error('text 不能为空')
-        if (rawText.length > 100_000) throw new Error('text 过长')
-        text = rawText
+        if (rawText !== undefined && typeof rawText !== 'string') throw new Error('text 必须是字符串')
+        if (typeof rawText === 'string' && rawText.length > 100_000) throw new Error('text 过长')
+        text = rawText ?? ''
+        const uploads = parseChatImages(body.images)
+        if (text.trim().length === 0 && uploads.length === 0) throw new Error('text 和图片不能同时为空')
+        if (uploads.length > 0) {
+          const attachments = ctx.get('attachments')
+          if (attachments === undefined) throw new Error('当前环境未挂载附件服务，暂不支持图片消息')
+          const parts = [
+            ...text.length > 0 ? [{ type: 'text' as const, text }] : [],
+            ...uploads.map(image => ({ type: 'image' as const, ...image })),
+          ]
+          const admitted = await attachments.admitPromptContent(parts)
+          images = admitted.flatMap(part => part.type === 'image' ? [part.attachment] : [])
+        }
       } catch (error) {
-        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        sendJson(res, 400, { error: imageErrorMessage(error) })
         return
       }
 
@@ -281,7 +429,7 @@ export function registerSvRoutes(
         res.write(`data: ${JSON.stringify(event)}\n\n`)
       }
       try {
-        for await (const event of chat.run(sessionId, text)) {
+        for await (const event of chat.run(sessionId, text, images)) {
           if (closed) break
           send(event)
         }

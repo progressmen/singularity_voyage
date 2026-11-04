@@ -194,6 +194,70 @@ test('一轮结束只写一条 transcript：思考合并、工具跨消息保留
 })
 
 
+test('run 把图片引用组装进用户消息，并在 session 事件回传引用', async () => {
+  const { chat, rec } = makeChat()
+  const sent: Array<{ content: unknown }> = []
+  let finishIdle: () => void = () => {}
+  rec.agent = {
+    followup(message: { content: unknown }) { sent.push(message) },
+    whenIdle: () => new Promise<void>(resolve => { finishIdle = resolve }),
+    cancel() {},
+  }
+  ;(chat as unknown as { sessions: unknown }).sessions = {
+    recordUser: async () => {},
+    recordAssistant: async () => {},
+    recordUsage: async () => {},
+  }
+  const ref = {
+    attachmentId: `sha256:${'a'.repeat(64)}`,
+    mediaType: 'image/png' as const,
+    bytes: 12,
+    width: 4,
+    height: 3,
+  }
+
+  const iterator = chat.run('s1', '看图', [ref])
+  const first = await iterator.next()
+  assert.deepEqual(first.value, { type: 'session', sessionId: 's1', images: [ref] })
+  assert.equal(sent.length, 1)
+  assert.deepEqual(sent[0]?.content, [
+    { type: 'text', text: '看图' },
+    { type: 'image', attachment: ref },
+  ])
+
+  finishIdle()
+  for await (const _event of iterator) { /* 消费到 done */ }
+})
+
+test('图片消息可以不带文本：content 只有 image 块', async () => {
+  const { chat, rec } = makeChat()
+  const sent: Array<{ content: unknown }> = []
+  let finishIdle: () => void = () => {}
+  rec.agent = {
+    followup(message: { content: unknown }) { sent.push(message) },
+    whenIdle: () => new Promise<void>(resolve => { finishIdle = resolve }),
+    cancel() {},
+  }
+  ;(chat as unknown as { sessions: unknown }).sessions = {
+    recordUser: async () => {},
+    recordAssistant: async () => {},
+    recordUsage: async () => {},
+  }
+  const ref = {
+    attachmentId: `sha256:${'b'.repeat(64)}`,
+    mediaType: 'image/jpeg' as const,
+    bytes: 20,
+    width: 8,
+    height: 6,
+  }
+
+  const iterator = chat.run('s1', '', [ref])
+  await iterator.next()
+  assert.deepEqual(sent[0]?.content, [{ type: 'image', attachment: ref }])
+  finishIdle()
+  for await (const _event of iterator) { /* 消费到 done */ }
+})
+
 test('usage 帧累计 token 统计并推送上下文占用', () => {
   const { chat, rec, events } = makeChat()
   const frameApi = (chat as unknown as { onStreamFrame: (rec: AnyRec, frame: unknown) => void })

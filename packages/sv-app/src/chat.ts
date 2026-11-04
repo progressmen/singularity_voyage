@@ -14,9 +14,10 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { defaultContextWindow } from './config-store.ts'
 import type { ConfigStore } from './config-store.ts'
@@ -26,7 +27,7 @@ import type { SessionUsage, SvSessionStore, TranscriptToolEntry } from './sessio
 
 /** 转发给页面的 SSE 事件。 */
 export type SvChatEvent =
-  | { type: 'session'; sessionId: string }
+  | { type: 'session'; sessionId: string; images?: readonly ImageAttachmentRef[] }
   | { type: 'status'; status: 'running' | 'idle' }
   | { type: 'reasoning-delta'; text: string }
   | { type: 'text-delta'; text: string }
@@ -442,9 +443,14 @@ export class ChatManager {
   /**
    * 发送一条用户消息并流式产出事件，直到 agent 空闲。
    * @param requested - 客户端持有的会话 id（可空）。
-   * @param text - 用户输入。
+   * @param text - 用户输入文本；图片消息可以为空串。
+   * @param images - 已通过附件服务准入的图片引用，按用户选择顺序排列。
    */
-  async *run(requested: string | undefined, text: string): AsyncGenerator<SvChatEvent> {
+  async *run(
+    requested: string | undefined,
+    text: string,
+    images: readonly ImageAttachmentRef[] = [],
+  ): AsyncGenerator<SvChatEvent> {
     const sessionId = await this.ensure(requested)
     const rec = this.live.get(sessionId)
     if (rec === undefined) {
@@ -470,13 +476,17 @@ export class ChatManager {
       wake?.()
     }
 
-    push({ type: 'session', sessionId })
+    push({ type: 'session', sessionId, ...images.length === 0 ? {} : { images } })
     rec.sinks.add(push)
+
+    const content: ContentBlock[] = []
+    if (text.length > 0) content.push({ type: 'text', text })
+    for (const image of images) content.push({ type: 'image', attachment: image })
 
     let followupError: string | undefined
     try {
       rec.agent.followup(createUserMessage({
-        content: [{ type: 'text', text }],
+        content,
         source: { kind: 'user' },
       }))
     } catch (error) {

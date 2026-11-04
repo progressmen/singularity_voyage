@@ -41,6 +41,15 @@ let conversations = loadConversations()
 let activeId = localStorage.getItem(ACTIVE_KEY) ?? null
 let streaming = false
 
+/** 图片消息限制（与后端 /sv/api/chat 的校验保持一致）。 */
+const MAX_IMAGES = 4
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+/** 待发送图片：{ id, name, mediaType, data(base64), preview(objectURL) }。 */
+let pendingImages = []
+/** 宿主是否挂载了附件服务；未挂载时禁用图片入口。 */
+let attachmentsSupported = false
+
 /* ── 视图切换（对话 / 待办 / 定时任务 / 记忆 / 日志） ───── */
 const VIEW_KEY = 'sv.view.v1'
 let currentView = localStorage.getItem(VIEW_KEY) ?? 'chat'
@@ -691,6 +700,27 @@ function messageNode(message) {
     note.className = 'error-note'
     note.textContent = message.error
     content.appendChild(note)
+  }
+
+  if (Array.isArray(message.images) && message.images.length > 0) {
+    const grid = document.createElement('div')
+    grid.className = 'msg-images'
+    for (const image of message.images) {
+      const src = image.preview ?? attachmentSrc(image)
+      if (!src) continue
+      const img = document.createElement('img')
+      img.src = src
+      img.alt = typeof image.name === 'string' && image.name.length > 0 ? image.name : '图片'
+      img.loading = 'lazy'
+      img.addEventListener('error', () => {
+        const note = document.createElement('span')
+        note.className = 'image-missing'
+        note.textContent = '图片不可用'
+        img.replaceWith(note)
+      })
+      grid.appendChild(img)
+    }
+    if (grid.children.length > 0) content.appendChild(grid)
   }
 
   if (message.tools && message.tools.length > 0) {
@@ -1359,6 +1389,7 @@ async function api(path, options = {}) {
 async function loadState() {
   try {
     const state = await api('/sv/api/state')
+    setAttachmentsSupported(state.attachments === true)
     const modelChip = $('chip-model')
     modelChip.textContent = state.llm?.model ?? '…'
     modelChip.className = 'chip'
@@ -1759,18 +1790,147 @@ function setStreaming(value) {
   $('topbar-status').className = 'topbar-status' + (value ? ' running' : '')
 }
 
+/** 附件引用 → 图片读取地址；刷新页面后历史消息也走这里。 */
+function attachmentSrc(ref) {
+  if (!ref || typeof ref.attachmentId !== 'string') return ''
+  try {
+    return `/sv/api/attachments?ref=${encodeURIComponent(JSON.stringify(ref))}`
+  } catch {
+    return ''
+  }
+}
+
+/** 输入区上方的即时提示（图片校验失败等），数秒后自动消失。 */
+let composerErrorTimer = null
+function showComposerError(text) {
+  const note = $('composer-error')
+  note.textContent = text
+  note.hidden = false
+  if (composerErrorTimer !== null) clearTimeout(composerErrorTimer)
+  composerErrorTimer = setTimeout(() => { note.hidden = true }, 5000)
+}
+
+/** 宿主未挂载附件服务时禁用图片入口，文本问答不受影响。 */
+function setAttachmentsSupported(supported) {
+  attachmentsSupported = supported
+  const button = $('attach')
+  button.hidden = !supported
+  button.disabled = !supported
+  if (!supported) {
+    $('image-input').value = ''
+    pendingImages = []
+    renderImageStrip()
+  }
+}
+
+function renderImageStrip() {
+  const strip = $('image-strip')
+  strip.innerHTML = ''
+  for (const image of pendingImages) {
+    const chip = document.createElement('div')
+    chip.className = 'image-chip'
+    const img = document.createElement('img')
+    img.src = image.preview
+    img.alt = image.name || '图片'
+    chip.appendChild(img)
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.title = '移除图片'
+    remove.textContent = '×'
+    remove.addEventListener('click', () => {
+      URL.revokeObjectURL(image.preview)
+      pendingImages = pendingImages.filter(item => item !== image)
+      renderImageStrip()
+    })
+    chip.appendChild(remove)
+    strip.appendChild(chip)
+  }
+  strip.hidden = pendingImages.length === 0
+}
+
+/** 读取图片为 base64（去掉 data URL 前缀）。 */
+function readImageBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const comma = result.indexOf(',')
+      if (comma < 0) {
+        reject(new Error('读取图片失败'))
+        return
+      }
+      resolve(result.slice(comma + 1))
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+/** 选择/粘贴图片后加入待发送列表，并做数量、类型与体积校验。 */
+async function addImageFiles(files) {
+  const candidates = [...files]
+  if (candidates.length === 0) return
+  if (!attachmentsSupported) {
+    showComposerError('当前环境未挂载附件服务，暂不支持图片消息')
+    return
+  }
+  for (const file of candidates) {
+    if (pendingImages.length >= MAX_IMAGES) {
+      showComposerError(`单次最多 ${MAX_IMAGES} 张图片`)
+      break
+    }
+    if (!IMAGE_TYPES.has(file.type)) {
+      showComposerError('仅支持 PNG / JPEG / WebP / GIF 图片')
+      continue
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      showComposerError('单张图片不能超过 10MB')
+      continue
+    }
+    try {
+      const data = await readImageBase64(file)
+      pendingImages.push({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        name: file.name || 'image',
+        mediaType: file.type,
+        data,
+        preview: URL.createObjectURL(file),
+      })
+    } catch {
+      showComposerError('读取图片失败，请重试')
+    }
+  }
+  renderImageStrip()
+}
+
 async function sendMessage() {
   hideSlashMenu()
   const input = $('input')
   const text = input.value.trim()
-  if (!text || streaming) return
+  const images = pendingImages.slice()
+  if ((!text && images.length === 0) || streaming) return
 
   const conv = ensureConversation()
-  conv.messages.push({ role: 'user', text })
-  if (conv.title === '新对话') conv.title = text.slice(0, 24)
+  const userMessage = {
+    role: 'user',
+    text,
+    ...images.length === 0
+      ? {}
+      : {
+          images: images.map(image => ({
+            preview: image.preview,
+            name: image.name,
+            mediaType: image.mediaType,
+          })),
+        },
+  }
+  conv.messages.push(userMessage)
+  if (conv.title === '新对话') conv.title = text ? text.slice(0, 24) : '图片消息'
   conv.updatedAt = Date.now()
   input.value = ''
   autosize()
+  pendingImages = []
+  renderImageStrip()
   renderMessages()
   saveConversations()
   renderSidebar()
@@ -1785,7 +1945,15 @@ async function sendMessage() {
     const res = await fetch('/sv/api/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(sessionId ? { sessionId, text } : { text }),
+      body: JSON.stringify({
+        ...sessionId ? { sessionId } : {},
+        text,
+        ...images.length === 0
+          ? {}
+          : {
+              images: images.map(({ mediaType, name, data }) => ({ mediaType, name, data })),
+            },
+      }),
     })
     if (!res.ok || !res.body) {
       const err = await res.json().catch(() => ({}))
@@ -1813,7 +1981,7 @@ async function sendMessage() {
           } catch {
             continue
           }
-          handleEvent(conv, assistant, event)
+          handleEvent(conv, assistant, event, userMessage)
           if (event.type === 'done') done = true
         }
       }
@@ -1834,7 +2002,7 @@ async function sendMessage() {
   }
 }
 
-function handleEvent(conv, assistant, event) {
+function handleEvent(conv, assistant, event, userMessage) {
   switch (event.type) {
     case 'session':
       if (conv.id !== event.sessionId) {
@@ -1842,6 +2010,15 @@ function handleEvent(conv, assistant, event) {
         activeId = event.sessionId
         localStorage.setItem(ACTIVE_KEY, event.sessionId)
         saveConversations()
+      }
+      // 服务端把上传图片转成了可持久化的附件引用：替换本地预览地址。
+      if (userMessage !== undefined && Array.isArray(event.images) && event.images.length > 0) {
+        for (const image of userMessage.images ?? []) {
+          if (typeof image.preview === 'string') URL.revokeObjectURL(image.preview)
+        }
+        userMessage.images = event.images
+        saveConversations()
+        renderMessages()
       }
       break
     case 'text-delta':
@@ -2696,6 +2873,17 @@ $('new-chat').addEventListener('click', () => {
 })
 $('send').addEventListener('click', sendMessage)
 $('stop').addEventListener('click', stopStreaming)
+$('attach').addEventListener('click', () => $('image-input').click())
+$('image-input').addEventListener('change', (event) => {
+  void addImageFiles(event.target.files ?? [])
+  event.target.value = ''
+})
+$('input').addEventListener('paste', (event) => {
+  const files = [...(event.clipboardData?.files ?? [])].filter(file => file.type.startsWith('image/'))
+  if (files.length === 0) return
+  event.preventDefault()
+  void addImageFiles(files)
+})
 $('input').addEventListener('input', autosize)
 $('input').addEventListener('input', updateSlashMenu)
 $('input').addEventListener('blur', () => setTimeout(hideSlashMenu, 120))
