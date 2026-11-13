@@ -186,13 +186,20 @@ function buildRow(tool) {
   meta.textContent = tool?.isError ? `✕ ${duration}`.trim() : (tool?.phase === 'start' ? '…' : duration)
   summary.appendChild(meta)
   row.appendChild(summary)
-  const body = detailText(tool)
-  if (body.length > 0) {
-    const pre = document.createElement('pre')
-    pre.className = 'trace-detail'
-    pre.textContent = body
-    row.appendChild(pre)
-  }
+  // 详情正文只在真正展开时生成：流式重绘时 79 个工具卡 × 4KB 文本的开销都在这里。
+  let detail
+  row.addEventListener('toggle', () => {
+    if (!row.open || detail !== undefined) return
+    const body = detailText(tool)
+    if (body.length === 0) {
+      detail = null
+      return
+    }
+    detail = document.createElement('pre')
+    detail.className = 'trace-detail'
+    detail.textContent = body
+    row.appendChild(detail)
+  })
   if (info.server !== undefined && info.kind === 'mcp') row.dataset.server = info.server
   return row
 }

@@ -480,6 +480,29 @@ html, body {
   white-space: pre-wrap;
 }
 
+/* 答案底部操作条：默认淡出，悬停或键盘聚焦时显形 */
+.msg-actions { display: flex; gap: 2px; margin-top: 4px; opacity: 0; transition: opacity 0.12s ease; }
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions { opacity: 1; }
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.icon-btn.copied { color: var(--ok); }
+.icon-btn.copy-failed { color: var(--danger); }
+@media (hover: none) { .msg-actions { opacity: 1; } }
+
 .content p { margin: 0 0 10px; }
 .content p:last-child { margin-bottom: 0; }
 .content pre {

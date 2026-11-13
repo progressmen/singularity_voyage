@@ -752,9 +752,76 @@ function messageNode(message) {
   }
   content.appendChild(body)
 
+  if (message.role === 'assistant' && !message.streaming && (message.text ?? '').trim().length > 0) {
+    content.appendChild(answerActions(message.text))
+  }
+
   bubble.appendChild(content)
   wrap.appendChild(bubble)
   return wrap
+}
+
+const ICON_COPY = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="5.6" y="5.6" width="7.8" height="7.8" rx="1.6"/><path d="M10.4 5.6V3.9a1.4 1.4 0 0 0-1.4-1.4H3.9a1.4 1.4 0 0 0-1.4 1.4v5.1a1.4 1.4 0 0 0 1.4 1.4h1.7"/></svg>'
+const ICON_CHECK = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.4l3 3 6-6.8"/></svg>'
+
+/** 答案底部操作条：复制整段回答（Markdown 原文，不含思考过程与工具轨迹）。 */
+function answerActions(text) {
+  const bar = document.createElement('div')
+  bar.className = 'msg-actions'
+
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'icon-btn'
+  button.title = '复制'
+  button.setAttribute('aria-label', '复制回答')
+  button.innerHTML = ICON_COPY
+
+  let timer
+  const flash = (className, title, icon) => {
+    button.classList.add(className)
+    button.title = title
+    button.innerHTML = icon
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      button.classList.remove(className)
+      button.title = '复制'
+      button.innerHTML = ICON_COPY
+    }, 1600)
+  }
+
+  button.addEventListener('click', async () => {
+    try {
+      await writeClipboard(text)
+      flash('copied', '已复制', ICON_CHECK)
+    } catch {
+      flash('copy-failed', '复制失败', ICON_COPY)
+    }
+  })
+
+  bar.appendChild(button)
+  return bar
+}
+
+/**
+ * 写入剪贴板。navigator.clipboard 只在安全上下文可用，
+ * 通过局域网 http 打开 /sv 时回退到 execCommand。
+ */
+async function writeClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {}
+  }
+  const area = document.createElement('textarea')
+  area.value = text
+  area.readOnly = true
+  area.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0'
+  document.body.appendChild(area)
+  area.select()
+  const ok = document.execCommand('copy')
+  area.remove()
+  if (!ok) throw new Error('copy failed')
 }
 
 /** 收集容器内处于展开状态的 details（按文档顺序编号）。 */
@@ -784,6 +851,7 @@ function nearBottom(el, threshold = 120) {
 }
 
 function renderMessages() {
+  cancelScheduledRefresh()
   renderFileRail()
   const container = $('messages')
   const open = openDetails(container)
@@ -930,6 +998,26 @@ async function openFilePreview(path) {
   } catch (error) {
     body.innerHTML = `<div class="file-preview-status error">预览失败：${escapeHtml(error.message ?? String(error))}</div>`
   }
+}
+
+/** 流式重绘合并窗口：每个 token 都重建整条消息会退化成 O(n²)。 */
+const REFRESH_INTERVAL_MS = 100
+let refreshTimer = 0
+
+/** 合并同一窗口内的增量事件，最多每 100ms 重绘一次。 */
+function scheduleRefreshActiveMessage() {
+  if (refreshTimer !== 0) return
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = 0
+    refreshActiveMessage()
+  }, REFRESH_INTERVAL_MS)
+}
+
+/** 丢弃尚未执行的合并重绘（整表重绘前调用，避免重复渲染旧消息）。 */
+function cancelScheduledRefresh() {
+  if (refreshTimer === 0) return
+  window.clearTimeout(refreshTimer)
+  refreshTimer = 0
 }
 
 function refreshActiveMessage() {
@@ -2023,11 +2111,11 @@ function handleEvent(conv, assistant, event, userMessage) {
       break
     case 'text-delta':
       assistant.text += event.text
-      refreshActiveMessage()
+      scheduleRefreshActiveMessage()
       break
     case 'reasoning-delta':
       assistant.reasoning += event.text
-      refreshActiveMessage()
+      scheduleRefreshActiveMessage()
       break
     case 'tool': {
       if (event.phase === 'start') {
@@ -2048,13 +2136,13 @@ function handleEvent(conv, assistant, event, userMessage) {
           })
         }
       }
-      refreshActiveMessage()
+      scheduleRefreshActiveMessage()
       break
     }
     case 'message':
       assistant.text = event.text
       assistant.reasoning = event.reasoning || assistant.reasoning
-      refreshActiveMessage()
+      scheduleRefreshActiveMessage()
       break
     case 'file':
       if (addConversationFile(conv, event.path)) renderFileRail()
@@ -2069,7 +2157,7 @@ function handleEvent(conv, assistant, event, userMessage) {
       break
     case 'error':
       assistant.error = event.message
-      refreshActiveMessage()
+      scheduleRefreshActiveMessage()
       break
     case 'done':
       assistant.streaming = false
