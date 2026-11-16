@@ -317,3 +317,68 @@ test('单个 sink 抛错不影响其他 sink', () => {
   )
   assert.equal(good.length, 1)
 })
+
+test('steer：运行中且有订阅者时投递到 agent，并记录用户消息', () => {
+  const steered: string[] = []
+  const recorded: string[] = []
+  const ctx = { logger: { info() {}, warn() {}, debug() {}, error() {} } }
+  const sessions = { recordUser: async (_id: string, text: string) => { recorded.push(text) } }
+  const chat = new ChatManager(
+    ctx as never,
+    { llm: { provider: 'custom', model: 'test-model' } } as never,
+    sessions as never,
+  )
+  const rec = {
+    sessionId: 's1',
+    agent: {
+      steer: (message: { content: Array<{ text?: string }> }) => {
+        steered.push(message.content[0]?.text ?? '')
+      },
+    },
+    sinks: new Set([() => {}]),
+    status: 'running' as const,
+    textBuf: '',
+    reasoningBuf: '',
+    pendingTools: new Map(),
+    turnText: '',
+    turnReasoning: '',
+    turnTools: [],
+    turnStartTs: 0,
+    turnUserChars: 0,
+  }
+  const live = (chat as unknown as { live: Map<string, typeof rec> }).live
+  live.set('s1', rec)
+
+  assert.deepEqual(chat.steer('s1', '改成只看现金流'), { ok: true })
+  assert.deepEqual(steered, ['改成只看现金流'])
+  assert.deepEqual(recorded, ['改成只看现金流'])
+  assert.equal(rec.turnUserChars, 7)
+})
+
+test('steer：空闲、无订阅者或会话不存在时拒绝', () => {
+  const ctx = { logger: { info() {}, warn() {}, debug() {}, error() {} } }
+  const sessions = { recordUser: async () => {} }
+  const chat = new ChatManager(ctx as never, { llm: { provider: 'custom', model: 'm' } } as never, sessions as never)
+  const rec = {
+    sessionId: 's1',
+    agent: { steer: () => { throw new Error('should not be called') } },
+    sinks: new Set([() => {}]),
+    status: 'idle' as const,
+    textBuf: '',
+    reasoningBuf: '',
+    pendingTools: new Map(),
+    turnText: '',
+    turnReasoning: '',
+    turnTools: [],
+    turnStartTs: 0,
+    turnUserChars: 0,
+  }
+  const live = (chat as unknown as { live: Map<string, typeof rec> }).live
+  live.set('s1', rec)
+
+  assert.equal(chat.steer('s1', 'x').ok, false)
+  rec.status = 'running' as never
+  rec.sinks.clear()
+  assert.equal(chat.steer('s1', 'x').ok, false)
+  assert.equal(chat.steer('missing', 'x').ok, false)
+})

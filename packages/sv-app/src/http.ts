@@ -454,6 +454,27 @@ export function registerSvRoutes(
       return
     }
 
+    // POST /sv/api/chat/steer —— 在正在生成的回答中插入一条用户消息
+    if (req.method === 'POST' && path === '/sv/api/chat/steer') {
+      try {
+        const body = await readJson(req)
+        const sessionId = body.sessionId
+        if (typeof sessionId !== 'string' || sessionId.length === 0) throw new Error('sessionId 不能为空')
+        const text = body.text
+        if (typeof text !== 'string' || text.trim().length === 0) throw new Error('text 不能为空')
+        if (text.length > 100_000) throw new Error('text 过长')
+        const result = chat.steer(sessionId, text)
+        if (!result.ok) {
+          sendJson(res, 409, { error: result.error })
+          return
+        }
+        sendJson(res, 200, { steered: true })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
     // POST /sv/api/test —— 连通性测试
     if (req.method === 'POST' && path === '/sv/api/test') {
       try {

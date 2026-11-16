@@ -441,6 +441,31 @@ export class ChatManager {
   }
 
   /**
+   * 在一轮正在生成的回答中插入一条用户消息（steer）。
+   * 消息在 agent 的下一个 step 边界被消费，不中止当前轮次；
+   * 空闲或没有 SSE 订阅者时拒绝，避免消息在无人接收时开启新轮。
+   */
+  steer(sessionId: string, text: string): { ok: true } | { ok: false; error: string } {
+    const rec = this.live.get(sessionId)
+    if (rec === undefined) return { ok: false, error: '会话不存在或已结束' }
+    if (rec.status !== 'running' || rec.sinks.size === 0) {
+      return { ok: false, error: '当前没有正在生成的回答' }
+    }
+    try {
+      rec.agent.steer(createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'user' },
+      }))
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+    this.latestUser.set(sessionId, text)
+    rec.turnUserChars += text.length
+    void this.sessions.recordUser(sessionId, text).catch(() => {})
+    return { ok: true }
+  }
+
+  /**
    * 发送一条用户消息并流式产出事件，直到 agent 空闲。
    * @param requested - 客户端持有的会话 id（可空）。
    * @param text - 用户输入文本；图片消息可以为空串。

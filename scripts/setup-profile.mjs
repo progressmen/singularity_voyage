@@ -11,7 +11,7 @@
  * 重复运行是安全的：manifest 会被重写为确定内容。
  */
 import { spawnSync } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -696,6 +696,288 @@ const COMPUTER_USE_PATCHES = [
       '}',
     ],
   },
+  // ── 点击 suspected_noop 自动前台重试 ───────────────────────────────
+  {
+    label: '点击 suspected_noop 自动前台重试',
+    file: 'lib/human.js',
+    replaceFile: 'human-click-escalate.txt',
+    marker: 'escalateNoopClick',
+    before: [
+      '    if (fromZoom) payload.from_zoom = true',
+      '  }',
+      "  const value = await cuaCall('click', payload)",
+      '  return value',
+      '}',
+    ],
+  },
+  {
+    label: '点击结果清理内部字段并生成 noop 提示',
+    file: 'lib/actions.js',
+    before: [
+      '  const value = await humanClick({ ...target, ...extra })',
+      '  const refusal = engineRefusal(value)',
+      '  if (refusal) return { ok: false, result: `${label} 被引擎拒绝：${refusal}` }',
+      "  const detail = typeof value === 'string' ? value : JSON.stringify(value)",
+    ],
+    after: [
+      '  const value = await humanClick({ ...target, ...extra })',
+      '  const refusal = engineRefusal(value)',
+      '  if (refusal) return { ok: false, result: `${label} 被引擎拒绝：${refusal}` }',
+      "  const stillNoop = Boolean(value && typeof value === 'object' && value.effect === 'suspected_noop')",
+      "  const escalated = Boolean(value && typeof value === 'object' && (value.sv_escalated === true || value.sv_escalation_error !== undefined))",
+      "  if (value && typeof value === 'object') {",
+      '    delete value.sv_escalated',
+      '    delete value.sv_escalation_error',
+      '    if (stillNoop) {',
+      '      delete value.hint',
+      '      delete value.escalation',
+      '    }',
+      '  }',
+      "  const detail = typeof value === 'string' ? value : JSON.stringify(value)",
+      '  const noopNote = stillNoop',
+      '    ? `\\n注意：${escalated ? \'已自动前台重试，但引擎仍无法确认点击生效\' : \'引擎报告点击可能没生效\'}；不要重复同一坐标，请重新 screen_observe 或改用键盘输入。`',
+      "    : ''",
+    ],
+  },
+  {
+    label: '点击结果附带 noop 提示',
+    file: 'lib/actions.js',
+    before: [
+      '    result: `${label} 完成（虚拟光标滑行+点击）：${detail}${windowsNote}\\n提示：界面可能已变化，下一步请重新 screen_observe（可传 window=标题 定位新窗口），不要复用旧元素编号。`,',
+    ],
+    after: [
+      '    result: `${label} 完成（虚拟光标滑行+点击）：${detail}${noopNote}${windowsNote}\\n提示：界面可能已变化，下一步请重新 screen_observe（可传 window=标题 定位新窗口），不要复用旧元素编号。`,',
+    ],
+  },
+  {
+    label: '输入文本含换行时提示单独回车',
+    file: 'lib/actions.js',
+    before: [
+      '  return { ok: true, result: `输入完成：${detail}` }',
+    ],
+    after: [
+      "  const newlineNote = String(args.text).includes('\\n')",
+      "    ? '\\n提示：输入文本包含换行，可能提前触发提交/搜索；提交请单独使用 computer_key(key=\"return\")。'",
+      "    : ''",
+      '  return { ok: true, result: `输入完成：${detail}${newlineNote}` }',
+    ],
+  },
+  {
+    label: 'cmd+t / cmd+l 后提示直接输入地址',
+    file: 'lib/actions.js',
+    before: [
+      '  return { ok: true, result: `按键完成 (${String(args.key)})：${detail}` }',
+    ],
+    after: [
+      '  const snap = getSnapshot()',
+      "  const isBrowser = /edge|chrome|safari|firefox|arc|brave|opera/i.test(snap?.appName || '')",
+      "  const keyCombo = String(args.key).toLowerCase().replace(/\\s+/g, '')",
+      '  const focusNote = isBrowser && /^(cmd|command|ctrl)\\+(t|l)$/.test(keyCombo)',
+      '    ? \'\\n提示：地址栏已聚焦，直接 computer_type 输入完整 https:// URL，再 computer_key(key="return") 提交；不要点击地址栏。\'',
+      "    : ''",
+      "  const axEmptyNow = (snap?.elementCount ?? 0) === 0 || snap?.entries?.size === 0 || snap?.mode === 'native'",
+      "  const electronNote = axEmptyNow && /^(cmd|command|ctrl)\\+(f|k)$/.test(keyCombo)",
+      '    ? \'\\n提示：当前应用 AX 树为空（Electron/Canvas），快捷键只打开面板；请点击搜索框/输入框后再 computer_type。\'',
+      "    : ''",
+      '  return { ok: true, result: `按键完成 (${String(args.key)})：${detail}${focusNote}${electronNote}` }',
+    ],
+  },
+  // ── app_launch 默认前置 ───────────────────────────────────────────
+  {
+    label: '应用前置模块',
+    file: 'lib/app-front.js',
+    contentFile: 'lib-app-front.js',
+  },
+  {
+    label: 'app_launch 引入可靠前置',
+    file: 'lib/actions.js',
+    marker: "from './app-front.js'",
+    before: ["import { focusWindow, humanClick, resolveClickTarget, screenPointOf, windowLocalOf } from './human.js'"],
+    after: [
+      "import { focusWindow, humanClick, resolveClickTarget, screenPointOf, windowLocalOf } from './human.js'",
+      "import { frontAppWindows } from './app-front.js'",
+    ],
+  },
+  {
+    label: 'app_launch 默认前置',
+    file: 'lib/actions.js',
+    replaceFile: 'app-launch-front.js',
+    marker: 'frontAppWindows(pid)',
+    before: [
+      '  // 若请求前置，找 pid 并 bring_to_front',
+      '  let pid = launched?.pid ?? null',
+      "  let frontNote = ''",
+      '  if (args.bring_to_front && pid) {',
+      '    try {',
+      "      const listed = await cuaCall('list_windows', { on_screen_only: false })",
+      '      const windows = Array.isArray(listed) ? listed : (listed?.windows || [])',
+      '      const areaOf = (w) => (w.bounds?.width ?? 0) * (w.bounds?.height ?? 0)',
+      '      const mine = windows',
+      '        .filter((w) => Number(w.pid) === Number(pid))',
+      '        .sort((a, b) => (Number(b.on_current_space !== false) - Number(a.on_current_space !== false))',
+      '          || (Number(b.is_on_screen !== false) - Number(a.is_on_screen !== false))',
+      '          || (areaOf(b) - areaOf(a)))',
+      '      if (mine.length > 0) {',
+      "        await cuaCall('bring_to_front', { pid, window_id: mine[0].window_id })",
+      '        frontNote = ` 已前置 window_id=${mine[0].window_id}`',
+      '      } else {',
+      "        await cuaCall('bring_to_front', { pid })",
+      "        frontNote = ' 已尝试前置（未找到窗口列表）'",
+      '      }',
+      '    } catch (err) {',
+      '      frontNote = ` 前置失败：${err instanceof Error ? err.message : String(err)}`',
+      '    }',
+      '  }',
+    ],
+  },
+  {
+    label: 'app_launch 描述默认前置',
+    file: 'index.js',
+    before: [
+      "    description: '启动或前置应用（默认后台启动、不抢焦点；需要立刻看到窗口时传 bring_to_front: true）。打开应用的唯一正确方式——不要用终端 open / osascript / cliclick。',",
+    ],
+    after: [
+      "    description: '启动或前置应用（默认前置到前台；只有明确要求后台启动时才传 bring_to_front: false）。打开应用的唯一正确方式——不要用终端 open / osascript / cliclick。',",
+    ],
+  },
+  {
+    label: 'bring_to_front 参数默认 true',
+    file: 'index.js',
+    before: [
+      "        description: '可选：启动后是否前置到前台（默认 false，后台启动）。',",
+    ],
+    after: [
+      "        description: '可选：启动后是否前置到前台（默认 true；明确要求后台启动时传 false）。',",
+      '        default: true,',
+    ],
+  },
+  {
+    label: 'app_launch 注释补默认前置',
+    file: 'lib/actions.js',
+    before: ['/** app_launch —— 启动应用（后台），可选前置 */'],
+    after: ['/** app_launch —— 启动应用并默认前置；显式 bring_to_front: false 时只启动 */'],
+  },
+  {
+    label: 'Electron 输入使用前台投递',
+    file: 'lib/actions.js',
+    before: [
+      '  } else {',
+      '    // 即使输入当前焦点，也必须绑定到新鲜观察快照的窗口，禁止盲发到 desktop scope。',
+      '    const { pid, windowId } = resolve(cfg.ttlMs)',
+      '    payload.pid = pid',
+      '    payload.window_id = windowId',
+      '  }',
+      "  const value = normalizeMcp(await call('type_text', payload))",
+    ],
+    after: [
+      '  } else {',
+      '    // 即使输入当前焦点，也必须绑定到新鲜观察快照的窗口，禁止盲发到 desktop scope。',
+      '    const { pid, windowId } = resolve(cfg.ttlMs)',
+      '    payload.pid = pid',
+      '    payload.window_id = windowId',
+      '  }',
+      '  // Electron/Canvas 的后台按键不会把焦点放进输入框：AX 树为空时直接前台投递。',
+      '  const snapNow = getSnapshot()',
+      '  const axEmpty = (snapNow?.elementCount ?? 0) === 0 || snapNow?.entries?.size === 0 || snapNow?.mode === \'native\'',
+      '  if (payload.element_token === undefined && (axEmpty || snapNow?.onCurrentSpace === false)) {',
+      "    payload.delivery_mode = 'foreground'",
+      '  }',
+      "  const value = normalizeMcp(await call('type_text', payload))",
+    ],
+  },
+  {
+    label: 'Electron 快捷键使用前台投递',
+    file: 'lib/actions.js',
+    before: [
+      '  const payload = withSession(isCombo',
+      '    ? { keys: [...modifiers, keyName], ...target }',
+      '    : { key: keyName, ...target })',
+      "  const tool = isCombo ? 'hotkey' : 'press_key'",
+      "  const value = normalizeMcp(await call(tool, payload))",
+    ],
+    after: [
+      '  const payload = withSession(isCombo',
+      '    ? { keys: [...modifiers, keyName], ...target }',
+      '    : { key: keyName, ...target })',
+      "  const tool = isCombo ? 'hotkey' : 'press_key'",
+      '  // Electron/Canvas 的后台组合键可能落不到目标；AX 树为空时前台投递一次。',
+      '  const snapNow = getSnapshot()',
+      '  const axEmpty = (snapNow?.elementCount ?? 0) === 0 || snapNow?.entries?.size === 0 || snapNow?.mode === \'native\'',
+      '  if (isCombo && (axEmpty || snapNow?.onCurrentSpace === false)) {',
+      "    payload.delivery_mode = 'foreground'",
+      '  }',
+      "  const value = normalizeMcp(await call(tool, payload))",
+    ],
+  },
+  {
+    label: '光标滑行同步高层光标',
+    file: 'lib/human.js',
+    before: [
+      '    await tryMove(withSession({ x, y, ...opts }))',
+      '    await new Promise((r) => setTimeout(r, GLIDE_STEP_MS))',
+      '  }',
+      '  await tryMove(withSession({ x: tx, y: ty, ...opts }))',
+      '}',
+    ],
+    after: [
+      '    await tryMove(withSession({ x, y, ...opts }))',
+      '    if (!opts.target) cursorMove(x, y)',
+      '    await new Promise((r) => setTimeout(r, GLIDE_STEP_MS))',
+      '  }',
+      '  await tryMove(withSession({ x: tx, y: ty, ...opts }))',
+      '  if (!opts.target) cursorMove(tx, ty)',
+      '}',
+    ],
+  },
+  {
+    label: '引入高层光标模块',
+    file: 'lib/human.js',
+    marker: "from './sv-hud.js'",
+    before: ["import { getSnapshot } from './snapshot.js'"],
+    after: [
+      "import { getSnapshot } from './snapshot.js'",
+      "import { cursorMove, cursorClick } from './sv-hud.js'",
+    ],
+  },
+  // ── 屏幕 HUD：显示当前动作与最近操作日志 ───────────────────────────
+  {
+    label: '屏幕 HUD 状态桥',
+    file: 'lib/sv-hud.js',
+    contentFile: 'lib-hud.js',
+  },
+  {
+    label: '屏幕 HUD 宿主',
+    file: 'lib/sv-hud.swift',
+    contentFile: 'lib-hud.swift',
+  },
+  {
+    label: '引入屏幕 HUD',
+    file: 'index.js',
+    marker: 'import { hudStart, hudEnd }',
+    before: ["import { cuaCall, CUA_SESSION } from './lib/cua.js'"],
+    after: [
+      "import { cuaCall, CUA_SESSION } from './lib/cua.js'",
+      "import { hudStart, hudEnd } from './lib/sv-hud.js'",
+    ],
+  },
+  {
+    label: '工具动作写入屏幕 HUD',
+    file: 'index.js',
+    replaceFile: 'index-wrap-hud.js',
+    marker: 'hudStart(toolName, args)',
+    before: [
+      '  /** 统一包装：先过安全护栏，再执行实现（exec 透传给需要 route 的实现）。 */',
+      '  const wrap = (toolName, impl) => async (args, exec) => {',
+      '    try {',
+      '      const g = await guard(ctx, cfg, toolName, args, exec)',
+      '      if (!g.ok) return { ok: false, result: `✗ ${g.reason}` }',
+      '      return await impl(args, cfg, exec)',
+      '    } catch (err) {',
+      '      return { ok: false, result: `✗ ${err.message}` }',
+      '    }',
+      '  }',
+    ],
+  },
 ]
 
 async function patchComputerUse(targetRoot = join(profileDir, 'node_modules', 'dsh-computer-use')) {
@@ -818,8 +1100,38 @@ async function patchComputerUse(targetRoot = join(profileDir, 'node_modules', 'd
   }
 }
 
+/**
+ * 预编译 macOS 屏幕 HUD。失败不影响主流程，运行时会尝试后台编译。
+ */
+async function buildComputerHud() {
+  if (process.platform !== 'darwin') return
+  const source = join(profileDir, 'node_modules', 'dsh-computer-use', 'lib', 'sv-hud.swift')
+  const outDir = join(dshHome, 'sv', 'computer-use')
+  const binary = join(outDir, 'sv-computer-hud')
+  try {
+    const sourceStat = await stat(source)
+    const binaryStat = await stat(binary).catch(() => null)
+    if (binaryStat !== null && binaryStat.mtimeMs >= sourceStat.mtimeMs) {
+      console.log(`[sv] Computer Use HUD 已就绪: ${binary}`)
+      return
+    }
+    await mkdir(outDir, { recursive: true })
+    console.log('[sv] 编译 Computer Use HUD…')
+    const result = spawnSync('swiftc', ['-O', '-o', binary, source], { stdio: 'inherit', timeout: 120000 })
+    if (result.status !== 0) {
+      console.warn('[sv] HUD 编译失败；首次操作时会尝试后台编译。')
+      return
+    }
+    console.log(`[sv] Computer Use HUD: ${binary}`)
+  } catch (error) {
+    console.warn(`[sv] 跳过 HUD 编译：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 await patchComputerUse(patchOnlyRoot || undefined)
 if (patchOnlyRoot) process.exit(0)
+
+await buildComputerHud()
 
 const dshSrc = process.env.DSH_SRC ?? process.env.SV_DSH_SRC ?? join(repoRoot, '..', 'deepseek-harness')
 console.log('')

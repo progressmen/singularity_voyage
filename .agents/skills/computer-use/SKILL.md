@@ -17,13 +17,17 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 
 观察 → 校准 → 操作 → 再观察。
 
-1. `app_list` 找到目标应用；`app_launch` 启动或前置（需要立刻看到窗口时传 `bring_to_front: true`）。
+1. `app_list` 找到目标应用；`app_launch` 启动并默认前置到前台（只有明确要求后台启动时才传 `bring_to_front: false`）。
 2. `screen_observe` 取得窗口快照与元素树（默认 `ax`，零图片 token）。
 3. `computer_aim` 把虚拟光标移到目标，返回含光标的局部截图；确认光标压在目标上。
 4. 用 `computer_click(element=编号)` 或 `computer_click(screen_x=, screen_y=)` 操作。
 5. 操作后重新 `screen_observe` 验证结果；窗口/页面变化后必须重新观察。
 
 不要盲操作：没有新鲜快照的动作会被拒绝；快照约 45 秒过期，过期后重新观察。
+
+> 平台：`app_list` / `app_launch` 本身跨平台（底层走 cua-driver 的 `list_apps` / `launch_app`），不是 macOS 专属。但本 skill 的窗口、Space、坐标换算与 HUD 流程以 macOS 验证为准；Windows/Linux 请用 `app_launch(name=...)`，不要用 `bundle_id`，且应用前置与窗口识别尚未验收。
+>
+> macOS 光标：默认使用自建高层光标（显示在普通窗口、微信搜索弹窗和 Dock 之上，鼠标事件穿透）；`SV_CUSTOM_CURSOR=0` 可关闭并回退 cua-driver 自带光标。
 
 ## 快速路径：聊天 / 消息类
 
@@ -33,18 +37,29 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
    - 用户的限定词（公司 / 外部 / 个人）优先于记忆里的默认偏好；
    - 限定词只匹配一个结果就直接选；
    - 仍有两个候选，或选中的是「自己」（输入框提示“给自己发消息”），**先问一句再发送**。
-4. 进入会话 → 点击输入框 → 输入/粘贴 → `return` 发送。
-5. 发送后观察消息气泡或输入框清空，确认成功；不要只凭“按了 Enter”就结束。
+4. 进入会话 → 点击输入框 → 输入/粘贴 → **优先 `computer_key(key="return")` 发送**；只有应用明确不支持回车发送时，才用 `cmd+return` / `ctrl+return`，最后才点击发送按钮。
+5. 发送后观察消息气泡或输入框清空，确认成功；不要只凭“按了 Enter”就结束，也不要重复按 Enter 或反复点击发送。
+
+## 快速路径：浏览器打开网址
+
+1. `app_list` 找到浏览器；`app_launch(name=<列表中的精确名称>)` 启动并默认前置。
+2. 新标签页用 `computer_key(key="cmd+t")`：光标会自动落在地址栏。已有标签页用 `computer_key(key="cmd+l")` 聚焦地址栏。
+3. **不要再点击地址栏**，直接 `computer_type(text="https://...")`。网址始终带完整 `https://`，避免被默认搜索引擎当成关键词。
+4. 文本里不要带 `\n`；输入完单独 `computer_key(key="return")` 提交。
+5. 提交后再 `screen_observe` 验证页面标题。若地址被当成搜索词：检查是否缺少 `https://` 或输入到了页面搜索框，修正后重试一次，不要反复点击/输入地址栏。
 
 ## macOS：应用启动与窗口状态
 
 先确认平台：`uname -s` 输出 `Darwin` 即 macOS。只通过 `app_list` / `app_launch` 启动应用，不用 `open -a` / `osascript` / `cliclick`。
 
+- `app_list` 里已经有目标应用时，`app_launch` 直接使用列表中的精确名称（如 `Lark`），默认会前置；不要先猜 bundle id 或中文名。名称失败再试 bundle id，最多两次。
+- 窗口标题以 `screen_observe` 输出的「应用 · 标题」为准，进程名不一定等于窗口标题（例如进程 `Lark`，窗口标题是「飞书」）。找不到窗口时，直接从错误里列出的候选复制标题或 `window_id`，不要再猜。
+
 ### 1. 应用未打开
 
-`app_list` 里没有目标应用 → `app_launch(name=显示名, bring_to_front=true)`。
+`app_list` 里没有目标应用 → `app_launch(name=显示名)`（默认前置）。
 
-中文名失败（`APP_NOT_INSTALLED`）时，换英文名或 bundle id 再试一次；例如飞书 → `Lark` / `com.bytedance.lark`。仍失败进入「未找到」。
+应用未运行时：先用常见显示名尝试 `app_launch`；失败再试英文名或 bundle id，最多两次；例如飞书 → `Lark` / `com.bytedance.lark`。仍失败进入「未找到」。
 
 ### 2. 应用未找到
 
@@ -60,7 +75,7 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 
 识别：`screen_observe` 返回 `on_current_space=true` 但 `is_on_screen=false`。
 
-- 先 `app_launch(name/bundle_id, bring_to_front=true)` 一次；
+- 先 `app_launch(name/bundle_id)` 一次（默认前置）；
 - 仍失败 → 用主窗口 `window_id` 再 `screen_observe`（会自动前置）；
 - 仍失败就请用户在 Dock 点一下或取消最小化；不要用 `osascript` / 原始 `cua-driver call` 绕过。
 
@@ -98,6 +113,7 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 | 点击 | `computer_click(element= / screen_x=, screen_y= / from_zoom=true, x=, y=)` |
 | 双击 / 右键 | `computer_double_click` / `computer_right_click` |
 | 输入 / 按键 | `computer_type(element=, text=)` / `computer_key(key=)` |
+| 发送 / 提交 | 优先 `computer_key(key="return")`；不支持回车时用 `cmd+return` / `ctrl+return`，最后才点发送按钮 |
 | 滚动 / 拖拽 / 等待 | `computer_scroll` / `computer_drag` / `computer_wait` |
 
 参数细节以工具描述为准；本 skill 只讲流程与取舍。
@@ -119,6 +135,11 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 ## 输入与快捷键
 
 - 先点击/聚焦输入控件，再 `computer_type`；自绘界面没有文本控件时用 `computer_key` 输入数字/短文本。
+- Electron/Canvas 界面（AX 树为空，如微信、飞书）：后台按键不会把焦点放进输入框；**先点击目标输入框，再 `computer_type`**。快捷键只负责打开面板，不代表输入框已聚焦。
+- 快捷键优先于点击：新标签 `cmd+t`、地址栏 `cmd+l`、应用内搜索 `cmd+k`/`cmd+f`、关闭 `cmd+w`。原生应用/浏览器里这些快捷键会自动聚焦，不要再点击对应控件；微信/飞书等 Electron 应用例外，需点击输入框（见上一条）。
+- `computer_type` 的文本不要包含 `\n`；需要提交时单独 `computer_key(key="return")`，避免提前触发搜索/发送。
+- 发送/提交优先用键盘：输入完成后先 `computer_key(key="return")`；回车只会换行时，用 `cmd+return` / `ctrl+return`，最后才点击发送按钮。不要先去点发送按钮。
+- 发送后只验证一次：输入框清空或消息气泡出现即视为成功；不要重复按 Enter，也不要再点发送按钮。
 - 快捷键用 `computer_key`，如 `return`、`tab`、`escape`、`cmd+a`、`cmd+v`。
 - 输入框已有旧内容：先 `cmd+a` 全选并确认高亮，再粘贴/输入，避免新旧叠加。
 - 剪贴板粘贴失败或被沙箱拒绝时，回退 `computer_type(element=, text=)`。
@@ -134,6 +155,7 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 ## 失败止损
 
 - 同一工具、同一错误连续失败 2 次就停下：说明卡在哪（窗口不在当前桌面 / 缺少输入控件 / 元素不在快照里），并告诉用户需要他做什么。
+- 点击结果出现 `effect:"suspected_noop"`：插件已自动升级为前台点击一次；若仍提示 noop，不要重复同一坐标，改用 `computer_type` / `computer_key`（会先前置窗口）或重新 `screen_observe` 后换 element 编号。禁止连续 3 次以上点同一位置。
 - 点击后界面无变化或跳到别的标签页：视为没点中，重新 `computer_aim` 定位，**不要重复点同一坐标**。
 - 连续两次点不中就停下来，请用户手动点一下并说明卡点。
 - 快照过期、元素编号失效、弹窗出现：重新 `screen_observe`，不要复用旧编号。
@@ -148,6 +170,7 @@ description: 使用 app_list / app_launch / screen_observe / screen_zoom / compu
 | 键盘/输入被拒绝 | 目标窗口不在当前桌面或无法前置；换当前桌面窗口 |
 | `screenshot_context_missing` | 先 `screen_observe` 建立快照，再 `screen_zoom` / 坐标点击 |
 | 元素编号无效 | 快照过期或界面已变化；重新观察 |
+| `effect:"suspected_noop"` | 已自动前台重试一次；仍 noop 时不要重复同一坐标，改用键盘输入或重新观察 |
 | 点击无变化 | 重新 aim 校准；两次失败停下来问用户 |
 
 ## 与任务 skill 的关系

@@ -1,0 +1,60 @@
+/*
+ * 补丁片段，不是独立模块。
+ * setup-profile.mjs 会把它替换进 dsh-computer-use/lib/human.js 的 humanClick 内部，
+ * 因此单独打开时 snap / payload / fromZoom 等变量显示未定义属于预期。
+ * 校验请运行：node --check .dsh/profiles/sv/node_modules/dsh-computer-use/lib/human.js
+ */
+    if (fromZoom) payload.from_zoom = true
+  }
+  // AX 树为空（或无法建立元素树）的 Electron/Canvas 界面，background 像素点击常被引擎判定
+  // suspected_noop；直接前台投递，避免用户看到同一次操作点两遍。
+  const axEmpty = (snap?.elementCount ?? 0) === 0 || snap?.entries?.size === 0 || snap?.mode === 'native'
+  if (!token && (axEmpty || snap?.onCurrentSpace === false)) {
+    payload.delivery_mode = 'foreground'
+  }
+  const screenPt = !fromZoom && sx != null && sy != null ? windowPxToScreen(sx, sy, snap) : null
+  if (screenPt) cursorMove(screenPt.x, screenPt.y)
+  const value = await cuaCall('click', payload)
+  if (screenPt) cursorClick(screenPt.x, screenPt.y)
+  // 后台点击没有效果时，按引擎建议自动升级到前台点击一次。
+  // 目标窗口在别的 Space / 被遮挡时，background 投递常返回 suspected_noop；
+  // 不自动升级的话，模型会反复点同一坐标，实际只有一次有效。
+  return await escalateNoopClick(value, payload, { pid, windowId, x, y, fromZoom })
+}
+
+/** 引擎是否报告“点击可能没生效”。 */
+function isSuspectedNoop(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && (value.effect === 'suspected_noop' || value.escalation?.reason === 'suspected_noop'),
+  )
+}
+
+/**
+ * 第一次点击被判定为 suspected_noop 时，用 foreground 投递重试一次。
+ * foreground 由引擎短暂前置窗口、点击后恢复原前台应用；仍失败则原样返回。
+ * @param {unknown} first - 第一次点击结果
+ * @param {object} payload - 第一次点击的引擎参数
+ * @param {{pid:number, windowId:number, x?:number, y?:number, fromZoom?:boolean}} target
+ */
+async function escalateNoopClick(first, payload, target) {
+  if (!isSuspectedNoop(first) || target.fromZoom === true) return first
+  const retry = { ...payload, delivery_mode: 'foreground' }
+  // 元素 token 路径不能直接前台重试：退化为同坐标的像素点击。
+  if (retry.element_token !== undefined) {
+    delete retry.element_token
+    if (target.x == null || target.y == null || target.windowId == null) return first
+    retry.window_id = target.windowId
+    retry.x = target.x
+    retry.y = target.y
+  }
+  if (retry.window_id == null) return first
+  try {
+    const second = await cuaCall('click', retry)
+    if (isSuspectedNoop(second)) return { ...second, sv_escalated: true }
+    return second
+  } catch (error) {
+    return { ...first, sv_escalation_error: String(error?.message ?? error) }
+  }
+}

@@ -138,6 +138,8 @@ function selectConversation(id) {
   // 服务端索引里的会话在换浏览器/清缓存后本地没有消息副本，点开时按需补齐。
   const conv = activeConversation()
   if (conv !== null && conv.messages.length === 0) void hydrateConversation(id)
+  // 回到有排队消息的会话且当前空闲时，自动续发。
+  if (!streaming && conv !== null) drainNextSend(conv)
 }
 
 /**
@@ -554,6 +556,14 @@ async function deleteConversation(conv) {
   }
   const index = conversations.indexOf(conv)
   if (index >= 0) conversations.splice(index, 1)
+  // 会话被删除时一并清掉它的排队消息，避免留下永远发不出去的条目。
+  for (let i = queuedMessages.length - 1; i >= 0; i--) {
+    if (queuedMessages[i].conv !== conv) continue
+    for (const image of queuedMessages[i].images ?? []) {
+      if (typeof image.preview === 'string') URL.revokeObjectURL(image.preview)
+    }
+    queuedMessages.splice(i, 1)
+  }
   if (conv.id !== null && activeId === conv.id) {
     const next = conversations[0]
     activeId = next?.id ?? null
@@ -690,10 +700,23 @@ function messageNode(message) {
   const who = document.createElement('div')
   who.className = 'who'
   who.textContent = message.role === 'user' ? '你' : 'Singularity Voyage'
+  if (message.steer) {
+    const tag = document.createElement('span')
+    tag.className = 'msg-tag'
+    tag.textContent = '插话'
+    who.appendChild(tag)
+  }
   bubble.appendChild(who)
 
   const content = document.createElement('div')
   content.className = 'content'
+
+  if (message.stopped) {
+    const note = document.createElement('div')
+    note.className = 'stop-note'
+    note.textContent = '已停止生成'
+    content.appendChild(note)
+  }
 
   if (message.error) {
     const note = document.createElement('div')
@@ -853,6 +876,7 @@ function nearBottom(el, threshold = 120) {
 function renderMessages() {
   cancelScheduledRefresh()
   renderFileRail()
+  renderQueueStrip()
   const container = $('messages')
   const open = openDetails(container)
   const stick = nearBottom(container) || container.scrollTop === 0
@@ -1872,10 +1896,16 @@ function ensureConversation() {
 
 function setStreaming(value) {
   streaming = value
-  $('send').hidden = value
+  // 生成中仍保留发送按钮：点击后选择排队、插话或打断。
+  $('send').hidden = false
+  $('send').title = value ? '继续提问' : '发送'
   $('stop').hidden = !value
+  $('input').placeholder = value
+    ? '可继续输入；Enter 选择排队、插话或打断'
+    : '输入消息，Enter 发送，Shift+Enter 换行；输入 / 选择技能或工具'
   $('topbar-status').textContent = value ? '● 生成中' : ''
   $('topbar-status').className = 'topbar-status' + (value ? ' running' : '')
+  if (!value) closeSendModeMenu()
 }
 
 /** 附件引用 → 图片读取地址；刷新页面后历史消息也走这里。 */
@@ -1991,14 +2021,260 @@ async function addImageFiles(files) {
   renderImageStrip()
 }
 
+/* ── 生成中继续提问 ───────────────────────────────────── */
+
+/** 排队等待当前回答结束后发送的消息。 */
+const queuedMessages = []
+/** 当前正在流式接收的回答；无生成时为 null。 */
+let activeStream = null
+/** 打断当前生成后要立即发送的消息。 */
+let pendingInterrupt = null
+/** 发送方式菜单（排队 / 插话 / 打断）。 */
+let sendModeMenu = null
+let sendModeAnchor = null
+
+function clearComposer() {
+  const input = $('input')
+  input.value = ''
+  autosize()
+  pendingImages = []
+  renderImageStrip()
+}
+
+function renderQueueStrip() {
+  const strip = $('queue-strip')
+  strip.innerHTML = ''
+  const conv = activeConversation()
+  const items = queuedMessages.filter(item => item.conv === conv)
+  strip.hidden = items.length === 0
+  for (const item of items) {
+    const chip = document.createElement('div')
+    chip.className = 'queue-chip'
+    const label = document.createElement('span')
+    label.className = 'queue-chip-text'
+    const imageNote = item.images?.length > 0 ? ` [${item.images.length} 图]` : ''
+    label.textContent = `${item.text || '图片消息'}${imageNote}`
+    label.title = item.text
+    const meta = document.createElement('span')
+    meta.className = 'queue-chip-meta'
+    meta.textContent = '待发送'
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.title = '取消排队'
+    remove.textContent = '×'
+    remove.addEventListener('click', () => {
+      const index = queuedMessages.indexOf(item)
+      if (index >= 0) queuedMessages.splice(index, 1)
+      for (const image of item.images ?? []) {
+        if (typeof image.preview === 'string') URL.revokeObjectURL(image.preview)
+      }
+      renderQueueStrip()
+    })
+    chip.append(label, meta, remove)
+    strip.appendChild(chip)
+  }
+}
+
+function enqueueMessage(conv, text, images) {
+  queuedMessages.push({ conv, text, images })
+  renderQueueStrip()
+}
+
+/** 取当前会话的下一条待发送消息：打断优先于排队。 */
+function takeNextSend(conv) {
+  if (pendingInterrupt !== null && pendingInterrupt.conv === conv) {
+    const next = pendingInterrupt
+    pendingInterrupt = null
+    return next
+  }
+  const index = queuedMessages.findIndex(item => item.conv === conv)
+  if (index < 0) return null
+  const next = queuedMessages.splice(index, 1)[0]
+  renderQueueStrip()
+  return next
+}
+
+/** 当前生成结束后自动续发；用户切走后不抢跑，等回到该会话再发。 */
+function drainNextSend(conv) {
+  if (activeConversation() !== conv) {
+    renderQueueStrip()
+    return
+  }
+  const next = takeNextSend(conv)
+  if (next !== null) void runTurn(conv, next.text, next.images)
+}
+
+function closeSendModeMenu() {
+  if (sendModeMenu === null) return
+  sendModeMenu.remove()
+  sendModeMenu = null
+  sendModeAnchor = null
+}
+
+function openSendModeMenu() {
+  const reopen = sendModeAnchor !== $('send')
+  closeSendModeMenu()
+  if (!reopen) return
+
+  // 插话与打断只作用于当前正在生成的那个会话；切到别的会话时只能排队。
+  const sameConv = activeStream !== null && activeStream.conv === activeConversation()
+  const menu = document.createElement('div')
+  menu.className = 'conv-menu send-menu'
+  menu.setAttribute('role', 'menu')
+  const options = [
+    ['queue', '排队发送', '当前回答结束后自动发送', false],
+    [
+      'steer',
+      '中途插话',
+      !sameConv ? '另一会话正在生成' : pendingImages.length > 0 ? '插话暂不支持图片' : '立即加入当前任务，下一步生效',
+      !sameConv || pendingImages.length > 0,
+    ],
+    ['interrupt', '打断重答', sameConv ? '停止当前生成，立即回答本条' : '另一会话正在生成', !sameConv],
+  ]
+  for (const [mode, label, desc, disabled] of options) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'conv-menu-item send-menu-item'
+    button.disabled = disabled === true
+    const title = document.createElement('span')
+    title.className = 'send-menu-label'
+    title.textContent = label
+    const hint = document.createElement('span')
+    hint.className = 'send-menu-desc'
+    hint.textContent = desc
+    button.append(title, hint)
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      chooseSendMode(mode)
+    })
+    menu.appendChild(button)
+  }
+  document.body.appendChild(menu)
+
+  const rect = $('send').getBoundingClientRect()
+  const top = Math.max(8, rect.top - menu.offsetHeight - 8)
+  const left = Math.max(8, Math.min(rect.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))
+  menu.style.top = `${top}px`
+  menu.style.left = `${left}px`
+  sendModeMenu = menu
+  sendModeAnchor = $('send')
+}
+
+document.addEventListener('click', (event) => {
+  if (sendModeMenu === null) return
+  if (sendModeMenu.contains(event.target) || sendModeAnchor?.contains(event.target)) return
+  closeSendModeMenu()
+})
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeSendModeMenu()
+})
+window.addEventListener('resize', closeSendModeMenu)
+$('messages').addEventListener('scroll', closeSendModeMenu, { passive: true })
+
+function chooseSendMode(mode) {
+  const input = $('input')
+  const text = input.value.trim()
+  const images = pendingImages.slice()
+  if (!text && images.length === 0) return
+  if (mode === 'steer' && images.length > 0) {
+    showComposerError('中途插话暂不支持图片')
+    return
+  }
+  closeSendModeMenu()
+  if (mode === 'steer') {
+    void steerMessage(text)
+    return
+  }
+  clearComposer()
+  const conv = ensureConversation()
+  if (mode === 'queue') {
+    enqueueMessage(conv, text, images)
+    return
+  }
+  void interruptAndSend(conv, text, images)
+}
+
+/** 取累计文本里新一段的内容；跨段拼接符（空行）去掉。 */
+function suffixOf(full, prefix) {
+  const rest = full.slice(prefix.length)
+  return prefix.length > 0 ? rest.replace(/^\n+/, '') : rest
+}
+
+/** 把当前回答定稿，在它和后续输出之间插入用户消息并开启新回答。 */
+function splitAssistant(stream, conv, text) {
+  stream.current.streaming = false
+  conv.messages.push({ role: 'user', text, steer: true })
+  const next = { role: 'assistant', text: '', reasoning: '', tools: [], streaming: true }
+  conv.messages.push(next)
+  stream.baseText = stream.cumulativeText
+  stream.baseReasoning = stream.cumulativeReasoning
+  stream.segments.push(next)
+  stream.current = next
+  renderMessages()
+}
+
+async function steerMessage(text) {
+  const conv = activeConversation()
+  const stream = activeStream
+  if (conv === null || stream === null || stream.conv !== conv) {
+    showComposerError('当前没有正在生成的回答')
+    return
+  }
+  const sessionId = stream.sessionId ?? conv.id
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    showComposerError('会话尚未就绪，请稍后再试')
+    return
+  }
+  try {
+    await api('/sv/api/chat/steer', { method: 'POST', body: { sessionId, text } })
+    clearComposer()
+    splitAssistant(stream, conv, text)
+    conv.updatedAt = Date.now()
+    saveConversations()
+  } catch (error) {
+    showComposerError(`插话失败：${error.message ?? String(error)}`)
+  }
+}
+
+async function interruptAndSend(conv, text, images) {
+  const stream = activeStream
+  if (stream === null || stream.conv !== conv) {
+    enqueueMessage(conv, text, images)
+    return
+  }
+  stream.current.stopped = true
+  pendingInterrupt = { conv, text, images }
+  refreshActiveMessage()
+  const sessionId = stream.sessionId ?? conv.id
+  try {
+    if (typeof sessionId === 'string' && sessionId.length > 0) {
+      await api('/sv/api/stop', { method: 'POST', body: { sessionId } })
+    }
+  } catch {
+    // 停止失败时让当前轮次自然结束，finally 仍会续发
+  }
+  // 流可能在设置 pendingInterrupt 之前就已结束，这里补一次。
+  if (!streaming) {
+    const next = takeNextSend(conv)
+    if (next !== null) void runTurn(conv, next.text, next.images)
+  }
+}
+
 async function sendMessage() {
   hideSlashMenu()
   const input = $('input')
   const text = input.value.trim()
   const images = pendingImages.slice()
-  if ((!text && images.length === 0) || streaming) return
+  if (!text && images.length === 0) return
+  if (streaming) {
+    openSendModeMenu()
+    return
+  }
+  clearComposer()
+  await runTurn(ensureConversation(), text, images)
+}
 
-  const conv = ensureConversation()
+async function runTurn(conv, text, images) {
   const userMessage = {
     role: 'user',
     text,
@@ -2015,16 +2291,23 @@ async function sendMessage() {
   conv.messages.push(userMessage)
   if (conv.title === '新对话') conv.title = text ? text.slice(0, 24) : '图片消息'
   conv.updatedAt = Date.now()
-  input.value = ''
-  autosize()
-  pendingImages = []
-  renderImageStrip()
   renderMessages()
   saveConversations()
   renderSidebar()
 
   const assistant = { role: 'assistant', text: '', reasoning: '', tools: [], streaming: true }
   conv.messages.push(assistant)
+  const stream = {
+    conv,
+    sessionId: typeof conv.id === 'string' && conv.id.length > 0 ? conv.id : null,
+    current: assistant,
+    baseText: '',
+    baseReasoning: '',
+    cumulativeText: '',
+    cumulativeReasoning: '',
+    segments: [assistant],
+  }
+  activeStream = stream
   refreshActiveMessage()
   setStreaming(true)
 
@@ -2069,30 +2352,39 @@ async function sendMessage() {
           } catch {
             continue
           }
-          handleEvent(conv, assistant, event, userMessage)
+          handleEvent(conv, stream, event, userMessage)
           if (event.type === 'done') done = true
         }
       }
     }
   } catch (error) {
-    assistant.error = assistant.error ?? `连接失败：${error.message ?? String(error)}`
+    stream.current.error = stream.current.error ?? `连接失败：${error.message ?? String(error)}`
   } finally {
-    assistant.streaming = false
+    for (const segment of stream.segments) segment.streaming = false
+    if (activeStream === stream) activeStream = null
     // 兜底：正文里以链接/绝对路径提到的产出文件也补进右侧列表
-    for (const path of extractFilePaths(assistant.text ?? '')) addConversationFile(conv, path, false)
+    for (const segment of stream.segments) {
+      for (const path of extractFilePaths(segment.text ?? '')) addConversationFile(conv, path, false)
+    }
     conv.updatedAt = Date.now()
     conversations.sort((a, b) => b.updatedAt - a.updatedAt)
     saveConversations()
     renderSidebar()
     renderMessages()
     setStreaming(false)
-    input.focus()
+    drainNextSend(conv)
+    // 当前流属于别的会话时，用户正停留的会话如果有排队消息，也在这里续发。
+    const active = activeConversation()
+    if (activeStream === null && active !== null && active !== conv) drainNextSend(active)
+    $('input').focus()
   }
 }
 
-function handleEvent(conv, assistant, event, userMessage) {
+function handleEvent(conv, stream, event, userMessage) {
+  const assistant = stream.current
   switch (event.type) {
     case 'session':
+      stream.sessionId = event.sessionId
       if (conv.id !== event.sessionId) {
         conv.id = event.sessionId
         activeId = event.sessionId
@@ -2110,10 +2402,12 @@ function handleEvent(conv, assistant, event, userMessage) {
       }
       break
     case 'text-delta':
+      stream.cumulativeText += event.text
       assistant.text += event.text
       scheduleRefreshActiveMessage()
       break
     case 'reasoning-delta':
+      stream.cumulativeReasoning += event.text
       assistant.reasoning += event.text
       scheduleRefreshActiveMessage()
       break
@@ -2139,11 +2433,21 @@ function handleEvent(conv, assistant, event, userMessage) {
       scheduleRefreshActiveMessage()
       break
     }
-    case 'message':
-      assistant.text = event.text
-      assistant.reasoning = event.reasoning || assistant.reasoning
+    case 'message': {
+      // 服务端给的是整轮累计文本；插话分段后用前缀差量还原当前段。
+      const text = typeof event.text === 'string' ? event.text : ''
+      stream.cumulativeText = text
+      assistant.text = text.startsWith(stream.baseText)
+        ? suffixOf(text, stream.baseText)
+        : text
+      const reasoning = typeof event.reasoning === 'string' ? event.reasoning : ''
+      stream.cumulativeReasoning = reasoning
+      assistant.reasoning = reasoning.startsWith(stream.baseReasoning)
+        ? suffixOf(reasoning, stream.baseReasoning)
+        : reasoning
       scheduleRefreshActiveMessage()
       break
+    }
     case 'file':
       if (addConversationFile(conv, event.path)) renderFileRail()
       break
@@ -2168,6 +2472,10 @@ function handleEvent(conv, assistant, event, userMessage) {
 async function stopStreaming() {
   const conv = activeConversation()
   if (!conv || !conv.id) return
+  if (activeStream !== null && activeStream.conv === conv) {
+    activeStream.current.stopped = true
+    refreshActiveMessage()
+  }
   try {
     await api('/sv/api/stop', { method: 'POST', body: { sessionId: conv.id } })
   } catch {
