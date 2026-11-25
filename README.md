@@ -2,7 +2,7 @@
 
 以 [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/)（`dsh`）为编排内核的**个人 Agent**：记住你的偏好与进行中的事，按时提醒，把笔记、写作与信息巡检收在同一个入口。
 
-> **当前状态：M0 对话底座 + M1 个人助理（记忆 / 待办提醒）已跑通。** 自定义模型路由、Web 搜索、聊天页面与 SSE 流式对话、长期记忆与待办提醒均已实现并验证；另提供默认关闭的 **Super-agent（Router / Worker）** 并行任务能力。下一步是 M2 个人知识。路线图见[架构设计 · 里程碑](docs/architecture.md#12-里程碑)。
+> **当前状态：M0 对话底座 + M1 个人助理（记忆 / 待办提醒）已跑通；M2 的「个人知识库」、M3 的「收件箱 + 每日简报 + 自动化」与 M4 的「数据备份/恢复/清空 + 使用面板」已提前落地。** 自定义模型路由、Web 搜索、聊天页面与 SSE 流式对话、长期记忆与待办提醒均已实现并验证；另提供默认关闭的 **Super-agent（Router / Worker）** 并行任务能力。路线图见[架构设计 · 里程碑](docs/architecture.md#12-里程碑)。
 
 [整体架构](docs/architecture.md) · [上游文档](https://deepseek-harness.github.io/deepseek-harness/) · [MCP 规范](https://modelcontextprotocol.io/)
 
@@ -121,8 +121,16 @@ singularity_voyage/
 │       │   ├── memory-extractor.ts # 轮次结束后的记忆抽取与 JSON 解析
 │       │   ├── tasks-store.ts   #   待办与提醒：到期计算、重复滚动、完成/顺延（tasks.json）
 │       │   ├── reminders.ts     #   到期扫描 + 提醒事件广播（/sv/api/events）
+│       │   ├── inbox-store.ts   #   收件箱：简报/提醒/后台结果的统一落点（inbox.json）
+│       │   ├── briefing.ts      #   每日简报：事实汇总、模型生成、回落模板与邮件
+│       │   ├── knowledge-store.ts #  个人知识：切块、倒排索引、检索与来源（knowledge.json）
+│       │   ├── knowledge-source.ts # 网页抓取与 HTML → 纯文本
+│       │   ├── automation-store.ts # 自动化定义、调度时间与运行历史
+│       │   ├── automation-runtime.ts # 自动化执行器：网页变化 / 关键词 / 定时任务
+│       │   ├── automation-agent.ts # 定时任务使用的隔离 Agent
+│       │   ├── backup.ts        #   数据备份/恢复/清空与使用、健康统计
 │       │   ├── mail-notifier.ts #   邮件通道：到期提醒 + 每日待办摘要（调用 sv-mail 的 mailer.py）
-│       │   ├── tools.ts         #   memory_search/_write、task_create/_list/_complete 工具
+│       │   ├── tools.ts         #   memory / task / inbox / knowledge / automation 工具
 │       │   ├── log.ts           #   统一日志格式（[sv-app][module] event k=v ... err=）
 │       │   ├── sessions-store.ts#   会话索引 + transcript 投影（$DSH_HOME/sv/sessions.json、transcripts/）
 │       │   ├── superagent.ts    #   Super-agent 纯编排：拆解/分派/重试/超时/watchdog/汇总
@@ -200,7 +208,8 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 ├─ sessions/        # harness 写：会话 JSONL
 ├─ storages/        # harness 写：storage-domain（定时任务在 schedule.json）
 ├─ logs/            # harness 写：启动诊断（失败时才有文件）
-└─ sv/              # 本项目写：config.json / memory.json / tasks.json / mail-state.json
+└─ sv/              # 本项目写：config.json / memory.json / tasks.json / inbox.json / knowledge.json
+                    #   / automations.json / automation-runs.json / mail-state.json
                     #   / superagent-runs.json（Super-agent 运行历史）
                     #   （配了 SV_DATABASE_URL 时会话索引与 transcript 落 Postgres）
 ```
@@ -219,6 +228,111 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 - **定时任务**：与待办分工明确——待办是清单（页面勾选 + 邮件提醒），定时任务由 harness 的 `@deepseek-ai/dsh-schedule` 调度。说「10 秒后提醒我喝水」由 `schedule_create` 创建；到期后宿主把提醒投递回**创建它的会话**并触发模型继续处理。支持一次性 / 固定间隔 / 每天 / 每周 / cron（显式 IANA 时区），进程重启后仍在，周期任务只补发最近一次错过的时点。侧栏「定时任务」可查看目录并删除；宿主不提供暂停，删除即取消后续投递。模型侧工具为 `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete`，数据在 `$DSH_HOME/storages/schedule.json`。
 - **邮件提醒**：待办页顶部有快捷开关，可一键开启/关闭（未配置 SMTP 时会引导去设置）。两种提醒：**定时提醒**在任务到期时立即发一封；**超时提醒**不单独发信，逾期未完成的任务在每日摘要里单列一段，主题也会标注逾期数量。发信与模型工具 `mcp__sv-mail__send_email` 共用 [mcp/sv-mail-mcp](mcp/sv-mail-mcp) 里的 `mailer.py`，只有一套 SMTP 实现；摘要发送日期记在 `mail-state.json`，重启不会重复发。
 - 存储都在 `$DSH_HOME/sv/`（0600），与 dsh 会话日志分离：日志存原文与来源，记忆存「当前有效结论」。
+
+### 个人知识（第二大脑）
+
+侧栏新增 **知识**，把笔记、工作区文件与网页导入本地知识库：
+
+- **导入**：粘贴 Markdown / 纯文本；填工作区相对路径从文件导入；或给 http(s) URL 从网页导入（走宿主 `ctx.web.fetch`，HTML 粗转为文本）。
+- **切块**：按 Markdown 标题与空行分段，单块不超过 900 字符；标题变化时另起一块，块内保留所属标题。
+- **检索**：内存倒排索引（ASCII 词 + 中文二元组），按 IDF 与整句命中加权；结果带文档 id、块号、来源与片段。
+- **自动召回**：每轮用当前输入检索 Top 3 片段注入系统提示词，引用格式为 `[标题](sv-knowledge:<docId>)`；回答里的引用可点击，直接打开知识原文。需要更多内容时模型可调用 `knowledge_search`。
+- **引用与纠错**：知识页可搜索、查看全文分块、删除文档；删除后下一轮立即不再召回。
+- **工具**：`knowledge_search`、`knowledge_ingest`（文本或 URL）、`knowledge_list`。
+- **限制**：单篇上限 50 万字符；工作区文件超过约 1MB 或含二进制内容会被拒绝；暂不支持 PDF 直接导入（可先转成文本）。
+- **数据**：`$DSH_HOME/sv/knowledge.json`（0600，最多 200 篇），与记忆、会话日志分开。
+
+写作草稿仍走对话 + 工作区文件工具：让助手先读知识/检索结果，再生成草稿并落盘，不需要额外的编辑器。
+
+### 收件箱与每日简报
+
+侧栏新增 **收件箱**，把五类消息汇总到一个入口：
+
+- **每日简报**：每天到点生成一条，包含今日重点、昨日进展与需要关注。
+- **到期提醒**：待办到期时，除了页面弹窗与邮件，还会在收件箱留一条记录。
+- **后台回复**：页面关闭后本轮对话仍会跑完；完成时没有页面订阅，结果自动进收件箱。
+- **定时任务回复**：宿主把定时任务投递回会话、助手继续处理后产生的回复。
+- **自动化结果**：网页变化、关键词命中、定时任务完成或失败时写入。
+
+未读条目在侧栏显示红点，面板顶部显示未读数量；可展开 Markdown 正文、标记已读/未读、删除；带关联会话的条目可一键回到原会话。数据写入 `$DSH_HOME/sv/inbox.json`（0600），最多保留 500 条，超出时优先丢弃最旧的已读条目。
+
+**每日简报**默认开启，每天 `08:30`（本地时区）生成，汇总：
+
+1. **今日重点**：逾期与今天到期的待办（优先）；
+2. **昨日进展**：昨天更新过的会话标题与最后回复摘要；
+3. **需要关注**：未读收件箱与无截止时间的积压待办。
+
+模型不可用、超时或未配置密钥时，自动回落到确定性模板，保证每天都有内容；生成日期记在 `inbox.json`，进程重启不会重复生成。设置页「每日简报」可改开关、时间、是否同时发邮件（复用 SMTP），并提供「立即生成」用于验证。
+
+模型侧新增 `inbox_list` 工具；系统提示词只注入未读数量与最近 5 条标题，正文按需读取，避免每轮注入整份简报。
+
+### 自动化（网页 / 关键词 / RSS / 定时任务）
+
+侧栏 **自动化** 支持四类任务，到点由进程内调度器执行：
+
+- **网页变化（web）**：抓取指定 http(s) 页面；首次建立基线，之后内容哈希变化时给出新增 / 移除行的摘要并写入收件箱。
+- **关键词监控（keyword）**：抓取页面并检查关键词（不区分大小写）；首次命中或命中集合变化时提醒，同一命中不重复。
+- **RSS 订阅（rss）**：抓取 RSS / Atom，按 guid/link 指纹识别新条目，只提醒新增内容。
+- **定时任务（prompt）**：把一段任务描述交给隔离 Agent 执行（复用完整工具面），输出写入收件箱。
+
+调度支持固定间隔（≥1 分钟）、每天 `HH:mm`、每周「星期 + HH:mm」。进程重启后按 `nextRunAt` 补跑一次错过的任务；恢复暂停时从当前时刻重排，不补跑多次。
+
+- **全局设置**：页面可暂停全部自动化、设置静默时段（只进收件箱不发邮件）与失败重试次数（0–5）。
+- **管理**：页面可新建、立即运行、暂停/恢复、删除，并查看最近运行记录与失败原因。
+- **触达**：命中、完成与失败都写入收件箱（未读红点 + SSE 弹窗；静默时只进列表）；每个自动化可勾选额外发邮件（复用 SMTP）。
+- **工具**：`automation_create` / `automation_list` / `automation_pause` / `automation_delete`。
+- **数据**：`$DSH_HOME/sv/automations.json` 与 `automation-runs.json`（0600，最多 100 个自动化、500 条运行记录）。
+- **边界**：执行器串行运行，避免同时起多个模型调用；静态 HTML 与 RSS 可直接抓取，需要登录或 JS 渲染的页面暂不支持。
+
+### 审批中心
+
+宿主在工具需要更高权限或外部副作用时发起审批；`/sv` 把审批请求接到页面：
+
+- **一次性授权**：批准只对当前这次工具调用生效（`allowed-once`），不会形成持久白名单。
+- **页面在线才等待**：没有 `/sv` 页面连接时立即按拒绝处理（`unavailable`），避免后台任务卡住；页面全部关闭时待处理审批自动取消。
+- **超时**：默认 10 分钟未处理自动取消；请求被中止也会结束为 `cancelled`。
+- **审计**：每次审批的工具名、原因、发起会话与最终结果写入 `$DSH_HOME/sv/approvals.json`（0600，最多 500 条），审批中心可分「待处理 / 历史」查看。
+- **入口**：工具执行时如果页面在聊天视图，会弹出常驻审批卡片；侧栏「审批」显示待处理红点。
+- **API**：`GET /sv/api/approvals`、`POST /sv/api/approvals/:id/answer`、`POST /sv/api/approvals/clear`。
+
+> 审批只解决「要不要放行」，不替代沙箱本身；工作区内写入仍按 `workspace-write` 规则直接执行。
+
+### 连接器（只读）
+
+侧栏 **连接器** 把邮件、日历、Slack、Notion 与 RSS 拉取到统一事件流，供对话与后续主动层使用。当前全部是**只读**接入，不会代表用户发送或修改任何内容。
+
+| 类型 | 需要的凭据 | 说明 |
+|---|---|---|
+| ICS 日历 | 公开/私密 ICS 地址 | Google Calendar「秘密地址」、Outlook 发布日历均可；无需 OAuth |
+| RSS / Atom | Feed 地址 | 复用现有解析器，保留发布时间 |
+| Slack | User / Bot Token | 读取公开/私有频道历史；频道可用 ID 或名称，留空取前 10 个 |
+| Notion | Integration Token（可选数据库 ID/搜索词） | 搜索页面或查询数据库，读取标题与属性 |
+| Gmail | Google OAuth `clientId` / `clientSecret` / `refreshToken` | 只读邮件元数据（主题、发件人、摘要）；scope `gmail.readonly` |
+| Google Calendar | 同上 | 读取未来 30 天日程；scope `calendar.readonly` |
+| Outlook | Microsoft Graph `clientId` / `clientSecret` / `refreshToken`（可选 tenant/resource） | 读取邮件或日历；scope `Mail.Read` / `Calendars.Read` + `offline_access` |
+
+- **同步**：每个连接器可设 5 分钟–7 天的间隔与首次回溯 1–30 天；失败写入 `lastError`，不会阻塞其他连接器。
+- **事件流**：按 `connectorId + 外部 id` 去重，最多 5000 条；面板可按关键词搜索、标记已读/全部已读、清空。
+- **凭据**：只保存在本机 `$DSH_HOME/sv/connectors.json`（0600）；列表接口只返回「已配置」字段名，不返回密钥。
+- **数据**：`connectors.json` + `connector-events.json`；可单独导出/清空。
+- **限制**：暂不包含 Google Drive / OneDrive；ICS 只解析单次日程，不展开 RRULE（Google / Outlook 日历接口会展开重复日程）；OAuth 授权流程不在页面内完成，需要先在对应平台创建 OAuth 应用并取得 refresh token（Google 可用 OAuth Playground，Microsoft 用 Azure 应用注册）。拉取到的只是事件，尚未接入自动判断/提醒（下一步的主动层）。
+
+### 数据与备份（长期自用）
+
+侧栏 **数据** 展示使用与健康快照：
+
+- 会话数、累计 tokens（输入 / 输出）、记忆 / 待办 / 收件箱 / 知识 / 自动化数量；
+- 可备份数据体积、会话存储后端（本地文件 / Postgres）、进程运行时长；
+- **用量与费用**：按天柱状用量、分模型汇总、请求次数；设置单价后估算费用，并显示本月 token 与月度预算占用（单价与预算默认 0，仅本地估算，不替代供应商账单）；
+- `$DSH_HOME/sv` 下各数据文件大小，`config.json`（含密钥）与 `usage.json` 标注为「不备份」。
+
+**导出备份**：下载单个 JSON（`sv-backup-YYYY-MM-DD.json`），包含记忆、待办、收件箱、知识库、自动化与运行历史、Super-agent 历史、邮件摘要状态、会话索引与 transcripts、审批历史与连接器/事件，以及会话快照（Postgres 后端也能完整导出对话）。
+
+- **按域导出**：备份区可选择只导出某一域（记忆 / 待办 / 收件箱 / 知识 / 自动化 / 会话 / Super-agent / 审批 / 连接器），文件名带域后缀；会话域会带上完整会话快照。
+- **不包含**：`config.json`（API Key / SMTP 密码），也不包含 `.dsh/sessions` 里 dsh 原始会话日志或 Postgres 中的原始会话（会话投影以快照形式包含）。
+- **恢复备份**：校验版本、路径与 JSON 后覆盖当前产品数据，并让各 store 重新加载（含会话快照、审批审计与连接器；遗留的待处理审批会标为取消）；随后页面自动刷新。单文件上限 32MB、整包 100MB。
+- **清空数据**：可按域清空（记忆 / 待办 / 收件箱 / 知识 / 自动化 / 会话投影 / Super-agent 历史 / 审批历史 / 连接器与事件），或全部个人数据；`config.json` 与 dsh 原始会话日志不受影响。
+- **迁移**：备份包负责产品数据；换机器时还需把 `.dsh/sessions`（或 Postgres 数据库）与 `config.json` 一并迁移。
 
 ### 斜杠菜单（技能 / 工具）
 
@@ -266,6 +380,8 @@ dsh 默认使用 `~/.dsh`，本项目把它的数据目录改到仓库内的 `.d
 - **Trace 面板**：每条回答上方的工具调用步骤条。按工具名自动分类（MCP 🔎 / 联网 🌐 / 技能 📘 / 文件 📄 / 终端 ⌨ / 工具 🔧），顶部一行显示类型分布；连续同类调用自动折叠，任一失败强制展开并标红。点开任意一行可查看参数与结果摘要（分类逻辑在 [web/trace.js](packages/sv-app/web/trace.js)，双端复用并有独立测试）。
 - **会话历史**：服务端在 `$DSH_HOME/sv/` 维护轻量投影（`sessions.json` 索引 + `transcripts/<id>.jsonl`）。`GET /sv/api/sessions` 列出会话，`GET /sv/api/sessions/:id/messages` 取回历史——前端启动时若本地缺失会自动补齐，清空浏览器缓存后同一台机器上仍能找回对话。`DELETE /sv/api/sessions/:id` 删除投影（dsh 会话 JSONL 不受影响，投影可随时重建）。
 - **Token 与上下文统计**：顶栏右侧显示当前上下文占用（已用 / 窗口，带进度条与百分比）和本次会话累计输入 / 输出 tokens。数据来自适配器上报的 `usage` 分片，每轮结束写入会话索引并随 `/sv/api/sessions` 返回，重启或换浏览器后仍可看到。窗口优先取设置页填写的「上下文窗口」，未填写时按供应商预设估算（DeepSeek 1M，Qwen / OpenAI 128K，火山方舟 256K；custom 不猜，只显示占用量）。
+- **会话全文检索**：侧栏搜索框输入即查（`GET /sv/api/search?q=`），文件后端扫描本地 transcript，Postgres 后端用 `ILIKE` 粗筛后按命中次数排序；结果展示会话标题与上下文片段，点击即可跳转并按需补齐历史。
+- **编辑重发 / 重新生成**：用户消息可「编辑并重发」，助手回答可「重新生成」。两者都会保留前序消息并新建一个分支会话，把前文压成上下文（≤12k 字符）随首轮发送；原会话不被修改，便于对比不同问法。
 
 ### 日志
 
@@ -354,6 +470,12 @@ SV_MAIL_NOTIFY_ON_REMINDER=true
 SV_MAIL_DIGEST_AT=08:30
 # 邮件 MCP 服务的 Python 解释器（默认 python3）
 SV_MAIL_PYTHON=python3
+
+# 每日简报（可选；页面保存的 config.json 优先）
+# 默认开启，每天 08:30 生成；email=true 时额外发一封（需上面的 SMTP 可用）
+SV_BRIEFING_ENABLED=true
+SV_BRIEFING_AT=08:30
+SV_BRIEFING_EMAIL=false
 ```
 
 环境变量只作初始默认；页面保存的值优先生效。
@@ -525,6 +647,8 @@ export function apply(ctx: Context): void {
 | M2 第二大脑 | 个人知识导入与检索、引用、写作草稿 | 回答可点击溯源；多份笔记能合成草稿并落到工作区 |
 | M3 自动化管家 | 定时/事件任务、每日简报、监控、收件箱 | 简报与监控可触达、可暂停、可追溯 |
 | M4 一体化 | 场景共用记忆与任务、隐私导出清空、评测与成本面板 | 连续一周真实自用无漏报/骚扰；换机器可完整迁移 |
+
+> M2 的 **知识导入 / 检索 / 引用** 已提前落地；写作草稿通过对话 + 工作区文件工具完成。M3 的 **收件箱 + 每日简报 + 自动化（网页/关键词/定时任务）** 已提前落地；M3 仍缺 RSS、全局静默时段与频率上限。M4 的 **数据导出 / 恢复 / 清空 + 使用面板** 已提前落地；仍缺按日成本与预算告警、上下文压缩、记忆衰减、消息编辑/重新生成、语音与模式分级。
 
 详细拆分、数据模型与风险清单见 [docs/architecture.md](docs/architecture.md)。
 

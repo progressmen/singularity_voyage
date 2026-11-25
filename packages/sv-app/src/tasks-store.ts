@@ -265,6 +265,12 @@ export class TasksStore {
     return existed
   }
 
+  /** 清空全部待办（隐私清空与恢复用）。 */
+  async clear(): Promise<void> {
+    this.entries.clear()
+    await this.persist()
+  }
+
   /** 当前到期且尚未提醒的任务。 */
   due(now = Date.now()): TaskEntry[] {
     return [...this.entries.values()].filter(task => task.status === 'pending'

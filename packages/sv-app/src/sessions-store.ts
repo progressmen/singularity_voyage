@@ -94,6 +94,25 @@ export interface TranscriptEntry {
   tools?: TranscriptToolEntry[]
 }
 
+/** 会话全文检索命中。 */
+export interface SessionSearchHit {
+  sessionId: string
+  title: string
+  role: 'user' | 'assistant'
+  /** 命中位置附近的片段。 */
+  snippet: string
+  ts: number
+  /** 命中次数（用于排序）。 */
+  score: number
+}
+
+/** 会话投影的可移植快照（跨文件 / PostgreSQL 备份恢复）。 */
+export interface SessionBackup {
+  sessions: SessionIndexEntry[]
+  /** sessionId → 对话记录。 */
+  transcripts: Record<string, TranscriptEntry[]>
+}
+
 /** 会话投影存储（文件 / PostgreSQL 共用接口）。 */
 export interface SvSessionStore {
   /** 载入索引到内存。 */
@@ -121,6 +140,44 @@ export interface SvSessionStore {
   remove(id: string): Promise<boolean>
   /** 重命名会话；未知 id 返回 false。 */
   rename(id: string, title: string): Promise<boolean>
+  /** 清空全部会话索引与对话记录（仅投影，不改 dsh 原始会话日志）。 */
+  clear(): Promise<void>
+  /** 全文检索会话投影（标题与正文）。 */
+  search(query: string, limit?: number): Promise<SessionSearchHit[]>
+  /** 导出全部会话索引与对话记录（备份用）。 */
+  exportAll(): Promise<SessionBackup>
+  /** 用快照整体替换当前会话投影（恢复用）。 */
+  importAll(snapshot: SessionBackup): Promise<void>
+}
+
+/** 检索片段：围绕首个命中词截取窗口。 */
+export function searchSnippet(text: string, query: string, max = 160): string {
+  const lower = text.toLowerCase()
+  const index = lower.indexOf(query.toLowerCase())
+  if (index < 0) return clipSnippet(text, 0, max)
+  const from = Math.max(0, index - 60)
+  const slice = text.slice(from, from + max).trim()
+  return `${from > 0 ? '…' : ''}${slice}${from + max < text.length ? '…' : ''}`
+}
+
+function clipSnippet(text: string, from: number, max: number): string {
+  const slice = text.slice(from, from + max).trim()
+  return `${from > 0 ? '…' : ''}${slice}${from + max < text.length ? '…' : ''}`
+}
+
+/** 统计子串出现次数（大小写不敏感）。 */
+export function countOccurrences(text: string, query: string): number {
+  if (query.length === 0) return 0
+  const lower = text.toLowerCase()
+  const needle = query.toLowerCase()
+  let count = 0
+  let index = lower.indexOf(needle)
+  while (index >= 0) {
+    count += 1
+    index = lower.indexOf(needle, index + needle.length)
+    if (count >= 1000) break
+  }
+  return count
 }
 
 interface SessionsFile {
@@ -297,6 +354,92 @@ export class SessionStore implements SvSessionStore {
       // 文件删除失败不影响索引删除
     }
     return existed
+  }
+
+  /** 清空全部会话索引与 transcript；dsh 原始会话日志不受影响。 */
+  async clear(): Promise<void> {
+    this.index = new Map()
+    await this.persistIndex()
+    try {
+      await rm(this.transcriptDir(), { recursive: true, force: true })
+    } catch {
+      // transcript 目录删除失败不阻塞索引清空
+    }
+  }
+
+  /** 全文检索：标题命中加权，正文按出现次数累加。 */
+  async search(query: string, limit = 20): Promise<SessionSearchHit[]> {
+    const needle = query.trim()
+    if (needle.length === 0) return []
+    const max = Math.min(100, Math.max(1, Math.trunc(limit)))
+    const hits: SessionSearchHit[] = []
+    for (const entry of this.list()) {
+      const titleHits = countOccurrences(entry.title, needle)
+      if (titleHits > 0) {
+        hits.push({
+          sessionId: entry.id,
+          title: entry.title,
+          role: 'assistant',
+          snippet: entry.title,
+          ts: entry.updatedAt,
+          score: titleHits * 5,
+        })
+      }
+      for (const message of await this.messages(entry.id)) {
+        const count = countOccurrences(message.text, needle)
+        if (count === 0) continue
+        hits.push({
+          sessionId: entry.id,
+          title: entry.title,
+          role: message.role,
+          snippet: searchSnippet(message.text, needle),
+          ts: message.ts,
+          score: count,
+        })
+      }
+    }
+    hits.sort((a, b) => b.score - a.score || b.ts - a.ts)
+    return hits.slice(0, max)
+  }
+
+  /** 导出全部会话索引与对话记录。 */
+  async exportAll(): Promise<SessionBackup> {
+    const sessions = this.list().map(entry => ({ ...entry }))
+    const transcripts: Record<string, TranscriptEntry[]> = {}
+    for (const entry of sessions) {
+      transcripts[entry.id] = await this.messages(entry.id)
+    }
+    return { sessions, transcripts }
+  }
+
+  /** 用快照整体替换当前会话投影：索引、transcript 目录都会先清空。 */
+  async importAll(snapshot: SessionBackup): Promise<void> {
+    const next = new Map<string, SessionIndexEntry>()
+    for (const entry of snapshot.sessions ?? []) {
+      if (typeof entry?.id !== 'string' || !SESSION_ID_RE.test(entry.id)) continue
+      next.set(entry.id, {
+        id: entry.id,
+        title: typeof entry.title === 'string' && entry.title.length > 0 ? entry.title : UNTITLED,
+        createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : 0,
+        updatedAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : 0,
+        turns: typeof entry.turns === 'number' && entry.turns >= 0 ? entry.turns : 0,
+        ...normalizeUsage(entry.usage) === undefined ? {} : { usage: normalizeUsage(entry.usage)! },
+      })
+    }
+    this.index = next
+    await this.persistIndex()
+    await rm(this.transcriptDir(), { recursive: true, force: true })
+    await mkdir(this.transcriptDir(), { recursive: true })
+    for (const [id, entries] of Object.entries(snapshot.transcripts ?? {})) {
+      if (!SESSION_ID_RE.test(id) || !Array.isArray(entries)) continue
+      const lines = entries
+        .filter(entry => entry !== null && typeof entry === 'object'
+          && (entry.role === 'user' || entry.role === 'assistant')
+          && typeof entry.text === 'string')
+        .map(entry => JSON.stringify(entry))
+      if (lines.length === 0) continue
+      await writeFile(this.transcriptFile(id), `${lines.join('\n')}\n`, { mode: 0o600 })
+    }
   }
 
   /** 串行化所有写操作，避免并发读-改-写交错。 */

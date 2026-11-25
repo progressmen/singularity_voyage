@@ -13,7 +13,38 @@ import type { EncodedImageAttachment, ImageAttachmentRef, ImageMediaType } from 
 import type {} from '@deepseek-ai/dsh-schedule'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { ChatManager, SvChatEvent } from './chat.ts'
+import type { ApprovalCenter } from './approval-center.ts'
+import type { AutomationService } from './automation-runtime.ts'
+import { previewConnector } from './connector-adapters.ts'
+import { CONNECTOR_KINDS, connectorView, type ConnectorKind, type ConnectorStore } from './connector-store.ts'
+import type { ConnectorService } from './connector-runtime.ts'
+import {
+  AUTOMATION_KINDS,
+  AUTOMATION_SCHEDULE_KINDS,
+  automationView,
+  type AutomationSchedule,
+  type AutomationStore,
+} from './automation-store.ts'
+import {
+  clearData,
+  createBackup,
+  dataStatus,
+  DATA_DOMAINS,
+  restoreBackup,
+  type BackupStores,
+  type DataDomain,
+} from './backup.ts'
+import type { BriefingService } from './briefing.ts'
 import type { ConfigStore } from './config-store.ts'
+import { INBOX_KINDS, inboxView, type InboxKind, type InboxStore } from './inbox-store.ts'
+import {
+  defaultKnowledgeTitle,
+  knowledgeDocSummary,
+  knowledgeDocView,
+  MAX_KNOWLEDGE_DOC_CHARS,
+  type KnowledgeStore,
+} from './knowledge-store.ts'
+import { fetchUrlPage } from './knowledge-source.ts'
 import { MEMORY_KINDS, memoryView, type MemoryKind, type MemoryPatch, type MemoryStore } from './memory-store.ts'
 import { listModelsWithConfig, SV_PROVIDER_ID } from './llm-adapter.ts'
 import { svError, svErrorTrace, svLog, svLogDir } from './log.ts'
@@ -57,6 +88,26 @@ function classifyLogLine(line: string): SvLogLevel {
   if (/err=|Traceback|EADDRINUSE|ECONNREFUSED|error|failed|failure/i.test(line)) return 'error'
   if (/\bwarn|warning|did not activate|deprecated/i.test(line)) return 'warn'
   return 'info'
+}
+
+/** 读取工作区内的文本文件（知识导入用）；二进制与超大文件拒绝。 */
+async function readWorkspaceText(raw: string): Promise<{ relativePath: string; name: string; text: string }> {
+  if (raw.trim().length === 0) throw new Error('path 不能为空')
+  const root = process.cwd()
+  const target = isAbsolute(raw) ? resolve(raw) : resolve(root, raw)
+  const rel = relative(root, target)
+  if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('只能导入工作区内的文件')
+  const info = await stat(target).catch(() => undefined)
+  if (info === undefined) throw new Error('文件不存在')
+  if (!info.isFile()) throw new Error('不是文件')
+  if (info.size > MAX_KNOWLEDGE_DOC_CHARS * 2) throw new Error('文件过大（上限约 1MB）')
+  const buffer = await readFile(target)
+  if (buffer.includes(0)) throw new Error('不支持二进制文件')
+  const text = buffer.toString('utf8')
+  if (text.length > MAX_KNOWLEDGE_DOC_CHARS) {
+    throw new Error(`文件内容过长（上限 ${MAX_KNOWLEDGE_DOC_CHARS} 字符）`)
+  }
+  return { relativePath: rel, name: basename(target), text }
 }
 
 /** 逐行定级；缩进的堆栈续行继承上一条的级别。 */
@@ -228,13 +279,42 @@ export function registerSvRoutes(
   sessions: SvSessionStore,
   memory: MemoryStore,
   tasks: TasksStore,
+  inbox: InboxStore,
+  knowledge: KnowledgeStore,
+  automations: AutomationStore,
+  automationService: AutomationService,
   reminders: ReminderService,
   mailer: MailNotifier,
+  briefing: BriefingService,
   schedule: Context['schedule'],
   listSkills: () => Promise<SvSkillView[]>,
   listTools: () => Promise<SvToolView[]>,
   superAgent?: SuperAgentSurface,
+  dataHooks?: {
+    clearSuperAgentHistory?: () => Promise<void>
+    restoreSuperAgentHistory?: () => Promise<void>
+    /** 本地用量/费用快照（未挂载时数据页不显示费用卡片）。 */
+    usageSnapshot?: () => import('./usage-store.ts').UsageSnapshot
+  },
+  /** 审批与连接器服务；未挂载时对应 API 返回 404。 */
+  services?: {
+    approvals: ApprovalCenter
+    connectors: ConnectorService
+    connectorStore: ConnectorStore
+  },
 ): void {
+  const dataStores: BackupStores = {
+    memory,
+    tasks,
+    inbox,
+    knowledge,
+    automations,
+    sessions,
+    ...dataHooks,
+    ...services === undefined
+      ? {}
+      : { approvals: services.approvals, connectors: services.connectorStore },
+  }
   const staticCache = new Map<string, { body: Buffer; type: string }>()
   const serveStatic = async (res: ServerResponse, file: string): Promise<void> => {
     let entry = staticCache.get(file)
@@ -385,6 +465,7 @@ export function registerSvRoutes(
       let sessionId: string | undefined
       let text: string
       let images: ImageAttachmentRef[] = []
+      let context: string | undefined
       try {
         const body = await readJson(req, CHAT_BODY_LIMIT)
         const rawSession = body.sessionId
@@ -396,6 +477,12 @@ export function registerSvRoutes(
         if (rawText !== undefined && typeof rawText !== 'string') throw new Error('text 必须是字符串')
         if (typeof rawText === 'string' && rawText.length > 100_000) throw new Error('text 过长')
         text = rawText ?? ''
+        if (body.context !== undefined) {
+          if (typeof body.context !== 'string') throw new Error('context 必须是字符串')
+          if (body.context.length > 20_000) throw new Error('context 过长')
+          const trimmed = body.context.trim()
+          if (trimmed.length > 0) context = trimmed
+        }
         const uploads = parseChatImages(body.images)
         if (text.trim().length === 0 && uploads.length === 0) throw new Error('text 和图片不能同时为空')
         if (uploads.length > 0) {
@@ -429,7 +516,7 @@ export function registerSvRoutes(
         res.write(`data: ${JSON.stringify(event)}\n\n`)
       }
       try {
-        for await (const event of chat.run(sessionId, text, images)) {
+        for await (const event of chat.run(sessionId, text, images, context)) {
           if (closed) break
           send(event)
         }
@@ -531,6 +618,24 @@ export function registerSvRoutes(
     // GET /sv/api/sessions —— 会话索引（按最近更新倒序）
     if (req.method === 'GET' && path === '/sv/api/sessions') {
       sendJson(res, 200, { sessions: sessions.list() })
+      return
+    }
+
+    // GET /sv/api/search?q=&limit= —— 会话全文检索
+    if (req.method === 'GET' && path === '/sv/api/search') {
+      const url = new URL(req.url ?? '/', 'http://sv.local')
+      const query = (url.searchParams.get('q') ?? '').trim()
+      if (query.length === 0) {
+        sendJson(res, 200, { hits: [] })
+        return
+      }
+      const rawLimit = Number(url.searchParams.get('limit') ?? '20')
+      const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, Math.trunc(rawLimit))) : 20
+      try {
+        sendJson(res, 200, { hits: await sessions.search(query, limit) })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
       return
     }
 
@@ -715,6 +820,532 @@ export function registerSvRoutes(
     if (req.method === 'DELETE' && taskMatch !== null) {
       const deleted = await tasks.remove(taskMatch[1]!)
       sendJson(res, 200, { deleted })
+      return
+    }
+
+    // GET /sv/api/inbox —— 收件箱列表（unread=1 / kind= 过滤）
+    if (req.method === 'GET' && path === '/sv/api/inbox') {
+      const params = new URL(req.url ?? '/', 'http://sv.local').searchParams
+      const rawKind = params.get('kind') ?? ''
+      if (rawKind.length > 0 && !(INBOX_KINDS as readonly string[]).includes(rawKind)) {
+        sendJson(res, 400, { error: 'kind 必须是 briefing / reminder / agent / system' })
+        return
+      }
+      const rawLimit = params.get('limit')
+      const limit = rawLimit === null ? 100 : Math.min(500, Math.max(1, Number(rawLimit) || 100))
+      sendJson(res, 200, {
+        items: inbox.list({
+          unreadOnly: params.get('unread') === '1',
+          ...(rawKind.length === 0 ? {} : { kind: rawKind as InboxKind }),
+          limit,
+        }).map(inboxView),
+        unread: inbox.unreadCount(),
+      })
+      return
+    }
+
+    // POST /sv/api/inbox/read-all —— 全部标记已读
+    if (req.method === 'POST' && path === '/sv/api/inbox/read-all') {
+      const updated = await inbox.markAllRead()
+      sendJson(res, 200, { updated, unread: inbox.unreadCount() })
+      return
+    }
+
+    // POST /sv/api/briefing/run —— 立即生成一份简报（忽略开关与当天去重）
+    if (req.method === 'POST' && path === '/sv/api/briefing/run') {
+      try {
+        const item = await briefing.runNow()
+        sendJson(res, 200, { item: inboxView(item), unread: inbox.unreadCount() })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const inboxReadMatch = /^\/sv\/api\/inbox\/([A-Za-z0-9-]{1,64})\/read$/.exec(path)
+
+    // POST /sv/api/inbox/:id/read —— 标记已读/未读
+    if (req.method === 'POST' && inboxReadMatch !== null) {
+      try {
+        const body = await readJson(req)
+        const read = body.read === undefined ? true : body.read === true
+        const item = await inbox.markRead(inboxReadMatch[1]!, read)
+        if (item === undefined) {
+          sendJson(res, 404, { error: '收件箱条目不存在' })
+          return
+        }
+        sendJson(res, 200, { item: inboxView(item), unread: inbox.unreadCount() })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const inboxItemMatch = /^\/sv\/api\/inbox\/([A-Za-z0-9-]{1,64})$/.exec(path)
+
+    // DELETE /sv/api/inbox/:id —— 删除条目
+    if (req.method === 'DELETE' && inboxItemMatch !== null) {
+      const deleted = await inbox.remove(inboxItemMatch[1]!)
+      sendJson(res, 200, { deleted, unread: inbox.unreadCount() })
+      return
+    }
+
+    // GET /sv/api/knowledge —— 知识库文档列表
+    if (req.method === 'GET' && path === '/sv/api/knowledge') {
+      sendJson(res, 200, {
+        docs: knowledge.list().map(knowledgeDocSummary),
+        total: knowledge.list().length,
+      })
+      return
+    }
+
+    // GET /sv/api/knowledge/search?q=&limit= —— 检索知识库
+    if (req.method === 'GET' && path === '/sv/api/knowledge/search') {
+      const params = new URL(req.url ?? '/', 'http://sv.local').searchParams
+      const query = (params.get('q') ?? '').trim()
+      const rawLimit = params.get('limit')
+      const limit = rawLimit === null ? 10 : Math.min(50, Math.max(1, Number(rawLimit) || 10))
+      sendJson(res, 200, { hits: query.length === 0 ? [] : knowledge.search(query, limit) })
+      return
+    }
+
+    // POST /sv/api/knowledge —— 导入文本 / 工作区文件 / 网页
+    if (req.method === 'POST' && path === '/sv/api/knowledge') {
+      try {
+        const body = await readJson(req)
+        const rawText = typeof body.text === 'string' ? body.text : ''
+        const rawPath = typeof body.path === 'string' ? body.path.trim() : ''
+        const rawUrl = typeof body.url === 'string' ? body.url.trim() : ''
+        const provided = [rawText.trim().length > 0, rawPath.length > 0, rawUrl.length > 0].filter(Boolean).length
+        if (provided !== 1) throw new Error('text / path / url 三选一')
+        const title = body.title === undefined ? '' : String(body.title).trim()
+        const source = body.source === undefined ? '' : String(body.source).trim()
+
+        let text: string
+        let resolvedSource: string
+        let sourceKind: 'text' | 'file' | 'url'
+        let resolvedTitle: string | undefined
+        if (rawUrl.length > 0) {
+          const page = await fetchUrlPage(ctx, rawUrl, AbortSignal.timeout(30_000))
+          text = page.text
+          resolvedSource = source || page.url
+          sourceKind = 'url'
+          resolvedTitle = title || page.title
+        } else if (rawPath.length > 0) {
+          const file = await readWorkspaceText(rawPath)
+          text = file.text
+          resolvedSource = source || file.relativePath
+          sourceKind = 'file'
+          resolvedTitle = title || defaultKnowledgeTitle(file.text, file.name)
+        } else {
+          text = rawText
+          resolvedSource = source || '手动导入'
+          sourceKind = 'text'
+          resolvedTitle = title || undefined
+        }
+
+        const result = await knowledge.ingest({
+          text,
+          source: resolvedSource,
+          sourceKind,
+          ...(resolvedTitle === undefined || resolvedTitle.length === 0 ? {} : { title: resolvedTitle }),
+        })
+        sendJson(res, 200, {
+          doc: knowledgeDocSummary(result.doc),
+          duplicate: result.duplicate,
+        })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const knowledgeMatch = /^\/sv\/api\/knowledge\/([A-Za-z0-9-]{1,64})$/.exec(path)
+
+    // GET /sv/api/knowledge/:id —— 文档详情（含分块）
+    if (req.method === 'GET' && knowledgeMatch !== null) {
+      const doc = knowledge.get(knowledgeMatch[1]!)
+      if (doc === undefined) {
+        sendJson(res, 404, { error: '知识文档不存在' })
+        return
+      }
+      sendJson(res, 200, { doc: knowledgeDocView(doc) })
+      return
+    }
+
+    // DELETE /sv/api/knowledge/:id —— 删除文档
+    if (req.method === 'DELETE' && knowledgeMatch !== null) {
+      sendJson(res, 200, { deleted: await knowledge.remove(knowledgeMatch[1]!) })
+      return
+    }
+
+    // GET /sv/api/automations —— 自动化列表 + 最近运行历史 + 全局设置
+    if (req.method === 'GET' && path === '/sv/api/automations') {
+      sendJson(res, 200, {
+        automations: automations.list().map(automationView),
+        runs: automations.listRuns(undefined, 50),
+        config: { ...store.automations },
+      })
+      return
+    }
+
+    // POST /sv/api/automations/config —— 更新全局设置（暂停 / 静默时段 / 重试）
+    if (req.method === 'POST' && path === '/sv/api/automations/config') {
+      try {
+        const body = await readJson(req)
+        const state = await store.update({ automations: body })
+        sendJson(res, 200, { config: state.automations })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // POST /sv/api/automations —— 创建自动化
+    if (req.method === 'POST' && path === '/sv/api/automations') {
+      try {
+        const body = await readJson(req)
+        const kind = String(body.kind ?? '')
+        if (!(AUTOMATION_KINDS as readonly string[]).includes(kind)) {
+          throw new Error('kind 必须是 web / keyword / prompt / rss')
+        }
+        const title = typeof body.title === 'string' ? body.title.trim() : ''
+        if (title.length === 0) throw new Error('title 不能为空')
+        const scheduleKind = String(body.scheduleKind ?? '')
+        if (!(AUTOMATION_SCHEDULE_KINDS as readonly string[]).includes(scheduleKind)) {
+          throw new Error('scheduleKind 必须是 interval / daily / weekly')
+        }
+        const schedule: AutomationSchedule = scheduleKind === 'interval'
+          ? { kind: 'interval', everyMinutes: Number(body.everyMinutes) }
+          : scheduleKind === 'daily'
+            ? { kind: 'daily', at: String(body.at ?? '').trim() }
+            : { kind: 'weekly', weekday: Number(body.weekday), at: String(body.at ?? '').trim() }
+        let keywords: string[] | undefined
+        if (body.keywords !== undefined) {
+          if (!Array.isArray(body.keywords)) throw new Error('keywords 必须是字符串数组')
+          keywords = body.keywords
+            .filter((keyword): keyword is string => typeof keyword === 'string')
+            .map(keyword => keyword.trim())
+            .filter(keyword => keyword.length > 0)
+        }
+        if (body.email !== undefined && typeof body.email !== 'boolean') throw new Error('email 必须是布尔值')
+        const entry = await automations.create({
+          title,
+          kind: kind as (typeof AUTOMATION_KINDS)[number],
+          schedule,
+          ...(typeof body.url === 'string' && body.url.trim().length > 0 ? { url: body.url.trim() } : {}),
+          ...(keywords === undefined ? {} : { keywords }),
+          ...(typeof body.prompt === 'string' && body.prompt.trim().length > 0 ? { prompt: body.prompt.trim() } : {}),
+          email: body.email === true,
+        })
+        sendJson(res, 200, { automation: automationView(entry) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const automationRunMatch = /^\/sv\/api\/automations\/([A-Za-z0-9-]{1,64})\/run$/.exec(path)
+
+    // POST /sv/api/automations/:id/run —— 手动运行一次
+    if (req.method === 'POST' && automationRunMatch !== null) {
+      try {
+        const result = await automationService.runNow(automationRunMatch[1]!)
+        sendJson(res, 200, { automation: automationView(result.automation), run: result.run })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        sendJson(res, message.includes('不存在') ? 404 : 500, { error: message })
+      }
+      return
+    }
+
+    const automationMatch = /^\/sv\/api\/automations\/([A-Za-z0-9-]{1,64})$/.exec(path)
+
+    // PATCH /sv/api/automations/:id —— 暂停/恢复
+    if (req.method === 'PATCH' && automationMatch !== null) {
+      try {
+        const body = await readJson(req)
+        if (typeof body.enabled !== 'boolean') throw new Error('enabled 必须是布尔值')
+        const entry = await automations.setEnabled(automationMatch[1]!, body.enabled)
+        if (entry === undefined) {
+          sendJson(res, 404, { error: '自动化不存在' })
+          return
+        }
+        sendJson(res, 200, { automation: automationView(entry) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // DELETE /sv/api/automations/:id —— 删除自动化
+    if (req.method === 'DELETE' && automationMatch !== null) {
+      sendJson(res, 200, { deleted: await automations.remove(automationMatch[1]!) })
+      return
+    }
+
+    // GET /sv/api/data —— 数据量、token 使用与服务健康快照
+    if (req.method === 'GET' && path === '/sv/api/data') {
+      sendJson(res, 200, { status: await dataStatus(dataStores, dataHooks?.usageSnapshot?.()) })
+      return
+    }
+
+    // GET /sv/api/backup —— 下载 JSON 备份（不含 config.json 密钥；?domain= 按域导出）
+    if (req.method === 'GET' && path === '/sv/api/backup') {
+      const url = new URL(req.url ?? '/', 'http://sv.local')
+      const rawDomain = (url.searchParams.get('domain') ?? '').trim()
+      let domain: DataDomain | undefined
+      if (rawDomain.length > 0) {
+        if (!(DATA_DOMAINS as readonly string[]).includes(rawDomain)) {
+          sendJson(res, 400, { error: 'domain 非法' })
+          return
+        }
+        domain = rawDomain as DataDomain
+      }
+      const bundle = await createBackup(dataStores, domain)
+      const body = `${JSON.stringify(bundle, null, 2)}\n`
+      const now = new Date()
+      const pad = (value: number): string => String(value).padStart(2, '0')
+      const suffix = domain === undefined || domain === 'all' ? 'backup' : `backup-${domain}`
+      const filename = `sv-${suffix}-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}.json`
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-disposition': `attachment; filename="${filename}"`,
+        'content-length': Buffer.byteLength(body),
+        'cache-control': 'no-store',
+      })
+      res.end(body)
+      return
+    }
+
+    // POST /sv/api/data/restore —— 恢复备份（覆盖当前产品数据）
+    if (req.method === 'POST' && path === '/sv/api/data/restore') {
+      try {
+        const body = await readJson(req, 100 * 1024 * 1024)
+        const result = await restoreBackup(dataStores, body)
+        ctx.logger.info(svLog('index', 'backup_restored', { files: result.files }))
+        sendJson(res, 200, { restored: result.files })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // POST /sv/api/data/clear —— 按域清空产品数据
+    if (req.method === 'POST' && path === '/sv/api/data/clear') {
+      try {
+        const body = await readJson(req)
+        const domain = String(body.domain ?? '')
+        if (!(DATA_DOMAINS as readonly string[]).includes(domain)) {
+          throw new Error('domain 必须是 memory / tasks / inbox / knowledge / automations / sessions / superagent / approvals / connectors / all')
+        }
+        await clearData(dataStores, domain as DataDomain)
+        ctx.logger.info(svLog('index', 'data_cleared', { domain }))
+        sendJson(res, 200, { cleared: domain })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    /* ── 审批中心 ───────────────────────────────────────── */
+
+    if (services !== undefined && req.method === 'GET' && path === '/sv/api/approvals') {
+      const url = new URL(req.url ?? '/', 'http://sv.local')
+      const status = url.searchParams.get('status') ?? 'all'
+      if (status !== 'all' && status !== 'pending' && status !== 'decided') {
+        sendJson(res, 400, { error: 'status 必须是 all / pending / decided' })
+        return
+      }
+      const rawLimit = Number(url.searchParams.get('limit') ?? '100')
+      const limit = Number.isFinite(rawLimit) ? Math.min(500, Math.max(1, Math.trunc(rawLimit))) : 100
+      sendJson(res, 200, {
+        approvals: services.approvals.list(status, limit),
+        pending: services.approvals.pendingCount(),
+      })
+      return
+    }
+
+    if (services !== undefined && req.method === 'POST' && path === '/sv/api/approvals/clear') {
+      try {
+        await services.approvals.clear()
+        sendJson(res, 200, { cleared: true })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const approvalAnswerMatch = /^\/sv\/api\/approvals\/([A-Za-z0-9-]{1,64})\/answer$/.exec(path)
+    if (services !== undefined && req.method === 'POST' && approvalAnswerMatch !== null) {
+      try {
+        const body = await readJson(req)
+        const outcome = String(body.outcome ?? '')
+        if (outcome !== 'allowed-once' && outcome !== 'rejected') {
+          throw new Error('outcome 必须是 allowed-once 或 rejected')
+        }
+        const record = await services.approvals.answer(approvalAnswerMatch[1]!, outcome)
+        sendJson(res, 200, { approval: record, pending: services.approvals.pendingCount() })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    /* ── 只读连接器与事件流 ─────────────────────────────── */
+
+    if (services !== undefined && req.method === 'GET' && path === '/sv/api/connectors') {
+      sendJson(res, 200, {
+        connectors: services.connectorStore.listConnectors().map(connectorView),
+        events: services.connectorStore.listEvents({ limit: 50 }),
+        unread: services.connectorStore.unreadCount(),
+      })
+      return
+    }
+
+    if (services !== undefined && req.method === 'POST' && path === '/sv/api/connectors') {
+      try {
+        const body = await readJson(req)
+        const kind = String(body.kind ?? '')
+        if (!(CONNECTOR_KINDS as readonly string[]).includes(kind)) throw new Error('连接器类型非法')
+        const settings = typeof body.settings === 'object' && body.settings !== null && !Array.isArray(body.settings)
+          ? body.settings as Record<string, unknown>
+          : {}
+        const connector = await services.connectorStore.create({
+          kind: kind as ConnectorKind,
+          name: typeof body.name === 'string' ? body.name : '',
+          settings,
+          ...(typeof body.everyMinutes === 'number' ? { everyMinutes: body.everyMinutes } : {}),
+          ...(typeof body.initialDays === 'number' ? { initialDays: body.initialDays } : {}),
+        })
+        sendJson(res, 200, { connector: connectorView(connector) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    if (services !== undefined && req.method === 'POST' && path === '/sv/api/connectors/test') {
+      try {
+        const body = await readJson(req)
+        const kind = String(body.kind ?? '')
+        if (!(CONNECTOR_KINDS as readonly string[]).includes(kind)) throw new Error('连接器类型非法')
+        const settings = typeof body.settings === 'object' && body.settings !== null && !Array.isArray(body.settings)
+          ? body.settings as Record<string, unknown>
+          : {}
+        const preview = await previewConnector(kind as ConnectorKind, settings, fetch)
+        sendJson(res, 200, { ok: true, ...preview })
+      } catch (error) {
+        sendJson(res, 200, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    if (services !== undefined && req.method === 'GET' && path === '/sv/api/connectors/events') {
+      const url = new URL(req.url ?? '/', 'http://sv.local')
+      const rawSource = (url.searchParams.get('source') ?? '').trim()
+      let source: ConnectorKind | undefined
+      if (rawSource.length > 0) {
+        if (!(CONNECTOR_KINDS as readonly string[]).includes(rawSource)) {
+          sendJson(res, 400, { error: 'source 非法' })
+          return
+        }
+        source = rawSource as ConnectorKind
+      }
+      const rawLimit = Number(url.searchParams.get('limit') ?? '100')
+      const limit = Number.isFinite(rawLimit) ? Math.min(500, Math.max(1, Math.trunc(rawLimit))) : 100
+      sendJson(res, 200, {
+        events: services.connectorStore.listEvents({
+          ...(source === undefined ? {} : { source }),
+          unreadOnly: url.searchParams.get('unread') === '1',
+          query: url.searchParams.get('q') ?? '',
+          limit,
+        }),
+        unread: services.connectorStore.unreadCount(source),
+      })
+      return
+    }
+
+    if (services !== undefined && req.method === 'POST' && path === '/sv/api/connectors/events/read-all') {
+      try {
+        const body = await readJson(req)
+        const rawSource = typeof body.source === 'string' ? body.source.trim() : ''
+        let source: ConnectorKind | undefined
+        if (rawSource.length > 0) {
+          if (!(CONNECTOR_KINDS as readonly string[]).includes(rawSource)) throw new Error('source 非法')
+          source = rawSource as ConnectorKind
+        }
+        const count = await services.connectorStore.markAllRead(source)
+        sendJson(res, 200, { read: count, unread: services.connectorStore.unreadCount(source) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    if (services !== undefined && req.method === 'DELETE' && path === '/sv/api/connectors/events') {
+      const url = new URL(req.url ?? '/', 'http://sv.local')
+      const rawSource = (url.searchParams.get('source') ?? '').trim()
+      let source: ConnectorKind | undefined
+      if (rawSource.length > 0) {
+        if (!(CONNECTOR_KINDS as readonly string[]).includes(rawSource)) {
+          sendJson(res, 400, { error: 'source 非法' })
+          return
+        }
+        source = rawSource as ConnectorKind
+      }
+      sendJson(res, 200, { removed: await services.connectorStore.clearEvents(source) })
+      return
+    }
+
+    const connectorEventReadMatch = /^\/sv\/api\/connectors\/events\/([A-Za-z0-9-]{1,64})\/read$/.exec(path)
+    if (services !== undefined && req.method === 'POST' && connectorEventReadMatch !== null) {
+      const event = await services.connectorStore.markRead(connectorEventReadMatch[1]!)
+      sendJson(res, event === undefined ? 404 : 200, event === undefined
+        ? { error: '事件不存在' }
+        : { event })
+      return
+    }
+
+    const connectorRunMatch = /^\/sv\/api\/connectors\/([A-Za-z0-9-]{1,64})\/run$/.exec(path)
+    if (services !== undefined && req.method === 'POST' && connectorRunMatch !== null) {
+      try {
+        const result = await services.connectors.runNow(connectorRunMatch[1]!)
+        sendJson(res, 200, {
+          connector: connectorView(result.connector),
+          added: result.added,
+          ...(result.note === undefined ? {} : { note: result.note }),
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        sendJson(res, message.includes('不存在') ? 404 : 500, { error: message })
+      }
+      return
+    }
+
+    const connectorMatch = /^\/sv\/api\/connectors\/([A-Za-z0-9-]{1,64})$/.exec(path)
+    if (services !== undefined && req.method === 'PATCH' && connectorMatch !== null) {
+      try {
+        const body = await readJson(req)
+        const connector = await services.connectorStore.update(connectorMatch[1]!, {
+          ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+          ...(typeof body.everyMinutes === 'number' ? { everyMinutes: body.everyMinutes } : {}),
+          ...(typeof body.initialDays === 'number' ? { initialDays: body.initialDays } : {}),
+          ...(typeof body.name === 'string' ? { name: body.name } : {}),
+        })
+        if (connector === undefined) {
+          sendJson(res, 404, { error: '连接器不存在' })
+          return
+        }
+        sendJson(res, 200, { connector: connectorView(connector) })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    if (services !== undefined && req.method === 'DELETE' && connectorMatch !== null) {
+      sendJson(res, 200, { deleted: await services.connectorStore.remove(connectorMatch[1]!) })
       return
     }
 
@@ -970,7 +1601,7 @@ export function registerSvRoutes(
       return
     }
 
-    // GET /sv/api/events —— 提醒 SSE 流
+    // GET /sv/api/events —— 提醒、收件箱、审批与连接器 SSE 流
     if (req.method === 'GET' && path === '/sv/api/events') {
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
@@ -980,10 +1611,27 @@ export function registerSvRoutes(
       })
       res.flushHeaders?.()
       res.write(': connected\n\n')
-      const unsubscribe = reminders.subscribe((event: SvReminderEvent) => {
+      const unsubscribeReminders = reminders.subscribe((event: SvReminderEvent) => {
         res.write(`data: ${JSON.stringify(event)}\n\n`)
       })
-      res.on('close', unsubscribe)
+      const unsubscribeInbox = inbox.subscribe(event => {
+        res.write(`data: ${JSON.stringify({ type: 'inbox', ...event })}\n\n`)
+      })
+      // 页面在线才等待审批；最后一个页面关闭时待处理审批会被取消。
+      const detachApproval = services?.approvals.attachViewer()
+      const unsubscribeApprovals = services?.approvals.subscribe(event => {
+        res.write(`data: ${JSON.stringify(event)}\n\n`)
+      })
+      const unsubscribeConnectors = services?.connectors.subscribe(event => {
+        res.write(`data: ${JSON.stringify(event)}\n\n`)
+      })
+      res.on('close', () => {
+        unsubscribeReminders()
+        unsubscribeInbox()
+        unsubscribeApprovals?.()
+        unsubscribeConnectors?.()
+        detachApproval?.()
+      })
       return
     }
 

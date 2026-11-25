@@ -15,12 +15,24 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-web'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-schedule'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
+import { ApprovalCenter, type HostApprovalRequest } from './approval-center.ts'
+import { ApprovalStore } from './approval-store.ts'
+import { ConnectorService } from './connector-runtime.ts'
+import { ConnectorStore } from './connector-store.ts'
+import { BriefingService, BRIEFING_SYSTEM, buildBriefingPrompt } from './briefing.ts'
+import { createAutomationPromptRunner } from './automation-agent.ts'
+import { AutomationService } from './automation-runtime.ts'
+import { AutomationStore } from './automation-store.ts'
 import { ChatManager } from './chat.ts'
-import { ConfigStore, inferLlmProvider, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
+import { ConfigStore, inferLlmProvider, type SvBriefingConfig, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
 import { registerSvRoutes, type SvSkillView, type SvToolView } from './http.ts'
+import { InboxStore, INBOX_KIND_LABELS } from './inbox-store.ts'
+import { KnowledgeStore } from './knowledge-store.ts'
+import { fetchUrlPage } from './knowledge-source.ts'
 import { SV_PROVIDER_ID, SvOpenAiCompatAdapter } from './llm-adapter.ts'
 import { svError, svErrorTrace, svLog, installSvLogSink } from './log.ts'
 import { MailNotifier } from './mail-notifier.ts'
@@ -34,8 +46,9 @@ import { PgSessionStore } from './sessions-postgres.ts'
 import { resolveSuperAgentConfig } from './superagent.ts'
 import { createSuperAgentRuntime } from './superagent-runtime.ts'
 import { SuperAgentRunStore } from './superagent-store.ts'
-import { TasksStore } from './tasks-store.ts'
-import { registerDesktopGuard, registerMemoryTools, registerTaskTools } from './tools.ts'
+import { TasksStore, formatTaskTime } from './tasks-store.ts'
+import { UsageStore } from './usage-store.ts'
+import { registerAutomationTools, registerDesktopGuard, registerInboxTools, registerKnowledgeTools, registerMemoryTools, registerTaskTools } from './tools.ts'
 
 /** 技能注册表的最小结构；不把 sv-app 绑死到具体 skill 包的版本。 */
 interface SkillSummaryLike {
@@ -55,7 +68,7 @@ interface SkillRegistryLike {
 export const name = '@singularity-voyage/sv-app'
 
 /** 等待这些服务就绪后再激活（base/web-app 层提供）。 */
-export const inject = ['llm', 'web', 'agents', 'webServer', 'tools', 'systemPrompt', 'schedule']
+export const inject = ['llm', 'web', 'agents', 'webServer', 'tools', 'systemPrompt', 'schedule', 'approval']
 
 /** 组合包 patch 行注入的非密钥配置。 */
 export interface Config {
@@ -134,6 +147,22 @@ function mailDefaults(): SvMailConfig {
   }
 }
 
+/** 每日简报的部署默认值（页面保存后以 config.json 为准）。 */
+function briefingDefaults(): SvBriefingConfig {
+  const time = (process.env.SV_BRIEFING_AT ?? '08:30').trim()
+  return {
+    enabled: envBool('SV_BRIEFING_ENABLED', true),
+    time: /^([01]\d|2[0-3]):[0-5]\d$/.test(time) ? time : '08:30',
+    email: envBool('SV_BRIEFING_EMAIL', false),
+  }
+}
+
+/** 收件箱条目标题：取文本首行并截断，避免把整段回复塞进列表。 */
+function inboxTitle(prefix: string, text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return `${prefix}${line.length === 0 ? '（无文本输出）' : line.length <= 40 ? line : `${line.slice(0, 40)}…`}`
+}
+
 /**
  * 激活 SV 宿主插件。
  * @param ctx - 插件上下文。
@@ -187,6 +216,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
       ...(retryBudgetMs !== undefined ? { budgetMs: retryBudgetMs } : {}),
     },
     mail: mailDefaults(),
+    briefing: briefingDefaults(),
     superAgent: superAgentDefaults,
   })
   try {
@@ -219,6 +249,82 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     ctx.logger.warn(svLog('index', 'tasks_load_failed', { err: svError(error) }))
   }
 
+  // 收件箱：每日简报、到期提醒与后台任务结果的统一落点。
+  const inbox = new InboxStore()
+  try {
+    await inbox.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'inbox_load_failed', { err: svError(error) }))
+  }
+
+  // 个人知识库：笔记/文件/网页导入后的本地检索与引用来源。
+  const knowledge = new KnowledgeStore()
+  try {
+    await knowledge.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'knowledge_load_failed', { err: svError(error) }))
+  }
+
+  // 自动化：网页变化 / 关键词监控 / 定时任务。
+  const automations = new AutomationStore()
+  try {
+    await automations.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'automations_load_failed', { err: svError(error) }))
+  }
+
+  // 本地用量统计：每次模型请求的 token 消耗按天/按模型累计。
+  const usage = new UsageStore()
+  try {
+    await usage.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'usage_load_failed', { err: svError(error) }))
+  }
+
+  // 审批审计：记录工具操作的一次性授权与结果。
+  const approvals = new ApprovalStore()
+  try {
+    await approvals.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'approval_load_failed', { err: svError(error) }))
+  }
+  try {
+    const stale = await approvals.failPending()
+    if (stale > 0) ctx.logger.info(svLog('approval', 'approval_stale_cleared', { count: stale }))
+  } catch (error) {
+    ctx.logger.warn(svLog('approval', 'approval_stale_failed', { err: svError(error) }))
+  }
+  const approvalCenter = new ApprovalCenter(approvals, {
+    log: (event, fields) => {
+      if (event.endsWith('_unavailable')) ctx.logger.warn(svLog('approval', event, fields))
+      else ctx.logger.info(svLog('approval', event, fields))
+    },
+  })
+  // 宿主审批瀑布：前置 answerer，页面在线时等待用户回答，否则 fail-closed。
+  const offApproval = (ctx.on as unknown as (
+    name: string,
+    handler: (request: HostApprovalRequest) => Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>,
+    options?: { prepend?: boolean },
+  ) => () => void)('approval/request', request => approvalCenter.request(request), { prepend: true })
+  ctx.effect(() => offApproval)
+
+  // 只读连接器：邮件 / 日历 / Slack / Notion / RSS 的定时拉取与统一事件流。
+  const connectors = new ConnectorStore()
+  try {
+    await connectors.load()
+  } catch (error) {
+    ctx.logger.warn(svLog('index', 'connectors_load_failed', { err: svError(error) }))
+  }
+  const connectorService = new ConnectorService({
+    store: connectors,
+    log: (event, fields) => {
+      if (event.endsWith('_failed')) ctx.logger.warn(svLog('connector', event, fields))
+      else ctx.logger.info(svLog('connector', event, fields))
+    },
+  })
+  connectorService.start()
+  ctx.effect(() => () => connectorService.stop())
+
   const reminders = new ReminderService(tasks, (event, fields) => {
     ctx.logger.warn(svLog('reminders', event, fields))
   })
@@ -228,13 +334,28 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     tasks,
     log: (event, fields) => ctx.logger.warn(svLog('mail', event, fields)),
   })
-  const unsubscribeMail = reminders.subscribe(event => {
-    void mailer.notifyReminder(event.task)
+  const unsubscribeReminder = reminders.subscribe(event => {
+    const task = event.task
+    const body = [
+      `**${task.title}**`,
+      ...task.dueAt === undefined ? [] : [`到期时间：${formatTaskTime(task.dueAt)}`],
+      ...task.notes === undefined || task.notes.length === 0 ? [] : [task.notes],
+    ].join('\n\n')
+    void inbox.add({
+      kind: 'reminder',
+      title: `待办提醒：${task.title}`,
+      body,
+      taskId: task.id,
+      ...task.sessionId === undefined ? {} : { sessionId: task.sessionId },
+    }).catch(error => {
+      ctx.logger.warn(svLog('inbox', 'reminder_store_failed', { taskId: task.id, err: svError(error) }))
+    })
+    void mailer.notifyReminder(task)
   })
   mailer.start()
   reminders.start()
   ctx.effect(() => () => {
-    unsubscribeMail()
+    unsubscribeReminder()
     mailer.stop()
     reminders.stop()
   })
@@ -243,16 +364,87 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   ctx.llm.registerAdapter([SV_PROVIDER_ID], new SvOpenAiCompatAdapter(
     () => store.llm,
     () => ctx.get('attachments'),
+    (model, report) => {
+      void usage.record(model, {
+        inputTokens: report.inputTokens,
+        outputTokens: report.outputTokens,
+        ...report.cacheReadTokens === undefined ? {} : { cacheReadTokens: report.cacheReadTokens },
+      }).catch(error => {
+        ctx.logger.warn(svLog('usage', 'usage_record_failed', { err: svError(error) }))
+      })
+    },
   ))
   ctx.web.registerSearchProvider(new SvSearchProvider(() => store.search, () => store.llm.apiKey))
 
+  // 每日简报：到点汇总今日待办、昨日对话与未读收件箱；模型失败时用模板回落。
+  const briefing = new BriefingService({
+    config: () => store.briefing,
+    mail: () => store.mail,
+    tasks,
+    sessions,
+    inbox,
+    log: (event, fields) => {
+      if (event.endsWith('_failed')) ctx.logger.warn(svLog('briefing', event, fields))
+      else ctx.logger.info(svLog('briefing', event, fields))
+    },
+    generate: async (input, signal) => {
+      let text = ''
+      let failure: string | undefined
+      for await (const chunk of ctx.llm.stream({
+        provider: SV_PROVIDER_ID,
+        model: store.llm.model,
+        system: BRIEFING_SYSTEM,
+        messages: [createUserMessage({
+          content: [{ type: 'text', text: buildBriefingPrompt(input) }],
+          source: { kind: 'user' },
+        })],
+        maxTokens: 800,
+        temperature: 0.3,
+        signal,
+      })) {
+        if (chunk.type === 'text-delta') text += chunk.text
+        else if (chunk.type === 'finish' && chunk.reason.kind === 'error') failure = chunk.reason.failure.message
+      }
+      if (failure !== undefined) throw new Error(failure)
+      return text.trim()
+    },
+  })
+  briefing.start()
+  ctx.effect(() => () => briefing.stop())
+
+  // 自动化执行器：到期扫描；prompt 类型用隔离 Agent，web/keyword 走 ctx.web.fetch。
+  const automationService = new AutomationService({
+    store: automations,
+    inbox,
+    mail: () => store.mail,
+    config: () => store.automations,
+    fetchPage: (url, signal) => fetchUrlPage(ctx, url, signal),
+    runPrompt: createAutomationPromptRunner(ctx, store),
+    log: (event, fields) => {
+      if (event.endsWith('_failed')) ctx.logger.warn(svLog('automation', event, fields))
+      else ctx.logger.info(svLog('automation', event, fields))
+    },
+  })
+  automationService.start()
+  ctx.effect(() => () => automationService.stop())
+
   registerMemoryTools(ctx, memory)
   registerTaskTools(ctx, tasks)
+  registerInboxTools(ctx, inbox)
+  registerKnowledgeTools(ctx, knowledge)
+  registerAutomationTools(ctx, automations)
   registerDesktopGuard(ctx)
 
   // 每轮 Prompt 组装时注入记忆与待办（system-prompt 注册表，作用于全部会话）。
   const recallQuery = (context: { agent?: { id: unknown } }): string =>
     chat.latestUserText(context.agent === undefined ? undefined : String(context.agent.id))
+  // 个人知识召回：只注入本次最相关的少量片段，带 [K1] 编号与来源，正文可按需再检索。
+  ctx.systemPrompt.section({
+    name: 'sv:knowledge-recall',
+    order: 9450,
+    interpolate: false,
+    text: context => knowledge.promptBlock(recallQuery(context)),
+  })
   ctx.systemPrompt.section({
     name: 'sv:memory-recall',
     order: 9500,
@@ -271,6 +463,24 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     order: 9510,
     interpolate: false,
     text: () => '提醒与定时任务的选型：用户要在某个时间点收到提醒、或让助手届时继续处理，调用 schedule_create（提醒会回到本会话）；只是记录一件要做的事、需要清单勾选或邮件提醒，调用 task_create。',
+  })
+
+  // 收件箱摘要：只给未读标题与数量，正文按需用 inbox_list 读取，避免每轮注入整份简报。
+  ctx.systemPrompt.section({
+    name: 'sv:inbox',
+    order: 9515,
+    interpolate: false,
+    text: () => {
+      const unread = inbox.list({ unreadOnly: true, limit: 5 })
+      if (unread.length === 0) return ''
+      const lines = [
+        '## 收件箱',
+        `未读 ${inbox.unreadCount()} 条：`,
+        ...unread.map(item => `- [${INBOX_KIND_LABELS[item.kind]}] ${item.title}`),
+        '需要查看正文时调用 inbox_list。',
+      ]
+      return lines.join('\n')
+    },
   })
 
   // 桌面操作（dsh-computer-use）：工具由第三方 bundle 注册，这里只给选型与
@@ -297,7 +507,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   // turn 结束后异步抽取记忆；失败只告警，不影响对话。
   const extract = createMemoryExtractor(ctx, () => ({ provider: SV_PROVIDER_ID, model: store.llm.model }))
   const chat = new ChatManager(ctx, store, sessions, {
-    onTurnComplete({ sessionId, userText, assistantText }) {
+    onTurnComplete({ sessionId, userText, assistantText, attended }) {
       void extract({ userText, assistantText })
         .then(candidates => (candidates.length === 0 ? undefined : memory.remember(candidates, { sessionId, note: 'auto-extract' })))
         .then(written => {
@@ -308,6 +518,29 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
         .catch(error => {
           ctx.logger.warn(svLog('memory', 'memory_extract_failed', { sessionId, err: svError(error) }))
         })
+      // 页面已关闭时本轮在后台完成：把结果放进收件箱，避免「跑完了但没人知道」。
+      if (!attended) {
+        void inbox.add({
+          kind: 'agent',
+          title: inboxTitle('后台回复已完成：', userText.length > 0 ? userText : assistantText),
+          body: assistantText,
+          sessionId,
+        }).catch(error => {
+          ctx.logger.warn(svLog('inbox', 'background_turn_store_failed', { sessionId, err: svError(error) }))
+        })
+      }
+    },
+    // 宿主直接投递到会话的轮次（例如定时任务到点后继续处理）没有页面 SSE，
+    // 统一记为「定时任务回复」。
+    onDetachedTurn({ sessionId, assistantText }) {
+      void inbox.add({
+        kind: 'agent',
+        title: inboxTitle('定时任务回复：', assistantText),
+        body: assistantText,
+        sessionId,
+      }).catch(error => {
+        ctx.logger.warn(svLog('inbox', 'detached_turn_store_failed', { sessionId, err: svError(error) }))
+      })
     },
   })
   // Super-agent 运行时始终创建，但开关由 config.json 控制（设置页可即时开关/调限额）；
@@ -369,6 +602,39 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
       .sort((a, b) => a.name.localeCompare(b.name))
   }
 
-  registerSvRoutes(ctx, chat, store, sessions, memory, tasks, reminders, mailer, ctx.schedule, listSkills, listTools, superAgent)
+  registerSvRoutes(
+    ctx,
+    chat,
+    store,
+    sessions,
+    memory,
+    tasks,
+    inbox,
+    knowledge,
+    automations,
+    automationService,
+    reminders,
+    mailer,
+    briefing,
+    ctx.schedule,
+    listSkills,
+    listTools,
+    superAgent,
+    {
+      clearSuperAgentHistory: async () => {
+        superAgent.clearHistory()
+      },
+      restoreSuperAgentHistory: async () => {
+        await runStore.load()
+        superAgent.restoreHistory(runStore.list())
+      },
+      usageSnapshot: () => usage.snapshot(store.usage),
+    },
+    {
+      approvals: approvalCenter,
+      connectors: connectorService,
+      connectorStore: connectors,
+    },
+  )
   ctx.logger.info(svLog('index', 'surface_ready', { path: '/sv/' }))
 }

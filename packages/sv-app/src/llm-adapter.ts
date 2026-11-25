@@ -284,6 +284,8 @@ export class SvOpenAiCompatAdapter extends LlmAdapter {
     private readonly options: () => SvLlmConfig,
     /** 附件服务：仅在消息含图片时按需读取，缺省时忽略图片。 */
     private readonly attachments: () => AttachmentStore | undefined = () => undefined,
+    /** 每次请求结束时的用量上报（用于本地费用统计）。 */
+    private readonly onUsage: ((model: string, usage: TokenUsage) => void) | undefined = undefined,
   ) {
     super()
   }
@@ -500,6 +502,14 @@ export class SvOpenAiCompatAdapter extends LlmAdapter {
         }
       }
       if (usage !== undefined) yield { type: 'usage', usage }
+      // 本地费用统计：一次请求只上报一次；失败不影响主流程。
+      if (usage !== undefined && this.onUsage !== undefined) {
+        try {
+          this.onUsage(options.model, usage)
+        } catch {
+          // 统计失败不干扰模型响应
+        }
+      }
       yield { type: 'finish', reason: finish ?? { kind: 'stop' } }
     } catch (error) {
       if (timedOut) throw new LlmError('sv-app: LLM 流式空闲超时', 'TIMEOUT', { cause: error })

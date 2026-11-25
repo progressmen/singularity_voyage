@@ -278,3 +278,17 @@ test('Super-agent 配置：保存、范围校验与持久化回环', async () =>
   assert.equal(reloaded.superAgent.maxSubtasks, 9)
   assert.equal(reloaded.superAgent.retryAttempts, 2)
 })
+
+test('每日简报配置：默认开启 08:30，更新时间/邮件开关并持久化', async () => {
+  const store = new ConfigStore(defaults())
+  assert.deepEqual(store.briefing, { enabled: true, time: '08:30', email: false })
+
+  const state = await store.update({ briefing: { enabled: false, time: '09:15', email: true } })
+  assert.deepEqual(state.briefing, { enabled: false, time: '09:15', email: true })
+  await assert.rejects(() => store.update({ briefing: { time: '9:15' } }), /HH:mm/)
+  await assert.rejects(() => store.update({ briefing: { enabled: 'yes' } }), /布尔值/)
+
+  const reloaded = new ConfigStore(defaults())
+  await reloaded.load()
+  assert.deepEqual(reloaded.briefing, { enabled: false, time: '09:15', email: true })
+})

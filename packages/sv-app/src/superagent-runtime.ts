@@ -322,6 +322,16 @@ export class SuperAgentService implements SuperAgentSurface {
     return this.runner.list()
   }
 
+  /** 清空已结束的运行历史（数据清空用）。 */
+  clearHistory(): void {
+    this.runner.clearHistory()
+  }
+
+  /** 从持久化快照恢复历史（数据恢复用）。 */
+  restoreHistory(runs: readonly SuperAgentRunView[]): void {
+    this.runner.restore(runs)
+  }
+
   run(
     goal: string,
     subtasks: readonly string[] | undefined,

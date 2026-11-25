@@ -242,6 +242,12 @@ export class MemoryStore {
     return existed
   }
 
+  /** 清空全部记忆（隐私清空与恢复用）。 */
+  async clear(): Promise<void> {
+    this.entries.clear()
+    await this.persist()
+  }
+
   /**
    * 按查询召回记忆：词重叠为主，标签命中与近期更新加权；空查询返回最近的记忆。
    * @param query - 当前用户输入。

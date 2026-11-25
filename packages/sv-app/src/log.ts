@@ -19,7 +19,7 @@ import { appendFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** sv-app 的模块标签。 */
-export type SvLogModule = 'index' | 'chat' | 'http' | 'reminders' | 'memory' | 'tasks' | 'mail' | 'tool' | 'superagent'
+export type SvLogModule = 'index' | 'chat' | 'http' | 'reminders' | 'memory' | 'tasks' | 'mail' | 'tool' | 'superagent' | 'inbox' | 'briefing' | 'knowledge' | 'automation' | 'usage' | 'approval' | 'connector'
 
 /** 日志字段值。 */
 export type SvLogFields = Record<string, string | number | boolean | null | undefined>

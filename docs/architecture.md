@@ -462,7 +462,9 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
 | **对话（Workbench）** | 对话、工具卡片、Trace、附件、当前待办 | Session 事件流、transcript 投影 | M0 ✅ |
 | **记忆（Memory）** | 记忆条目、来源、置信度、编辑/删除 | `ctx.memory` | M1 ✅ |
 | **待办（Tasks）** | 待办、提醒、下次触发时间、完成/顺延 | `ctx.tasks` + 提醒 SSE | M1 ✅ |
-| **知识（Knowledge）** | 个人知识源、同步状态、检索调试、引用预览 | `ctx.knowledge` | M2 |
+| **知识（Knowledge）** | 个人知识源、同步状态、检索调试、引用预览 | `ctx.knowledge` | M2 ✅ |
+| **审批（Approvals）** | 待处理工具审批、批准/拒绝、超时与审计历史 | `ctx.approval` + `approvals.json` | M3 ✅ |
+| **连接器（Connectors）** | 只读邮件/日历/Slack/Notion/RSS、同步状态、统一事件流 | `connectors.json` + `connector-events.json` | M3 ✅ |
 | **产出（Artifacts）** | 草稿、版本、导出记录 | `ctx.artifacts` | M2 |
 | **洞察（Insights）** | Token/成本、工具失败、提醒触达与忽略率 | `ctx.sessionQuery` + OTel | M4 |
 | **设置（Settings）** | 模型、搜索、连接器、隐私（导出/清空）、遥测 | 配置存储 + `ctx.connectors` | M0 部分 ✅ |
@@ -549,6 +551,7 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
   ├─ 知识源 / 文档 / 切块 / 索引
   ├─ 交付物 / 版本 / 导出记录
   ├─ 连接器 / 配置版本 / 健康
+  ├─ 审批 / 一次性授权审计
   └─ 自动化 / 运行记录
 
 二进制
@@ -571,7 +574,7 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
 | 投影缓存 | JSON / SQLite | Postgres | 可重建 |
 | 记忆 | `$DSH_HOME/sv/memory.json` 或 SQLite | Postgres | 可编辑、可删除、可导出 |
 | 待办与提醒 | `$DSH_HOME/sv/tasks.json` | Postgres | 与记忆分开存，避免抽取误伤日程 |
-| 会话检索 | SQLite FTS | Postgres FTS | 按需开启 |
+| 会话检索 | transcript 扫描 | Postgres `ILIKE` | 无外部依赖；按命中次数排序返回片段 |
 | 知识检索 | SQLite FTS（向量按需） | pgvector | 个人规模下 FTS 通常够用 |
 | 领域数据 | JSON + 本地目录 | Postgres | 交付物、自动化、连接器 |
 | 二进制 | 本地附件目录 | S3/MinIO | 内容寻址、授权读取 |
@@ -595,8 +598,12 @@ DSH 本地 Skill provider 的发现顺序（rank 越小越优先）：
 | `Artifact` | `artifactId`、`taskId`、`kind`、`title`、`currentVersion` | 本项目 | 交付物 |
 | `ArtifactVersion` | `versionId`、`artifactId`、`blobRef`、`hash`、`createdAt` | 本项目 | 不可变版本 |
 | `Connector` | `connectorId`、`kind`、`serverName`、`configRef`、`status` | 本项目 | 不存明文密钥 |
-| `Automation` | `automationId`、`trigger`、`mode`、`prompt`、`enabled` | 本项目 | 定时/事件，含简报 |
+| `Connector` | `connectorId`、`kind`（ics/rss/slack/notion/gmail/gcal/outlook）、`settings`、`enabled`、`cursor` | 本项目 | 只读接入，凭据本地保存 |
+| `ConnectorEvent` | `eventId`、`connectorId`、`externalId`、`kind`、`title`、`occurredAt`、`readAt` | 本项目 | 统一事件流，按外部 id 去重 |
+| `Approval` | `approvalId`、`sessionId`、`toolName`、`reason`、`requestedAt`、`outcome`、`decidedBy` | 本项目 | 一次性授权与审计 |
+| `Automation` | `automationId`、`kind`（web/keyword/rss/prompt）、`trigger`、`mode`、`prompt`、`enabled` | 本项目 | 定时/事件，含简报 |
 | `AutomationRun` | `runId`、`automationId`、`sessionId`、`status` | 本项目 | 可追溯到会话 |
+| `UsageRecord` | `day`、`model`、`inputTokens`、`outputTokens`、`cacheReadTokens`、`requests` | 本项目 | 本地费用估算，`usage.json` |
 | `OperationLog` | `eventId`、`actor`（user/agent）、`action`、`target`、`decision`、`at` | 本项目 | 仅追加 |
 | `EvalCase` / `EvalRun` | `caseId`、`suite`、`input`、`checks`、`score` | 本项目 | 评测 |
 
@@ -635,13 +642,13 @@ M1 已落地（`packages/sv-app/src/memory-store.ts`、`memory-extractor.ts`、`
 
 - **切块**：标题感知、400–800 tokens、10–15% 重叠；保留页码/段落定位。
 - **检索**：先 FTS/BM25；召回不足时再引入向量与 RRF 融合，避免为个人规模过度设计。
-- **引用**：每个片段带 `documentId`、`sourceId`、位置、原文哈希；回答必须能回溯。
+- **引用**：每个片段带 `documentId`、`sourceId`、位置、原文哈希；回答必须能回溯。注入格式为 `[标题](sv-knowledge:<docId>)`，前端渲染为可点击链接，点击直接打开知识原文。
 - **增量**：内容哈希去重；删除用墓碑；同步失败不破坏旧索引。
 - **隐私**：个人知识默认仅本机可读，不做跨来源 ACL；导入外部内容时标记来源与时间。
 - **多模态**：先做文本；图片/表格按需引入 OCR/表格解析。
 - **评测**：recall@k、引用准确率、答案有据率、拒答率。
 
-本地实现：SQLite FTS5 起步，向量索引作为可选增强。云端不是产品形态，不维护第二套实现。
+本地实现：进程内倒排索引（ASCII 词 + 中文二元组、IDF 加权），不引入向量库与额外依赖；向量与重排作为后续可选增强。
 
 ### 8.6 交付物
 
@@ -865,46 +872,87 @@ Browser
 
 ### M2 第二大脑：个人知识 + 写作
 
-交付：
+已提前落地（知识库）：
 
-- `ctx.knowledge` 本地实现：Markdown/文本/网页导入、切块、SQLite FTS 检索、引用定位。
-- `knowledge_search` / `knowledge_ingest` 工具；回答中的引用可点击回原文。
-- 写作链路：读取记忆 + 知识 → 生成草稿 → 保存为工作区文件并登记为产出。
-- `/sv` 增加「知识」页；产出在对话侧栏预览。
+- `ctx.knowledge` 的本地实现（`knowledge-store.ts`）：文本 / 工作区文件 / 网页导入，按 Markdown 标题与段落切块（≤900 字符），内存倒排索引（ASCII 词 + 中文二元组）与 IDF 检索；命中带 docId / chunkId / 来源。
+- `knowledge_search` / `knowledge_ingest` / `knowledge_list` 工具；每轮按当前输入召回 Top 3 片段注入 System Prompt，要求模型标注 `[K1]` 与出处。
+- `/sv` 增加「知识」页：搜索、导入（文本 / 文件路径 / URL）、查看全文分块、删除；删除后下一轮不再召回。
+- 数据 `$DSH_HOME/sv/knowledge.json`（0600，最多 200 篇）；单篇 ≤50 万字符；文件导入拒绝二进制与超大文件。
+
+仍未做：
+
+- 向量检索与重排：当前只有词面检索，召回不足时再引入 embedding / rerank。
+- 会话全文搜索：还只能按会话列表翻历史，不能搜「上周聊过什么」。
+- 写作专用管线：草稿目前走对话 + 工作区文件工具，没有独立的草稿库与版本管理。
+- PDF / docx 直接解析：暂不支持，需先转文本。
+
+计划交付（剩余）：
+
+- 向量检索与重排：当前只有词面检索，召回不足时再引入 embedding / rerank。
+- 会话全文搜索：还只能按会话列表翻历史，不能搜「上周聊过什么」。
+- 写作专用管线：草稿目前走对话 + 工作区文件工具，没有独立的草稿库与版本管理。
+- PDF / docx 直接解析：暂不支持，需先转文本。
 
 完成标准：
 
-- 导入一批个人笔记后，提问能给出可点击来源，而不是泛泛而谈。
-- 能基于多份笔记合成一篇草稿，落到工作区可继续编辑。
+- 导入一批个人笔记后，提问能给出可点击来源，而不是泛泛而谈（已达成：来源可在知识页打开）。
+- 能基于多份笔记合成一篇草稿，落到工作区可继续编辑（通用文件工具已支持）。
 
 ### M3 自动化管家：主动简报与监控
 
-交付：
+已提前落地（收件箱 + 每日简报 + 自动化）：
 
-- `ctx.automations`：定时（每日/每周）与事件触发（网页变化、关键词命中）。
-- 简报统一进入 `/sv` 收件箱；支持静默时段、频率上限、一键暂停。
-- 工具：`automation_create` / `automation_list` / `automation_pause`；启用 `operator` 模式。
-- 运行记录、失败重试与下次触发时间可见。
+- `ctx.inbox` 的本地实现（`inbox-store.ts`）：统一收口每日简报、到期提醒、后台对话完成、定时任务回复与自动化结果；未读角标、已读/删除、关联会话跳转；数据 `$DSH_HOME/sv/inbox.json`。
+- 每日简报（`briefing.ts`）：到点汇总今日待办、昨日会话与未读收件箱；模型失败/超时/无密钥时回落模板；可选邮件；生成日期持久化，重启不重复。
+- 后台完成触达：页面关闭后本轮对话继续执行，完成时无 SSE 订阅则写入收件箱；宿主投递回会话的轮次也会记录。
+- `ctx.automations` 的本地实现（`automation-store.ts` / `automation-runtime.ts`）：web 网页变化、keyword 关键词命中、prompt 定时任务；固定间隔 / 每天 / 每周调度；暂停/恢复、立即运行、运行历史与下次触发时间；结果与失败写入收件箱，可选邮件。
+- prompt 类型使用隔离 Agent（`automation-agent.ts`）执行，复用完整工具面，完成后 dispose；同一自动化不并发运行，整轮扫描串行。
+- 工具 `inbox_list` / `automation_create` / `automation_list` / `automation_pause` / `automation_delete`；系统提示词只注入未读数量与最近标题，正文按需读取。
+
+仍未做：
+
+- RSS / Atom 订阅解析。
+- 全局静默时段、全局一键暂停与跨任务频率上限；当前只有每个自动化的调度间隔与去重。
+- `operator` 模式与自动化失败重试策略（失败会记录并触达，但不自动重试）。
+
+计划交付：
+
+- RSS / Atom 订阅与事件触发。
+- 收件箱的静默时段、频率上限与一键暂停。
+- `operator` 模式；监控任务的自动重试与更细的运行记录页。
 
 完成标准：
 
-- 每日早间简报自动生成，包含今日待办与关注变化。
-- 一个网页监控任务能发现变化、触达用户并留下运行记录。
-- 任何主动消息都能追溯到触发规则与被使用的数据。
+- 每日早间简报自动生成，包含今日待办与关注变化（已达成）。
+- 一个网页监控任务能发现变化、触达用户并留下运行记录（已达成：网页变化 / 关键词命中 / 运行历史）。
+- 任何主动消息都能追溯到触发规则与被使用的数据（简报与自动化结果已可在收件箱/运行记录追溯）。
 
 ### M4 一体化与长期自用
 
-交付：
+已提前落地（数据闭环 + 使用面板）：
 
-- 四个场景共用同一记忆与任务模型；冲突消解、优先级与「最近使用」排序。
-- 隐私闭环：按来源导出/删除、全量清空、备份与恢复。
-- 评测：记忆召回、提醒准时率、简报有用性（人工打分）、写作引用准确率。
-- 成本与失败面板；长会话压缩与记忆衰减策略。
+- `backup.ts`：导出单个 JSON，包含记忆、待办、收件箱、知识库、自动化与运行历史、Super-agent 历史、邮件摘要状态、会话索引与 transcripts；排除 `config.json` 密钥与 dsh 原始会话日志。
+- 恢复：校验版本/路径/JSON 与大小上限后覆盖产品数据，并让各 store 重新 `load()`（含 Super-agent 历史重载）；页面自动刷新。
+- 按域清空：记忆 / 待办 / 收件箱 / 知识 / 自动化 / 会话投影 / Super-agent 历史 / 全部；配置与原始日志不受影响。
+- 数据页：会话数、累计 token（输入 / 输出）、各域条目数、可备份体积、文件清单、会话后端与运行时长。
+
+仍未做：
+
+- 按日成本曲线与预算告警（目前只有累计 token 与数据量）。
+- 上下文压缩与记忆衰减策略。
+- 评测体系与失败率面板（当前可依赖日志与运行历史）。
+- 消息编辑 / 重新生成 / 分支、语音输入与 TTS、`ask / auto / operator` 模式分级。
+
+计划交付：
+
+- 按日 usage 记录、成本估算与预算告警。
+- 长会话压缩、记忆衰减与评测指标。
+- 消息编辑/重新生成、语音与模式分级。
 
 完成标准：
 
 - 连续一周真实自用：记忆没有明显误记，提醒没有漏报或骚扰。
-- 数据可导出、可清空；换机器能完整迁移。
+- 数据可导出、可清空；换机器能完整迁移（备份包负责产品数据，`.dsh/sessions` / Postgres 与 `config.json` 需一并迁移）。
 
 ---
 

@@ -103,16 +103,25 @@ function producedFilePath(name: string, value: unknown, args: string | undefined
   return undefined
 }
 
-/** 一轮对话结束后的回调输入（用于异步记忆抽取）。 */
+/** 一轮对话结束后的回调输入（用于异步记忆抽取与后台完成通知）。 */
 export interface ChatTurnComplete {
   sessionId: string
   userText: string
+  assistantText: string
+  /** 页面是否仍有 SSE 在监听；false 表示本轮在后台完成。 */
+  attended: boolean
+}
+
+/** 非 chat.run 触发的轮次（例如宿主定时任务投递回会话）完成后的回调。 */
+export interface ChatDetachedTurn {
+  sessionId: string
   assistantText: string
 }
 
 /** 可选钩子；未提供时 ChatManager 行为不变。 */
 export interface ChatHooks {
   onTurnComplete?(input: ChatTurnComplete): void
+  onDetachedTurn?(input: ChatDetachedTurn): void
 }
 
 /** 一个活跃 SV 会话的运行时记录。 */
@@ -143,6 +152,10 @@ interface LiveSession {
   modelId?: string
   /** 会话累计 token 统计与上下文占用（resume 时从索引恢复）。 */
   usage?: SessionUsage
+  /** 是否有 chat.run 正在消费本轮（区分页面发起与宿主投递）。 */
+  runActive?: boolean
+  /** 非 chat.run 启动的轮次（例如定时任务投递）是否正在进行。 */
+  detachedTurn?: boolean
 }
 
 export class ChatManager {
@@ -172,6 +185,19 @@ export class ChatManager {
     agentCtx.on('agent/status', ({ status }) => {
       rec.status = status
       this.emit(rec, { type: 'status', status })
+      // chat.run 发起的轮次由 run 的 whenIdle 统一收尾；这里只处理宿主
+      // 直接投递到会话的轮次（例如定时任务到点后的继续处理）。
+      if (rec.runActive === true) return
+      if (status === 'running') {
+        this.resetTurn(rec)
+        rec.detachedTurn = true
+        return
+      }
+      if (status === 'idle' && rec.detachedTurn === true) {
+        rec.detachedTurn = false
+        // 等当前 dispatch 收尾，确保 assistant/end 的 commit 已写入 turnText。
+        setTimeout(() => this.finishDetachedTurn(rec), 0)
+      }
     })
     agentCtx.on('agent/assistant-stream', ({ frame }) => {
       this.onStreamFrame(rec, frame)
@@ -255,6 +281,59 @@ export class ChatManager {
       } catch {
         // 单个 sink 故障不影响其他 sink 与 agent 本身
       }
+    }
+  }
+
+  /** 清空一轮的累计缓冲（用户发起与宿主投递的轮次共用）。 */
+  private resetTurn(rec: LiveSession): void {
+    rec.turnStartTs = Date.now()
+    rec.turnUserChars = 0
+    rec.textBuf = ''
+    rec.reasoningBuf = ''
+    rec.turnText = ''
+    rec.turnReasoning = ''
+    rec.turnTools = []
+    rec.pendingTools.clear()
+  }
+
+  /**
+   * 收尾一个宿主投递的轮次：写入 transcript / token 统计，并通知订阅方
+   * （用于收件箱记录「定时任务已完成」）。没有文本输出时只跳过通知。
+   */
+  private finishDetachedTurn(rec: LiveSession): void {
+    const assistantText = rec.turnText
+    if (assistantText.trim().length === 0) return
+    this.ctx.logger.info(svLog('chat', 'turn_completed', {
+      sessionId: rec.sessionId,
+      model: this.store.llm.model,
+      userChars: 0,
+      replyChars: assistantText.length,
+      tools: rec.turnTools.length,
+      durationMs: rec.turnStartTs === 0 ? 0 : Date.now() - rec.turnStartTs,
+      source: 'host',
+    }))
+    void this.sessions.recordAssistant(rec.sessionId, rec.turnText, rec.turnReasoning, rec.turnTools)
+      .catch(error => {
+        this.ctx.logger.warn(svLog('chat', 'transcript_record_failed', {
+          sessionId: rec.sessionId,
+          err: svError(error),
+        }))
+      })
+    if (rec.usage !== undefined) {
+      void this.sessions.recordUsage(rec.sessionId, rec.usage).catch(error => {
+        this.ctx.logger.warn(svLog('chat', 'usage_record_failed', {
+          sessionId: rec.sessionId,
+          err: svError(error),
+        }))
+      })
+    }
+    try {
+      this.hooks.onDetachedTurn?.({ sessionId: rec.sessionId, assistantText })
+    } catch (error) {
+      this.ctx.logger.warn(svLog('chat', 'turn_hook_failed', {
+        sessionId: rec.sessionId,
+        err: svError(error),
+      }))
     }
   }
 
@@ -470,11 +549,14 @@ export class ChatManager {
    * @param requested - 客户端持有的会话 id（可空）。
    * @param text - 用户输入文本；图片消息可以为空串。
    * @param images - 已通过附件服务准入的图片引用，按用户选择顺序排列。
+   * @param context - 可选的上文注入（编辑重发 / 重新生成的分支上下文），
+   *   只进入模型输入，不写入 transcript，也不作为会话标题。
    */
   async *run(
     requested: string | undefined,
     text: string,
     images: readonly ImageAttachmentRef[] = [],
+    context?: string,
   ): AsyncGenerator<SvChatEvent> {
     const sessionId = await this.ensure(requested)
     const rec = this.live.get(sessionId)
@@ -484,13 +566,9 @@ export class ChatManager {
       return
     }
     this.latestUser.set(sessionId, text)
-    rec.turnStartTs = Date.now()
+    this.resetTurn(rec)
+    rec.runActive = true
     rec.turnUserChars = text.length
-    rec.textBuf = ''
-    rec.reasoningBuf = ''
-    rec.turnText = ''
-    rec.turnReasoning = ''
-    rec.turnTools = []
     void this.sessions.recordUser(sessionId, text).catch(() => {})
 
     const queue: SvChatEvent[] = []
@@ -505,7 +583,12 @@ export class ChatManager {
     rec.sinks.add(push)
 
     const content: ContentBlock[] = []
-    if (text.length > 0) content.push({ type: 'text', text })
+    const prefix = context?.trim()
+    if (prefix !== undefined && prefix.length > 0) {
+      content.push({ type: 'text', text: `以下是此前的对话，供你理解上下文：\n\n${prefix}\n\n---\n\n${text}` })
+    } else if (text.length > 0) {
+      content.push({ type: 'text', text })
+    }
     for (const image of images) content.push({ type: 'image', attachment: image })
 
     let followupError: string | undefined
@@ -532,7 +615,8 @@ export class ChatManager {
           const assistantText = rec.turnText
           if (assistantText.trim().length > 0) {
             try {
-              this.hooks.onTurnComplete?.({ sessionId, userText: text, assistantText })
+              // 页面已关闭时 sinks 为空：本轮在后台完成，需要进收件箱。
+              this.hooks.onTurnComplete?.({ sessionId, userText: text, assistantText, attended: rec.sinks.size > 0 })
             } catch (error) {
               this.ctx.logger.warn(svLog('chat', 'turn_hook_failed', { sessionId, err: svError(error) }))
             }
@@ -588,6 +672,7 @@ export class ChatManager {
       }
     } finally {
       rec.sinks.delete(push)
+      rec.runActive = false
     }
   }
 }

@@ -9,9 +9,11 @@
  * 单条会话记录超过上限时删除最旧条目。
  */
 import pg from 'pg'
-import { normalizeUsage, UNTITLED } from './sessions-store.ts'
+import { countOccurrences, normalizeUsage, searchSnippet, UNTITLED } from './sessions-store.ts'
 import type {
+  SessionBackup,
   SessionIndexEntry,
+  SessionSearchHit,
   SessionUsage,
   SvSessionStore,
   TranscriptEntry,
@@ -48,7 +50,7 @@ type MessageRow = {
 
 export class PgSessionStore implements SvSessionStore {
   private readonly pool: InstanceType<typeof pg.Pool>
-  private readonly index = new Map<string, SessionIndexEntry>()
+  private index = new Map<string, SessionIndexEntry>()
   private schemaReady: Promise<void> | undefined
 
   constructor(connectionString: string) {
@@ -241,6 +243,135 @@ export class PgSessionStore implements SvSessionStore {
     await this.schema()
     const result = await this.pool.query('DELETE FROM sv_sessions WHERE id = $1', [id])
     return existed || (result.rowCount ?? 0) > 0
+  }
+
+  /** 清空全部会话索引与消息（数据库级联删除；dsh 原始会话日志不受影响）。 */
+  async clear(): Promise<void> {
+    await this.schema()
+    await this.pool.query('DELETE FROM sv_sessions')
+    this.index.clear()
+  }
+
+  /** 全文检索：SQL ILIKE 粗筛后按出现次数排序；标题命中也计入。 */
+  async search(query: string, limit = 20): Promise<SessionSearchHit[]> {
+    const needle = query.trim()
+    if (needle.length === 0) return []
+    await this.schema()
+    const max = Math.min(100, Math.max(1, Math.trunc(limit)))
+    const escaped = needle.replace(/[\\%_]/g, char => `\\${char}`)
+    const hits: SessionSearchHit[] = []
+    try {
+      const { rows } = await this.pool.query<{
+        session_id: string
+        title: string
+        ts: string | number
+        role: string
+        body: string
+      }>(
+        `SELECT m.session_id, s.title, m.ts, m.role, m.body
+           FROM sv_messages m
+           JOIN sv_sessions s ON s.id = m.session_id
+          WHERE m.body ILIKE $1 ESCAPE '\\'
+          ORDER BY m.ts DESC
+          LIMIT $2`,
+        [`%${escaped}%`, max * 10],
+      )
+      for (const row of rows) {
+        if (row.role !== 'user' && row.role !== 'assistant') continue
+        const count = countOccurrences(row.body, needle)
+        if (count === 0) continue
+        hits.push({
+          sessionId: row.session_id,
+          title: row.title,
+          role: row.role,
+          snippet: searchSnippet(row.body, needle),
+          ts: Number(row.ts),
+          score: count,
+        })
+      }
+    } catch {
+      // 表为空或 SQL 方言差异时回落到内存索引扫描
+    }
+    for (const entry of this.list()) {
+      const titleHits = countOccurrences(entry.title, needle)
+      if (titleHits === 0) continue
+      hits.push({
+        sessionId: entry.id,
+        title: entry.title,
+        role: 'assistant',
+        snippet: entry.title,
+        ts: entry.updatedAt,
+        score: titleHits * 5,
+      })
+    }
+    hits.sort((a, b) => b.score - a.score || b.ts - a.ts)
+    return hits.slice(0, max)
+  }
+
+  /** 导出全部会话与消息。 */
+  async exportAll(): Promise<SessionBackup> {
+    await this.schema()
+    const sessions = this.list().map(entry => ({ ...entry }))
+    const transcripts: Record<string, TranscriptEntry[]> = {}
+    for (const entry of sessions) transcripts[entry.id] = await this.messages(entry.id)
+    return { sessions, transcripts }
+  }
+
+  /** 用快照整体替换会话投影（单事务写入）。 */
+  async importAll(snapshot: SessionBackup): Promise<void> {
+    await this.schema()
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('DELETE FROM sv_sessions')
+      const next = new Map<string, SessionIndexEntry>()
+      for (const entry of snapshot.sessions ?? []) {
+        if (typeof entry?.id !== 'string' || !SESSION_ID_RE.test(entry.id)) continue
+        const usage = normalizeUsage(entry.usage)
+        next.set(entry.id, {
+          id: entry.id,
+          title: typeof entry.title === 'string' && entry.title.length > 0 ? entry.title : UNTITLED,
+          createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : 0,
+          updatedAt: typeof entry.updatedAt === 'number' ? entry.updatedAt : 0,
+          turns: typeof entry.turns === 'number' && entry.turns >= 0 ? entry.turns : 0,
+          ...usage === undefined ? {} : { usage },
+        })
+      }
+      for (const entry of next.values()) {
+        await client.query(
+          `INSERT INTO sv_sessions (id, title, created_at, updated_at, turns, usage)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [entry.id, entry.title, entry.createdAt, entry.updatedAt, entry.turns, entry.usage ?? null],
+        )
+      }
+      for (const [sessionId, entries] of Object.entries(snapshot.transcripts ?? {})) {
+        if (!SESSION_ID_RE.test(sessionId) || !next.has(sessionId) || !Array.isArray(entries)) continue
+        for (const entry of entries) {
+          if (entry === null || typeof entry !== 'object') continue
+          if (entry.role !== 'user' && entry.role !== 'assistant') continue
+          if (typeof entry.text !== 'string') continue
+          await client.query(
+            `INSERT INTO sv_messages (session_id, ts, role, body, reasoning, tools)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              sessionId,
+              typeof entry.ts === 'number' ? entry.ts : Date.now(),
+              entry.role,
+              entry.text,
+              entry.reasoning ?? null,
+              entry.tools === undefined ? null : JSON.stringify(entry.tools),
+            ],
+          )
+        }
+      }
+      await client.query('COMMIT')
+      this.index = next
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      client.release()
+    }
   }
 
   private async insertMessage(id: string, entry: TranscriptEntry): Promise<void> {

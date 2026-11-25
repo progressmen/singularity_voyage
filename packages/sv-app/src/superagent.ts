@@ -165,6 +165,10 @@ export interface SuperAgentSurface {
   /** 手动重试某个已结束运行里的失败 Worker。 */
   retry(runId: string, index: number, signal: AbortSignal): AsyncGenerator<SuperAgentEvent>
   stop(runId: string): boolean
+  /** 清空已结束的运行历史（活动运行保留）。 */
+  clearHistory(): void
+  /** 从持久化快照恢复历史（数据恢复用）。 */
+  restoreHistory(runs: readonly SuperAgentRunView[]): void
 }
 
 /**
@@ -562,6 +566,16 @@ export class SuperAgentRunner {
     this.history.sort((a, b) => b.startedAt - a.startedAt)
     if (this.history.length > SUPER_AGENT_HISTORY_LIMIT) {
       this.history.splice(SUPER_AGENT_HISTORY_LIMIT)
+    }
+  }
+
+  /** 清空已结束的运行历史；活动运行保留，并触发一次持久化回调。 */
+  clearHistory(): void {
+    this.history.length = 0
+    try {
+      this.deps.onChange?.(this.list())
+    } catch {
+      // 持久化失败不影响清空
     }
   }
 

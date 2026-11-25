@@ -34,11 +34,23 @@
           </span>
           <span class="nav-label">新建会话</span>
         </button>
-        <button class="nav-item" id="tab-superagent" data-view="superagent" hidden>
+        <button class="nav-item" id="tab-inbox" data-view="inbox">
           <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><path d="M12 3l2.2 5.3L20 10.5l-5.8 2.2L12 18l-2.2-5.3L4 10.5l5.8-2.2z"/><path d="M18.5 16.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
+            <svg viewBox="0 0 24 24"><path d="M4 5.5h16v13H4z"/><path d="M4 13h4.5l1.5 2.5h4l1.5-2.5H20"/></svg>
           </span>
-          <span class="nav-label">Super Agent</span>
+          <span class="nav-label">收件箱</span>
+        </button>
+        <button class="nav-item" id="tab-approvals" data-view="approvals">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.4-3 8.3-7 10-4-1.7-7-5.6-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg>
+          </span>
+          <span class="nav-label">审批</span>
+        </button>
+        <button class="nav-item" id="tab-knowledge" data-view="knowledge">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 5.5h6.5L12 7l1.5-1.5H20v14H4z"/><path d="M12 7v11"/></svg>
+          </span>
+          <span class="nav-label">知识</span>
         </button>
         <button class="nav-item" id="tab-tasks" data-view="tasks">
           <span class="nav-icon" aria-hidden="true">
@@ -46,25 +58,63 @@
           </span>
           <span class="nav-label">待办</span>
         </button>
-        <button class="nav-item" id="tab-schedules" data-view="schedules">
-          <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 1.8"/></svg>
-          </span>
-          <span class="nav-label">定时任务</span>
+
+        <button class="nav-more-toggle" id="toggle-more-nav" type="button" aria-expanded="false" aria-controls="nav-more">
+          <span class="nav-more-chevron" aria-hidden="true">›</span>
+          <span class="nav-more-label">更多</span>
+          <span class="nav-more-hint">定时任务 · 自动化 · 连接器</span>
         </button>
-        <button class="nav-item" id="tab-memory" data-view="memory">
-          <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="7" ry="2.8"/><path d="M5 5.5v13c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8v-13"/><path d="M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8"/></svg>
-          </span>
-          <span class="nav-label">记忆</span>
-        </button>
-        <button class="nav-item" id="tab-logs" data-view="logs">
-          <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h10"/></svg>
-          </span>
-          <span class="nav-label">日志</span>
-        </button>
+        <div class="nav-more" id="nav-more" hidden>
+          <button class="nav-item" id="tab-superagent" data-view="superagent" hidden>
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 3l2.2 5.3L20 10.5l-5.8 2.2L12 18l-2.2-5.3L4 10.5l5.8-2.2z"/><path d="M18.5 16.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9z"/></svg>
+            </span>
+            <span class="nav-label">Super Agent</span>
+          </button>
+          <button class="nav-item" id="tab-schedules" data-view="schedules">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 1.8"/></svg>
+            </span>
+            <span class="nav-label">定时任务</span>
+          </button>
+          <button class="nav-item" id="tab-automations" data-view="automations">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M13 3L5 14h5l-1 7 8-11h-5z"/></svg>
+            </span>
+            <span class="nav-label">自动化</span>
+          </button>
+          <button class="nav-item" id="tab-connectors" data-view="connectors">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M9 3v5M15 3v5"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v4"/></svg>
+            </span>
+            <span class="nav-label">连接器</span>
+          </button>
+          <button class="nav-item" id="tab-memory" data-view="memory">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="7" ry="2.8"/><path d="M5 5.5v13c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8v-13"/><path d="M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8"/></svg>
+            </span>
+            <span class="nav-label">记忆</span>
+          </button>
+          <button class="nav-item" id="tab-data" data-view="data">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="7" ry="2.8"/><path d="M5 5.5v13c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8v-13"/><path d="M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8"/></svg>
+            </span>
+            <span class="nav-label">数据</span>
+          </button>
+          <button class="nav-item" id="tab-logs" data-view="logs">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h10"/></svg>
+            </span>
+            <span class="nav-label">日志</span>
+          </button>
+        </div>
       </nav>
+
+      <div class="side-search">
+        <input id="conv-search" type="search" placeholder="搜索会话…" autocomplete="off">
+        <button class="side-search-clear" type="button" id="conv-search-clear" hidden aria-label="清空搜索">✕</button>
+        <div class="side-search-results" id="conv-search-results" hidden></div>
+      </div>
 
       <div class="side-section starred" id="section-starred" hidden>
         <button class="side-section-head" type="button" id="toggle-starred" aria-expanded="true">
@@ -110,6 +160,91 @@
       </header>
       <section class="messages" id="messages"></section>
 
+      <section class="panel" id="panel-inbox" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>收件箱<span class="side-count" id="inbox-count"></span></h2>
+            <button class="btn btn-ghost" type="button" id="inbox-refresh">刷新</button>
+            <button class="btn btn-ghost" type="button" id="inbox-read-all">全部已读</button>
+          </div>
+          <p class="schedule-hint">
+            每日简报、到期提醒与后台任务结果都会汇总到这里；未读消息在侧栏显示红点。
+          </p>
+          <div class="memory-kind-filter" id="inbox-kind-filter">
+            <button class="kchip active" data-kind="">全部</button>
+            <button class="kchip" data-kind="briefing">简报</button>
+            <button class="kchip" data-kind="reminder">提醒</button>
+            <button class="kchip" data-kind="agent">助手</button>
+            <button class="kchip" data-kind="automation">自动化</button>
+            <button class="kchip" data-kind="system">系统</button>
+            <label class="panel-toggle"><input type="checkbox" id="inbox-unread-only"> 只看未读</label>
+          </div>
+          <div class="panel-list" id="inbox-list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-knowledge" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>个人知识<span class="side-count" id="knowledge-count"></span></h2>
+            <button class="btn btn-ghost" type="button" id="knowledge-refresh">刷新</button>
+          </div>
+          <p class="schedule-hint">
+            导入 Markdown、文本、工作区文件或网页；对话时自动召回相关片段，回答可回到来源。
+          </p>
+          <div class="knowledge-search-row">
+            <input id="knowledge-search" class="memory-search" placeholder="搜索知识库…" autocomplete="off">
+            <button class="btn btn-ghost" type="button" id="knowledge-search-btn">搜索</button>
+            <button class="btn btn-ghost" type="button" id="knowledge-search-clear" hidden>清空</button>
+          </div>
+          <details class="advanced knowledge-import">
+            <summary>导入资料</summary>
+            <form class="panel-form knowledge-form" id="knowledge-form">
+              <input id="knowledge-title" placeholder="标题（可选，留空自动取首行）" maxlength="120">
+              <input id="knowledge-source" placeholder="来源（可选，如 notes/plan.md）" maxlength="500">
+              <textarea id="knowledge-text" rows="6" placeholder="粘贴 Markdown 或纯文本…" required></textarea>
+              <button class="btn btn-primary" type="submit">保存到知识库</button>
+            </form>
+            <form class="panel-form knowledge-form" id="knowledge-file-form">
+              <input id="knowledge-path" placeholder="工作区文件路径，如 docs/notes.md" required>
+              <button class="btn btn-ghost" type="submit">从文件导入</button>
+            </form>
+            <form class="panel-form knowledge-form" id="knowledge-url-form">
+              <input id="knowledge-url" type="url" placeholder="https://example.com/article" required>
+              <button class="btn btn-ghost" type="submit">从网页导入</button>
+            </form>
+            <div class="test-result" id="knowledge-import-result"></div>
+          </details>
+          <div class="panel-list" id="knowledge-list"></div>
+          <div class="knowledge-detail" id="knowledge-detail" hidden>
+            <div class="panel-head">
+              <h2 id="knowledge-detail-title"></h2>
+              <button class="btn btn-ghost" type="button" id="knowledge-detail-close">返回列表</button>
+            </div>
+            <div class="task-meta" id="knowledge-detail-meta"></div>
+            <div class="panel-list" id="knowledge-detail-chunks"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-approvals" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>审批<span class="side-count" id="approval-count"></span></h2>
+            <button class="btn btn-ghost" type="button" id="approval-refresh">刷新</button>
+            <button class="btn btn-ghost" type="button" id="approval-clear">清空历史</button>
+          </div>
+          <p class="schedule-hint">
+            需要你确认的工具操作会出现在这里。批准只对本次调用生效；未处理会在 10 分钟后自动取消。
+            没有页面在线时后台任务会直接按拒绝处理，避免卡住。
+          </p>
+          <div class="knowledge-section-head">待处理</div>
+          <div class="panel-list" id="approval-pending"></div>
+          <div class="knowledge-section-head">历史</div>
+          <div class="panel-list" id="approval-history"></div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-tasks" hidden>
         <div class="panel-inner">
           <div class="panel-head">
@@ -150,6 +285,174 @@
             新建请直接对话（例如「10 秒后提醒我喝水」）；宿主不提供暂停，删除即取消后续投递。
           </p>
           <div class="panel-list" id="schedules-list"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-automations" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>自动化<span class="side-count" id="automation-count"></span></h2>
+            <button class="btn btn-ghost" type="button" id="automation-refresh">刷新</button>
+          </div>
+          <p class="schedule-hint">
+            网页变化、关键词命中、RSS 更新与定时任务：到点执行，结果与失败都会进入收件箱。
+          </p>
+          <form class="panel-form automation-global" id="automation-global-form">
+            <div class="field-row">
+              <label class="field">
+                <span>全局开关</span>
+                <label class="field-inline"><input type="checkbox" id="automation-paused"> 暂停全部自动化</label>
+              </label>
+              <label class="field">
+                <span>静默时段（只进收件箱，不发邮件）</span>
+                <div class="field-row">
+                  <input id="automation-quiet-start" type="time" value="">
+                  <input id="automation-quiet-end" type="time" value="">
+                </div>
+              </label>
+              <label class="field">
+                <span>失败重试次数</span>
+                <input id="automation-retry" type="number" min="0" max="5" step="1" value="1">
+              </label>
+            </div>
+            <div class="section-actions">
+              <button class="btn btn-ghost" type="submit" id="automation-global-save">保存全局设置</button>
+              <span class="test-result" id="automation-global-result"></span>
+            </div>
+          </form>
+          <details class="advanced automation-create">
+            <summary>新建自动化</summary>
+            <form class="panel-form knowledge-form" id="automation-form">
+              <div class="field-row">
+                <label class="field">
+                  <span>类型</span>
+                  <select id="automation-kind">
+                    <option value="web">网页变化</option>
+                    <option value="keyword">关键词监控</option>
+                    <option value="rss">RSS 订阅</option>
+                    <option value="prompt">定时任务</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>标题</span>
+                  <input id="automation-title" maxlength="120" placeholder="如 竞品价格监控" required>
+                </label>
+              </div>
+              <label class="field" id="automation-url-field">
+                <span>监控网页</span>
+                <input id="automation-url" type="url" placeholder="https://example.com/news" spellcheck="false">
+              </label>
+              <label class="field" id="automation-keywords-field" hidden>
+                <span>关键词（逗号分隔，最多 10 个）</span>
+                <input id="automation-keywords" placeholder="价格, 降息, 发布">
+              </label>
+              <label class="field" id="automation-prompt-field" hidden>
+                <span>任务描述（执行者看不到当前对话，请写完整）</span>
+                <textarea id="automation-prompt" rows="3" placeholder="例如：搜索今天的 AI 行业新闻，给出 3 条摘要与来源"></textarea>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>调度</span>
+                  <select id="automation-schedule-kind">
+                    <option value="interval">固定间隔</option>
+                    <option value="daily">每天</option>
+                    <option value="weekly">每周</option>
+                  </select>
+                </label>
+                <label class="field" id="automation-interval-field">
+                  <span>间隔（分钟）</span>
+                  <input id="automation-interval" type="number" min="1" max="10080" step="1" value="60">
+                </label>
+                <label class="field" id="automation-at-field" hidden>
+                  <span>运行时间</span>
+                  <input id="automation-at" type="time" value="08:30">
+                </label>
+                <label class="field" id="automation-weekday-field" hidden>
+                  <span>星期</span>
+                  <select id="automation-weekday">
+                    <option value="1">周一</option>
+                    <option value="2">周二</option>
+                    <option value="3">周三</option>
+                    <option value="4">周四</option>
+                    <option value="5">周五</option>
+                    <option value="6">周六</option>
+                    <option value="0">周日</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field field-inline">
+                <input type="checkbox" id="automation-email">
+                <span>命中/完成时也发邮件（需邮件通道可用）</span>
+              </label>
+              <div class="section-actions">
+                <button class="btn btn-primary" type="submit" id="automation-submit">创建</button>
+                <span class="test-result" id="automation-result"></span>
+              </div>
+            </form>
+          </details>
+          <div class="panel-list" id="automation-list"></div>
+          <div class="knowledge-section-head">最近运行</div>
+          <div class="panel-list" id="automation-runs"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-connectors" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>连接器<span class="side-count" id="connector-count"></span></h2>
+            <button class="btn btn-ghost" type="button" id="connector-refresh">刷新</button>
+            <button class="btn btn-ghost" type="button" id="connector-read-all">全部已读</button>
+          </div>
+          <p class="schedule-hint">
+            只读接入邮件、日历、Slack、Notion 与 RSS/Atom；不会代表你发送或修改任何内容。
+            凭据只保存在本机数据目录，列表只显示「已配置」。
+          </p>
+          <details class="advanced automation-create">
+            <summary>添加连接器</summary>
+            <form class="panel-form knowledge-form" id="connector-form">
+              <div class="field-row">
+                <label class="field">
+                  <span>类型</span>
+                  <select id="connector-kind">
+                    <option value="ics">日历订阅 (ICS)</option>
+                    <option value="rss">RSS / Atom</option>
+                    <option value="slack">Slack</option>
+                    <option value="notion">Notion</option>
+                    <option value="gmail">Gmail</option>
+                    <option value="gcal">Google Calendar</option>
+                    <option value="outlook">Outlook (Graph)</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>名称</span>
+                  <input id="connector-name" maxlength="80" placeholder="如 工作邮箱 / 产品日历">
+                </label>
+              </div>
+              <div class="field-row connector-fields" id="connector-fields"></div>
+              <div class="field-row">
+                <label class="field">
+                  <span>同步间隔（分钟）</span>
+                  <input id="connector-interval" type="number" min="5" max="10080" step="1" value="15">
+                </label>
+                <label class="field">
+                  <span>首次同步天数</span>
+                  <input id="connector-days" type="number" min="1" max="30" step="1" value="7">
+                </label>
+              </div>
+              <div class="section-actions">
+                <button class="btn btn-primary" type="submit" id="connector-submit">添加</button>
+                <button class="btn btn-ghost" type="button" id="connector-test">测试</button>
+                <span class="test-result" id="connector-result"></span>
+              </div>
+            </form>
+          </details>
+          <div class="panel-list" id="connector-list"></div>
+          <div class="knowledge-section-head">最近事件</div>
+          <div class="memory-search-row">
+            <input id="connector-event-search" class="memory-search" placeholder="搜索事件…" autocomplete="off">
+            <button class="btn btn-ghost" type="button" id="connector-event-clear">清空事件</button>
+          </div>
+          <div class="panel-list" id="connector-events"></div>
         </div>
       </section>
 
@@ -205,6 +508,62 @@
             <select id="sa-history" aria-label="Super Agent 历史运行"></select>
           </div>
           <div class="panel-list" id="sa-runs"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-data" hidden>
+        <div class="panel-inner">
+          <div class="panel-head">
+            <h2>数据与备份</h2>
+            <button class="btn btn-ghost" type="button" id="data-refresh">刷新</button>
+          </div>
+          <p class="schedule-hint">
+            备份为单个 JSON 文件，含记忆、待办、收件箱、知识库、自动化与会话投影；
+            不含 API Key / SMTP 密码，也不含 dsh 原始会话日志（`.dsh/sessions` 或 Postgres）。
+          </p>
+          <div class="data-stat-grid" id="data-stats"></div>
+          <div class="panel-list" id="data-files"></div>
+          <div class="data-block">
+            <h3>备份与恢复</h3>
+            <div class="section-actions">
+              <select id="data-export-domain" class="data-select">
+                <option value="all">全部数据</option>
+                <option value="memory">长期记忆</option>
+                <option value="tasks">待办与提醒</option>
+                <option value="inbox">收件箱</option>
+                <option value="knowledge">个人知识</option>
+                <option value="automations">自动化与运行历史</option>
+                <option value="sessions">会话</option>
+                <option value="superagent">Super-agent 运行历史</option>
+                <option value="approvals">审批历史</option>
+                <option value="connectors">连接器与事件</option>
+              </select>
+              <button class="btn btn-primary" type="button" id="data-export">导出备份</button>
+              <button class="btn btn-ghost" type="button" id="data-restore">恢复备份…</button>
+              <input id="data-restore-input" type="file" accept="application/json,.json" hidden>
+              <span class="test-result" id="data-result"></span>
+            </div>
+            <p class="schedule-hint">按域导出只包含所选数据；恢复会覆盖当前记忆、待办、收件箱、知识库、自动化与会话投影，且不可撤销。</p>
+          </div>
+          <div class="data-block">
+            <h3>清空数据</h3>
+            <div class="section-actions">
+              <select id="data-clear-domain" class="data-select">
+                <option value="memory">长期记忆</option>
+                <option value="tasks">待办与提醒</option>
+                <option value="inbox">收件箱</option>
+                <option value="knowledge">个人知识</option>
+                <option value="automations">自动化与运行历史</option>
+                <option value="sessions">会话投影</option>
+                <option value="superagent">Super-agent 运行历史</option>
+                <option value="approvals">审批历史</option>
+                <option value="connectors">连接器与事件</option>
+                <option value="all">全部个人数据</option>
+              </select>
+              <button class="btn btn-danger" type="button" id="data-clear">清空</button>
+            </div>
+            <p class="schedule-hint">清空只影响本产品的数据文件；config.json（密钥）与 dsh 原始会话日志不受影响。</p>
+          </div>
         </div>
       </section>
 
@@ -482,6 +841,27 @@
           <button type="button" class="btn btn-ghost" id="test-mail">发送测试邮件</button>
           <span class="test-result" id="test-mail-result"></span>
         </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>每日简报</h3>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-brief-enabled">
+          <span>启用每日简报（生成后进入收件箱）</span>
+        </label>
+        <label class="field">
+          <span>生成时间（本地时区）</span>
+          <input id="cfg-brief-time" type="time">
+        </label>
+        <label class="field field-inline">
+          <input type="checkbox" id="cfg-brief-email">
+          <span>同时发送到邮箱（需先启用邮件通知并配置 SMTP）</span>
+        </label>
+        <div class="section-actions">
+          <button type="button" class="btn btn-ghost" id="brief-run">立即生成</button>
+          <span class="test-result" id="brief-run-result"></span>
+        </div>
+        <p class="schedule-hint">简报汇总今日待办、昨日对话与未读收件箱；模型不可用时自动回落到模板。</p>
       </section>
 
       <div class="settings-actions">

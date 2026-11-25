@@ -121,9 +121,40 @@ export interface SvSearchConfig {
   budgetMs?: number
 }
 
+/** 每日简报配置。 */
+export interface SvBriefingConfig {
+  /** 是否启用定时生成；手动「立即生成」不受此开关影响。 */
+  enabled: boolean
+  /** 每天生成时间（HH:mm，本地时区）；空字符串表示不生成。 */
+  time: string
+  /** 生成后是否额外发一封邮件（需要邮件通道已启用且 SMTP 配置完整）。 */
+  email: boolean
+}
+
+/** 自动化全局设置。 */
+export interface SvAutomationConfig {
+  /** 全局暂停：暂停后调度扫描不再执行任何自动化。 */
+  paused: boolean
+  /** 静默时段开始（HH:mm）；空字符串表示不静默。 */
+  quietStart: string
+  /** 静默时段结束（HH:mm）。 */
+  quietEnd: string
+  /** 失败后的额外重试次数（0–5）。 */
+  retryAttempts: number
+}
+
+/** 用量与费用估算配置。 */
+export interface SvUsageConfig {
+  /** 输入 token 单价（每百万 token，按用户填写币种）。 */
+  inputPerMillion: number
+  /** 输出 token 单价（每百万 token）。 */
+  outputPerMillion: number
+  /** 月度 token 预算；0 表示不限制。 */
+  monthlyTokenBudget: number
+}
+
 /** 邮件通道配置（SMTP）。 */
-export interface SvMailConfig {
-  /** 是否启用邮件通道（提醒与摘要都受它控制）。 */
+export interface SvMailConfig {  /** 是否启用邮件通道（提醒与摘要都受它控制）。 */
   enabled: boolean
   /** SMTP 主机，例如 smtp.qq.com。 */
   host: string
@@ -156,6 +187,26 @@ interface SvStoreShape {
   superAgent: SvSuperAgentConfig
   search: SvSearchConfig
   mail: SvMailConfig
+  briefing: SvBriefingConfig
+  /** 自动化全局设置（暂停 / 静默时段 / 重试）。 */
+  automations: SvAutomationConfig
+  /** 用量与费用估算配置。 */
+  usage: SvUsageConfig
+}
+
+/** 内置的每日简报缺省值：默认开启，只进收件箱，不额外发邮件。 */
+export function defaultBriefingConfig(): SvBriefingConfig {
+  return { enabled: true, time: '08:30', email: false }
+}
+
+/** 内置的自动化缺省值：不暂停、不静默、失败重试 1 次。 */
+export function defaultAutomationConfig(): SvAutomationConfig {
+  return { paused: false, quietStart: '', quietEnd: '', retryAttempts: 1 }
+}
+
+/** 内置的用量估算缺省值：未填写单价与预算，只展示 token。 */
+export function defaultUsageConfig(): SvUsageConfig {
+  return { inputPerMillion: 0, outputPerMillion: 0, monthlyTokenBudget: 0 }
 }
 
 /** 内置的邮件缺省值：未配置 SMTP 时通道处于关闭状态。 */
@@ -207,6 +258,9 @@ export interface SvPublicState {
     notifyOnReminder: boolean
     digestAt: string
   }
+  briefing: SvBriefingConfig
+  automations: SvAutomationConfig
+  usage: SvUsageConfig
 }
 
 /** SV 数据目录：$DSH_HOME/sv（可用 SV_HOME 覆盖）。 */
@@ -234,6 +288,11 @@ function positiveInt(value: unknown): number | undefined {
 /** 读取闭区间整数；越界或非法返回 undefined。 */
 function rangedInt(value: unknown, min: number, max: number): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined
+}
+
+/** 读取非负数字；非法返回 undefined。 */
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }
 
 /** 新模型配置的稳定 id。 */
@@ -272,6 +331,9 @@ export class ConfigStore {
     llm: SvLlmConfig
     search: SvSearchConfig
     mail?: SvMailConfig
+    briefing?: SvBriefingConfig
+    automations?: SvAutomationConfig
+    usage?: SvUsageConfig
     /** 启动时的 Super-agent 默认值（来自 patch / 环境变量）。 */
     superAgent?: SvSuperAgentConfig
   }) {
@@ -284,6 +346,9 @@ export class ConfigStore {
       superAgent: { enabled: false, ...SUPER_AGENT_DEFAULTS, ...defaults.superAgent },
       search: { ...defaults.search },
       mail: { ...defaultMailConfig(), ...defaults.mail },
+      briefing: { ...defaultBriefingConfig(), ...defaults.briefing },
+      automations: { ...defaultAutomationConfig(), ...defaults.automations },
+      usage: { ...defaultUsageConfig(), ...defaults.usage },
     }
   }
 
@@ -300,6 +365,21 @@ export class ConfigStore {
   /** 当前生效的邮件配置。 */
   get mail(): SvMailConfig {
     return this.state.mail
+  }
+
+  /** 每日简报开关、时间与邮件选项。 */
+  get briefing(): SvBriefingConfig {
+    return this.state.briefing
+  }
+
+  /** 自动化全局设置（暂停 / 静默时段 / 重试）。 */
+  get automations(): SvAutomationConfig {
+    return this.state.automations
+  }
+
+  /** 用量与费用估算配置。 */
+  get usage(): SvUsageConfig {
+    return this.state.usage
   }
 
   /** Super-agent 开关与限额（保存后即时应用）。 */
@@ -374,6 +454,9 @@ export class ConfigStore {
       superAgent: Partial<SvSuperAgentConfig>
       search: Partial<SvSearchConfig>
       mail: Partial<SvMailConfig>
+      briefing: Partial<SvBriefingConfig>
+      automations: Partial<SvAutomationConfig>
+      usage: Partial<SvUsageConfig>
     }>
     if (typeof record.llm === 'object' && record.llm !== null) {
       const { llm } = record
@@ -480,6 +563,40 @@ export class ConfigStore {
         this.state.mail.digestAt = mail.digestAt.trim()
       }
     }
+    if (typeof record.briefing === 'object' && record.briefing !== null) {
+      const briefing = record.briefing
+      if (typeof briefing.enabled === 'boolean') this.state.briefing.enabled = briefing.enabled
+      if (typeof briefing.time === 'string') {
+        const value = briefing.time.trim()
+        if (DIGEST_TIME_RE.test(value)) this.state.briefing.time = value
+      }
+      if (typeof briefing.email === 'boolean') this.state.briefing.email = briefing.email
+    }
+    if (typeof record.automations === 'object' && record.automations !== null) {
+      const automation = record.automations
+      if (typeof automation.paused === 'boolean') this.state.automations.paused = automation.paused
+      if (typeof automation.quietStart === 'string') {
+        const value = automation.quietStart.trim()
+        if (value.length === 0) this.state.automations.quietStart = ''
+        else if (DIGEST_TIME_RE.test(value)) this.state.automations.quietStart = value
+      }
+      if (typeof automation.quietEnd === 'string') {
+        const value = automation.quietEnd.trim()
+        if (value.length === 0) this.state.automations.quietEnd = ''
+        else if (DIGEST_TIME_RE.test(value)) this.state.automations.quietEnd = value
+      }
+      const retryAttempts = rangedInt(automation.retryAttempts, 0, 5)
+      if (retryAttempts !== undefined) this.state.automations.retryAttempts = retryAttempts
+    }
+    if (typeof record.usage === 'object' && record.usage !== null) {
+      const usage = record.usage
+      const inputPerMillion = nonNegativeNumber(usage.inputPerMillion)
+      if (inputPerMillion !== undefined) this.state.usage.inputPerMillion = inputPerMillion
+      const outputPerMillion = nonNegativeNumber(usage.outputPerMillion)
+      if (outputPerMillion !== undefined) this.state.usage.outputPerMillion = outputPerMillion
+      const monthlyTokenBudget = nonNegativeNumber(usage.monthlyTokenBudget)
+      if (monthlyTokenBudget !== undefined) this.state.usage.monthlyTokenBudget = monthlyTokenBudget
+    }
   }
 
   /**
@@ -514,6 +631,9 @@ export class ConfigStore {
       notifyOnReminder?: unknown
       digestAt?: unknown
     }
+    briefing?: { enabled?: unknown; time?: unknown; email?: unknown }
+    automations?: { paused?: unknown; quietStart?: unknown; quietEnd?: unknown; retryAttempts?: unknown }
+    usage?: { inputPerMillion?: unknown; outputPerMillion?: unknown; monthlyTokenBudget?: unknown }
   }): Promise<SvPublicState> {
     if (patch.llm !== undefined) {
       const { llm } = patch
@@ -740,6 +860,59 @@ export class ConfigStore {
       if (this.state.mail.from.length === 0) this.state.mail.from = this.state.mail.user
       if (this.state.mail.to.length === 0) this.state.mail.to = this.state.mail.user
     }
+    if (patch.briefing !== undefined) {
+      const briefing = patch.briefing
+      if (briefing.enabled !== undefined) {
+        if (typeof briefing.enabled !== 'boolean') throw new Error('简报启用开关必须是布尔值')
+        this.state.briefing.enabled = briefing.enabled
+      }
+      if (briefing.time !== undefined) {
+        const value = briefing.time === null ? '' : String(briefing.time).trim()
+        if (value.length > 0 && !DIGEST_TIME_RE.test(value)) throw new Error('每日简报时间必须是 HH:mm（如 08:30）')
+        this.state.briefing.time = value
+      }
+      if (briefing.email !== undefined) {
+        if (typeof briefing.email !== 'boolean') throw new Error('简报邮件开关必须是布尔值')
+        this.state.briefing.email = briefing.email
+      }
+    }
+    if (patch.automations !== undefined) {
+      const automation = patch.automations
+      if (automation.paused !== undefined) {
+        if (typeof automation.paused !== 'boolean') throw new Error('自动化暂停开关必须是布尔值')
+        this.state.automations.paused = automation.paused
+      }
+      for (const [key, label] of [['quietStart', '静默开始'], ['quietEnd', '静默结束']] as const) {
+        const raw = automation[key]
+        if (raw === undefined) continue
+        const value = raw === null ? '' : String(raw).trim()
+        if (value.length > 0 && !DIGEST_TIME_RE.test(value)) throw new Error(`静默${label}时间必须是 HH:mm（如 22:00）`)
+        this.state.automations[key] = value
+      }
+      if (automation.retryAttempts !== undefined) {
+        const value = rangedInt(automation.retryAttempts, 0, 5)
+        if (value === undefined) throw new Error('自动化重试次数必须是 0–5 的整数')
+        this.state.automations.retryAttempts = value
+      }
+    }
+    if (patch.usage !== undefined) {
+      const usage = patch.usage
+      for (const [key, label] of [
+        ['inputPerMillion', '输入单价'],
+        ['outputPerMillion', '输出单价'],
+        ['monthlyTokenBudget', '月度预算'],
+      ] as const) {
+        const raw = usage[key]
+        if (raw === undefined) continue
+        if (raw === null) {
+          this.state.usage[key] = 0
+          continue
+        }
+        const value = nonNegativeNumber(raw)
+        if (value === undefined) throw new Error(`${label}必须是非负数字`)
+        this.state.usage[key] = value
+      }
+    }
     await this.persist()
     return this.publicState()
   }
@@ -781,6 +954,9 @@ export class ConfigStore {
         notifyOnReminder: this.state.mail.notifyOnReminder,
         digestAt: this.state.mail.digestAt,
       },
+      briefing: { ...this.state.briefing },
+      automations: { ...this.state.automations },
+      usage: { ...this.state.usage },
     }
   }
 
