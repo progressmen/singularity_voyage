@@ -7,6 +7,8 @@ __pycache__/
 .DS_Store
 .env
 .dsh/
+# 本地测试 HOME（含 arkcli 凭据，禁止入库）
+.tmp-home/
 logs/
 .pids/
 .trae/

@@ -1161,7 +1161,7 @@ dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.55); }
   /* 窄屏优先保证对话区宽度，右侧文件列表收起 */
   .file-rail { display: none; }
 }
-@media (max-width: 720px) {
+@media (max-width: 900px) {
   /* 窄屏：侧栏改为抽屉，默认收起，避免遮挡主区表单与按钮 */
   .model-switch { max-width: 112px; }
   .sidebar {

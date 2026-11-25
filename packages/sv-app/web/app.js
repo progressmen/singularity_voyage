@@ -5292,8 +5292,9 @@ $('input').addEventListener('keydown', (e) => {
   }
 })
 /** 窄屏抽屉：打开时显示遮罩，关闭时一并收起。 */
+const narrowMedia = window.matchMedia('(max-width: 900px)')
 function isNarrow() {
-  return window.matchMedia('(max-width: 720px)').matches
+  return narrowMedia.matches
 }
 function setSidebarOpen(open) {
   $('sidebar').classList.toggle('open', open)
@@ -5304,6 +5305,9 @@ $('toggle-sidebar').addEventListener('click', () => {
   else $('sidebar').classList.toggle('collapsed')
 })
 $('sidebar-backdrop').addEventListener('click', () => setSidebarOpen(false))
+// 窗口缩到窄屏时自动收起抽屉；重新变宽时清理 open 状态，避免下次缩小时又自动弹出。
+narrowMedia.addEventListener('change', () => setSidebarOpen(false))
+if (isNarrow()) setSidebarOpen(false)
 /** 窄屏下选中视图后收起抽屉，避免继续遮挡主区。 */
 function closeSidebarDrawer() {
   if (isNarrow()) setSidebarOpen(false)
@@ -5569,24 +5573,25 @@ $('fetch-models').addEventListener('click', async () => {
   }
 })
 
-const bootActiveId = localStorage.getItem(ACTIVE_KEY)
-if (conversations.length === 0) newConversation()
-else {
-  if (activeId === null || !conversations.some(c => c.id === activeId)) {
-    activeId = conversations[0].id
-  }
-  renderSidebar()
-  renderMessages()
-}
+// 每次打开 /sv/ 都从空白新对话开始，并把光标放进输入框。
+currentView = 'chat'
+localStorage.setItem(VIEW_KEY, 'chat')
+activeId = null
+localStorage.removeItem(ACTIVE_KEY)
+const bootBlank = conversations.find(c => c.id === null && c.messages.length === 0)
+conversations = bootBlank === undefined
+  ? [{ id: null, title: '新对话', messages: [], updatedAt: Date.now() }, ...conversations]
+  : [bootBlank, ...conversations.filter(c => c !== bootBlank && !(c.id === null && c.messages.length === 0))]
+saveConversations()
+renderSidebar()
+renderMessages()
 setNavMore(navMoreExpanded, false)
-applyView(currentView)
-if (bootActiveId && (activeConversation()?.messages.length ?? 0) === 0) {
-  void hydrateConversation(bootActiveId)
-}
-// 从服务端索引补齐侧边栏（清缓存/换浏览器后仍能看到历史会话），必要时回填当前会话
+applyView('chat')
+$('input').focus()
+// 从服务端索引补齐侧边栏（清缓存/换浏览器后仍能看到历史会话列表）
 void syncConversations().then(() => {
   const conv = activeConversation()
-  if (conv !== null && conv.messages.length === 0) void hydrateConversation(conv.id)
+  if (conv !== null && conv.id !== null && conv.messages.length === 0) void hydrateConversation(conv.id)
 })
 loadState()
 connectReminders()
