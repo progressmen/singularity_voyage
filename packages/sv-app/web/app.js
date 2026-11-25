@@ -40,6 +40,8 @@ const LLM_PRESETS = {
 let conversations = loadConversations()
 let activeId = localStorage.getItem(ACTIVE_KEY) ?? null
 let streaming = false
+/** 当前正在朗读的回答：{ key, utterance }；用于跨重绘恢复按钮状态。 */
+let speechState = null
 
 /** 图片消息限制（与后端 /sv/api/chat 的校验保持一致）。 */
 const MAX_IMAGES = 4
@@ -919,6 +921,8 @@ const ICON_COPY = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" s
 const ICON_CHECK = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.4l3 3 6-6.8"/></svg>'
 const ICON_REGEN = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.8v2.7h-2.7"/></svg>'
 const ICON_EDIT = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 2.6l3 3L5.8 13.2l-3.6.6.6-3.6z"/></svg>'
+const ICON_SPEAK = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.2h2.6L9 3.4v9.2L5.6 9.8H3z"/><path d="M11.5 5.6a3.6 3.6 0 0 1 0 4.8"/><path d="M13.3 3.6a6.4 6.4 0 0 1 0 8.8"/></svg>'
+const ICON_SPEAK_STOP = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.2h2.6L9 3.4v9.2L5.6 9.8H3z"/><path d="M11.6 6.2l3.2 3.6M14.8 6.2l-3.2 3.6"/></svg>'
 
 /** 用户消息底部操作条：编辑并重发（会创建分支会话）。 */
 function userActions() {
@@ -970,6 +974,19 @@ function answerActions(text) {
 
   bar.appendChild(button)
 
+  if ('speechSynthesis' in window) {
+    const speak = document.createElement('button')
+    speak.type = 'button'
+    speak.className = 'icon-btn msg-speak'
+    speak.dataset.speechKey = speechKey(text)
+    speak.title = '朗读回答'
+    speak.setAttribute('aria-label', '朗读回答')
+    speak.innerHTML = ICON_SPEAK
+    speak.addEventListener('click', () => toggleSpeech(text))
+    bar.appendChild(speak)
+    applySpeechButtonState(speak)
+  }
+
   const regen = document.createElement('button')
   regen.type = 'button'
   regen.className = 'icon-btn msg-regen'
@@ -978,6 +995,97 @@ function answerActions(text) {
   regen.innerHTML = ICON_REGEN
   bar.appendChild(regen)
   return bar
+}
+
+/**
+ * 把 Markdown 回答转成适合朗读的纯文本：去掉代码块与标记符号，保留段落停顿。
+ */
+function speechText(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/^\s*---+\s*$/gm, '')
+    .replace(/^\s*\|?[\s:|-]+\|?\s*$/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\|/g, '，')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, 20_000)
+}
+
+/** 用文本长度与简单哈希生成稳定 key：重绘后仍能找回正在朗读的那条消息。 */
+function speechKey(text) {
+  let hash = 0
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) | 0
+  }
+  return `${text.length}:${hash}`
+}
+
+/** 根据当前朗读状态刷新单个朗读按钮。 */
+function applySpeechButtonState(button) {
+  const active = speechState !== null && button.dataset.speechKey === speechState.key
+  button.classList.toggle('speaking', active)
+  button.title = active ? '停止朗读' : '朗读回答'
+  button.setAttribute('aria-label', active ? '停止朗读' : '朗读回答')
+  button.innerHTML = active ? ICON_SPEAK_STOP : ICON_SPEAK
+  const bar = button.closest('.msg-actions')
+  if (bar !== null) bar.classList.toggle('speaking', active)
+}
+
+/** 刷新当前页面里所有朗读按钮（重绘后状态一致）。 */
+function syncSpeechButtons() {
+  document.querySelectorAll('.msg-speak').forEach(button => applySpeechButtonState(button))
+}
+
+/** 朗读/停止一条回答；同一时间只播放一条。 */
+function toggleSpeech(text) {
+  if (!('speechSynthesis' in window)) {
+    alert('当前浏览器不支持语音朗读')
+    return
+  }
+  const key = speechKey(text)
+  if (speechState !== null && speechState.key === key) {
+    speechState = null
+    window.speechSynthesis.cancel()
+    syncSpeechButtons()
+    return
+  }
+  const plain = speechText(text)
+  if (plain.length === 0) {
+    alert('这条回答没有可朗读的文字')
+    return
+  }
+  window.speechSynthesis.cancel()
+  speechState = null
+  const utterance = new SpeechSynthesisUtterance(plain)
+  utterance.lang = /[\u4e00-\u9fff]/.test(plain) ? 'zh-CN' : 'en-US'
+  utterance.rate = 1
+  const voices = window.speechSynthesis.getVoices()
+  const voice = voices.find(item => item.lang === utterance.lang)
+    ?? voices.find(item => item.lang.startsWith(utterance.lang.slice(0, 2)))
+  if (voice !== undefined) {
+    utterance.voice = voice
+    utterance.lang = voice.lang
+  }
+  const finish = () => {
+    if (speechState !== null && speechState.utterance === utterance) {
+      speechState = null
+      syncSpeechButtons()
+    }
+  }
+  utterance.onend = finish
+  utterance.onerror = finish
+  speechState = { key, utterance }
+  window.speechSynthesis.speak(utterance)
+  syncSpeechButtons()
 }
 
 /**
