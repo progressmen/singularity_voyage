@@ -85,10 +85,17 @@ let knowledgeDetail = null
 let automationsCache = []
 let automationRuns = []
 let automationRunningId = null
+/** 正在编辑的自动化 id；null 表示新建。 */
+let automationEditingId = null
 /** 自动化全局设置（暂停 / 静默 / 重试）。 */
 let automationConfig = { paused: false, quietStart: '', quietEnd: '', retryAttempts: 1 }
-/** 会话全文检索的输入防抖与结果。 */
+/* 会话全文检索的输入防抖与结果。 */
 let convSearchTimer = null
+/** 搜索弹窗状态：当前范围（all | message | session）、命中与关键词。 */
+let convSearchScope = 'all'
+let convSearchHits = []
+let convSearchQuery = ''
+let convSearchPending = false
 /** 审批缓存：待处理与历史、未处理数量。 */
 let approvalsPending = []
 let approvalsHistory = []
@@ -185,14 +192,24 @@ function newConversation() {
   activeId = null
   localStorage.removeItem(ACTIVE_KEY)
   saveConversations()
+  syncSessionUrl(null)
   renderSidebar()
   renderMessages()
   $('input').focus()
 }
 
+/** 让地址栏跟随当前会话：分享链接与刷新定位都依赖 ?session=<id>。 */
+function syncSessionUrl(id) {
+  const url = new URL(location.href)
+  if (typeof id === 'string' && id.length > 0) url.searchParams.set('session', id)
+  else url.searchParams.delete('session')
+  if (url.toString() !== location.href) history.replaceState(null, '', url)
+}
+
 function selectConversation(id) {
   activeId = id
   localStorage.setItem(ACTIVE_KEY, id)
+  syncSessionUrl(id)
   renderSidebar()
   renderMessages()
   applyView('chat')
@@ -407,45 +424,148 @@ function renderSidebar() {
   renderUsage(conv?.usage)
 }
 
-/* ── 会话全文检索 ─────────────────────────────────────── */
+/* ── 会话全文检索（居中搜索弹窗） ─────────────────────── */
 
-/** 渲染检索结果下拉框。 */
-function renderConvSearchResults(hits, query) {
-  const box = $('conv-search-results')
-  box.innerHTML = ''
-  if (query.length === 0) {
-    box.hidden = true
-    return
+/** 对话气泡图标（搜索结果与最近对话共用）。 */
+const SEARCH_CHAT_ICON = '<path d="M20 11.5a8 8 0 0 1-8 8H5l-2 2.5v-11a8 8 0 0 1 17 0z"/>'
+
+/** 结果行时间：今天 10:20 / 昨天 18:05 / 11月19日 15:56。 */
+function formatSearchTime(ts) {
+  const value = Number(ts)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  const date = new Date(value)
+  const now = new Date()
+  const pad = (part) => String(part).padStart(2, '0')
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
+  const dayDiff = Math.round((startOfToday - startOfDate) / 86400000)
+  if (dayDiff === 0) return `今天 ${clock}`
+  if (dayDiff === 1) return `昨天 ${clock}`
+  const day = date.getFullYear() === now.getFullYear()
+    ? `${date.getMonth() + 1}月${date.getDate()}日`
+    : `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`
+  return `${day} ${clock}`
+}
+
+/** 生成一行搜索弹窗条目：图标 + 标题（可选摘要）+ 右侧时间。 */
+function createSearchRow({ iconPath, title, snippet, time, onClick }) {
+  const row = document.createElement('button')
+  row.type = 'button'
+  row.className = 'search-result-row'
+  const icon = document.createElement('span')
+  icon.className = 'search-row-icon'
+  icon.setAttribute('aria-hidden', 'true')
+  icon.innerHTML = `<svg viewBox="0 0 24 24">${iconPath}</svg>`
+  const text = document.createElement('span')
+  text.className = 'search-row-text'
+  const titleNode = document.createElement('span')
+  titleNode.className = 'search-row-title'
+  titleNode.textContent = title
+  text.appendChild(titleNode)
+  if (snippet) {
+    const snippetNode = document.createElement('span')
+    snippetNode.className = 'search-row-snippet'
+    snippetNode.textContent = snippet
+    text.appendChild(snippetNode)
   }
-  if (hits.length === 0) {
+  row.append(icon, text)
+  if (time) {
+    const timeNode = document.createElement('span')
+    timeNode.className = 'search-row-time'
+    timeNode.textContent = time
+    row.appendChild(timeNode)
+  }
+  row.addEventListener('click', onClick)
+  return row
+}
+
+/** 「对话」按会话去重；「消息」排除仅标题命中的条目。 */
+function filterSearchHits(hits, scope) {
+  if (scope === 'message') return hits.filter(hit => hit.snippet !== hit.title)
+  if (scope === 'session') {
+    const seen = new Set()
+    return hits.filter(hit => {
+      if (seen.has(hit.sessionId)) return false
+      seen.add(hit.sessionId)
+      return true
+    })
+  }
+  return hits
+}
+
+/** 空关键词时展示最近对话（按本地更新时间倒序）。 */
+function renderSearchRecent() {
+  const box = $('conv-search-recent-list')
+  box.innerHTML = ''
+  const recent = conversations
+    .filter(conv => conv.id !== null && conv.messages.length > 0)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, 10)
+  if (recent.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'panel-empty'
-    empty.textContent = '没有匹配的会话'
+    empty.textContent = '暂无历史对话'
     box.appendChild(empty)
-  } else {
-    for (const hit of hits) {
-      const row = document.createElement('button')
-      row.type = 'button'
-      row.className = 'side-search-hit'
-      const title = document.createElement('div')
-      title.className = 'side-search-hit-title'
-      title.textContent = hit.title || '未命名会话'
-      const snippet = document.createElement('div')
-      snippet.className = 'side-search-hit-snippet'
-      snippet.textContent = hit.snippet ?? ''
-      row.append(title, snippet)
-      row.addEventListener('click', () => openSearchHit(hit))
-      box.appendChild(row)
-    }
+    return
   }
-  box.hidden = false
+  for (const conv of recent) {
+    box.appendChild(createSearchRow({
+      iconPath: SEARCH_CHAT_ICON,
+      title: conv.title || '未命名会话',
+      time: formatSearchTime(conv.updatedAt),
+      onClick: () => {
+        closeConvSearch()
+        selectConversation(conv.id)
+      },
+    }))
+  }
+}
+
+/** 按当前关键词与范围渲染弹窗内容。 */
+function renderConvSearchResults() {
+  const emptyQuery = convSearchQuery.length === 0
+  $('conv-search-quick').hidden = !emptyQuery
+  $('conv-search-recent').hidden = !emptyQuery
+  $('conv-search-hit-section').hidden = emptyQuery
+  const box = $('conv-search-results')
+  box.innerHTML = ''
+  if (emptyQuery) {
+    renderSearchRecent()
+    return
+  }
+  $('conv-search-hit-title').textContent = convSearchScope === 'message'
+    ? '匹配消息'
+    : convSearchScope === 'session' ? '匹配对话' : '搜索结果'
+  if (convSearchPending) {
+    const loading = document.createElement('div')
+    loading.className = 'panel-empty'
+    loading.textContent = '搜索中…'
+    box.appendChild(loading)
+    return
+  }
+  const rows = filterSearchHits(convSearchHits, convSearchScope)
+  if (rows.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = '没有匹配的内容'
+    box.appendChild(empty)
+    return
+  }
+  for (const hit of rows) {
+    box.appendChild(createSearchRow({
+      iconPath: SEARCH_CHAT_ICON,
+      title: hit.title || '未命名会话',
+      snippet: hit.snippet !== hit.title ? hit.snippet : '',
+      time: formatSearchTime(hit.ts),
+      onClick: () => openSearchHit(hit),
+    }))
+  }
 }
 
 /** 打开一条检索命中：本地没有该会话时先建占位，再由 hydrate 补历史。 */
 function openSearchHit(hit) {
-  $('conv-search').value = ''
-  $('conv-search-clear').hidden = true
-  renderConvSearchResults([], '')
+  closeConvSearch()
   let conv = conversations.find(c => c.id === hit.sessionId)
   if (conv === undefined) {
     conv = { id: hit.sessionId, title: hit.title || '会话', messages: [], updatedAt: hit.ts || Date.now() }
@@ -455,22 +575,66 @@ function openSearchHit(hit) {
   selectConversation(hit.sessionId)
 }
 
+/** 打开居中搜索弹窗：重置关键词并聚焦输入框。 */
+function openConvSearch() {
+  clearTimeout(convSearchTimer)
+  convSearchTimer = null
+  convSearchQuery = ''
+  convSearchHits = []
+  convSearchPending = false
+  $('conv-search').value = ''
+  convSearchScope = 'all'
+  $('conv-search-tabs').querySelectorAll('.search-tab').forEach(tab => {
+    const active = tab.dataset.scope === 'all'
+    tab.classList.toggle('active', active)
+    tab.setAttribute('aria-selected', String(active))
+  })
+  renderConvSearchResults()
+  const dialog = $('conv-search-dialog')
+  if (!dialog.open) dialog.showModal()
+  $('conv-search').focus()
+}
+
+function closeConvSearch() {
+  const dialog = $('conv-search-dialog')
+  if (dialog.open) dialog.close()
+}
+
+/** 切换搜索范围：全部 / 消息 / 对话。 */
+function setConvSearchScope(scope) {
+  convSearchScope = scope === 'message' || scope === 'session' ? scope : 'all'
+  $('conv-search-tabs').querySelectorAll('.search-tab').forEach(tab => {
+    const active = tab.dataset.scope === convSearchScope
+    tab.classList.toggle('active', active)
+    tab.setAttribute('aria-selected', String(active))
+  })
+  renderConvSearchResults()
+}
+
 /** 输入防抖后请求 /sv/api/search。 */
 function onConvSearchInput(event) {
   const query = event.target.value.trim()
-  $('conv-search-clear').hidden = query.length === 0
+  convSearchQuery = query
+  convSearchHits = []
   clearTimeout(convSearchTimer)
   if (query.length === 0) {
-    renderConvSearchResults([], '')
+    convSearchPending = false
+    renderConvSearchResults()
     return
   }
+  convSearchPending = true
+  renderConvSearchResults()
   convSearchTimer = setTimeout(async () => {
     try {
       const data = await api(`/sv/api/search?q=${encodeURIComponent(query)}&limit=20`)
-      renderConvSearchResults(Array.isArray(data.hits) ? data.hits : [], query)
+      if (query !== convSearchQuery) return
+      convSearchHits = Array.isArray(data.hits) ? data.hits : []
     } catch {
-      renderConvSearchResults([], query)
+      if (query !== convSearchQuery) return
+      convSearchHits = []
     }
+    convSearchPending = false
+    renderConvSearchResults()
   }, 220)
 }
 
@@ -710,6 +874,18 @@ function escapeHtml(text) {
     .replaceAll('"', '&quot;')
 }
 
+/** 取思考文本中最后一行非空内容（流式时用于展示「当前正在想什么」）。 */
+function latestReasoningLine(reasoning) {
+  const lines = String(reasoning ?? '').split('\n').map(s => s.trim()).filter(Boolean)
+  return lines.length > 0 ? lines[lines.length - 1] : ''
+}
+
+/** 压成单行并截断，超出用省略号收尾。 */
+function truncateOneLine(text, max = 64) {
+  const s = String(text ?? '').replace(/\s+/g, ' ')
+  return s.length > max ? s.slice(0, max) + '…' : s
+}
+
 /** 极简 Markdown 渲染：围栏代码、行内代码、粗体、链接、标题、表格、引用、列表、段落。 */
 function renderMarkdown(text) {
   const fences = []
@@ -721,6 +897,9 @@ function renderMarkdown(text) {
   })
   s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>')
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+  // 图片：只允许 http(s) 地址，点击可查看大图
+  s = s.replace(/!\[([^\]]*)\]\((https?:[^)\s]+)\)/g,
+    (_m, alt, url) => `<img class="msg-image" src="${url}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer">`)
   s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
   // 知识库引用：[标题](sv-knowledge:<docId>) → 可点击，打开知识原文。
   s = s.replace(/\[([^\]]+)\]\(sv-knowledge:([A-Za-z0-9-]+)\)/g,
@@ -886,8 +1065,26 @@ function messageNode(message) {
   if (message.reasoning && message.reasoning.trim().length > 0) {
     const details = document.createElement('details')
     details.className = 'reasoning'
+    if (message.streaming) details.classList.add('is-streaming')
     const summary = document.createElement('summary')
-    summary.textContent = '思考过程'
+    const label = document.createElement('span')
+    label.className = 'reasoning-label'
+    label.textContent = '思考过程'
+    summary.appendChild(label)
+    if (message.streaming) {
+      const live = document.createElement('span')
+      live.className = 'reasoning-live'
+      const dot = document.createElement('span')
+      dot.className = 'reasoning-dot'
+      dot.setAttribute('aria-hidden', 'true')
+      const text = document.createElement('span')
+      text.className = 'reasoning-live-text'
+      const latest = latestReasoningLine(message.reasoning)
+      text.textContent = latest.length > 0 ? truncateOneLine(latest, 64) : '思考中…'
+      live.appendChild(dot)
+      live.appendChild(text)
+      summary.appendChild(live)
+    }
     const body = document.createElement('div')
     body.textContent = message.reasoning
     details.appendChild(summary)
@@ -923,6 +1120,7 @@ const ICON_REGEN = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" 
 const ICON_EDIT = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.4 2.6l3 3L5.8 13.2l-3.6.6.6-3.6z"/></svg>'
 const ICON_SPEAK = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.2h2.6L9 3.4v9.2L5.6 9.8H3z"/><path d="M11.5 5.6a3.6 3.6 0 0 1 0 4.8"/><path d="M13.3 3.6a6.4 6.4 0 0 1 0 8.8"/></svg>'
 const ICON_SPEAK_STOP = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.2h2.6L9 3.4v9.2L5.6 9.8H3z"/><path d="M11.6 6.2l3.2 3.6M14.8 6.2l-3.2 3.6"/></svg>'
+const ICON_SHARE = '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.4V2.6"/><path d="M5.2 5.2L8 2.4l2.8 2.8"/><path d="M3.2 8.6v4a1 1 0 0 0 1 1h7.6a1 1 0 0 0 1-1v-4"/></svg>'
 
 /** 用户消息底部操作条：编辑并重发（会创建分支会话）。 */
 function userActions() {
@@ -936,6 +1134,12 @@ function userActions() {
   button.innerHTML = ICON_EDIT
   bar.appendChild(button)
   return bar
+}
+
+/** 分享按钮文案：会话已落库时可复制定位链接，否则退回复制回答文本。 */
+function shareActionTitle() {
+  const conv = activeConversation() ?? conversations[0]
+  return typeof conv?.id === 'string' && conv.id.length > 0 ? '复制分享链接' : '复制回答'
 }
 
 /** 答案底部操作条：复制整段回答（Markdown 原文，不含思考过程与工具轨迹）。 */
@@ -974,6 +1178,15 @@ function answerActions(text) {
 
   bar.appendChild(button)
 
+  const share = document.createElement('button')
+  share.type = 'button'
+  share.className = 'icon-btn msg-share'
+  share.title = shareActionTitle()
+  share.setAttribute('aria-label', shareActionTitle())
+  share.innerHTML = ICON_SHARE
+  share.addEventListener('click', () => void shareAnswer(text, share))
+  bar.appendChild(share)
+
   if ('speechSynthesis' in window) {
     const speak = document.createElement('button')
     speak.type = 'button'
@@ -995,6 +1208,68 @@ function answerActions(text) {
   regen.innerHTML = ICON_REGEN
   bar.appendChild(regen)
   return bar
+}
+
+/** 生成可定位到指定会话的分享链接（打开后自动选中并加载该会话）。 */
+function conversationShareUrl(sessionId) {
+  const url = new URL(location.href)
+  url.hash = ''
+  url.searchParams.set('session', sessionId)
+  return url.toString()
+}
+
+/** 读取地址栏里的 ?session= 深链参数。 */
+function readSessionDeepLink() {
+  const id = new URLSearchParams(location.search).get('session')
+  return typeof id === 'string' && id.trim().length > 0 ? id.trim() : null
+}
+
+/** 打开分享链接指向的会话：本地没有索引时先建占位，由 hydrate 补历史。 */
+function openSessionDeepLink(sessionId) {
+  let conv = conversations.find(c => c.id === sessionId)
+  if (conv === undefined) {
+    conv = { id: sessionId, title: '会话', messages: [], updatedAt: Date.now() }
+    // 复用开屏的空白会话，避免留下一条空记录
+    const blank = conversations.find(c => c.id === null && c.messages.length === 0)
+    if (blank !== undefined) {
+      blank.id = sessionId
+      conv = blank
+    } else {
+      conversations.unshift(conv)
+    }
+    saveConversations()
+  }
+  selectConversation(sessionId)
+}
+
+/**
+ * 分享回答：复制一个可直接定位到该会话的链接；会话尚未落库（没有 id）时复制回答文本。
+ */
+async function shareAnswer(text, button) {
+  const conv = activeConversation() ?? conversations[0]
+  const title = conv?.title && conv.title !== '新对话' ? conv.title : 'Singularity Voyage'
+  const sessionId = typeof conv?.id === 'string' && conv.id.length > 0 ? conv.id : null
+  const url = sessionId === null ? '' : conversationShareUrl(sessionId)
+  const defaultTitle = shareActionTitle()
+  let timer
+  const flash = (icon, label, ok) => {
+    button.classList.toggle('copied', ok)
+    button.classList.toggle('copy-failed', !ok)
+    button.title = label
+    button.innerHTML = icon
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      button.classList.remove('copied', 'copy-failed')
+      button.title = defaultTitle
+      button.innerHTML = ICON_SHARE
+    }, 1600)
+  }
+  try {
+    await writeClipboard(url.length > 0 ? url : `${title}\n\n${text}`)
+    flash(ICON_CHECK, url.length > 0 ? '已复制链接' : '已复制回答', true)
+  } catch {
+    flash(ICON_SHARE, '复制失败', false)
+  }
 }
 
 /**
@@ -1257,6 +1532,15 @@ function renderFileRail() {
     button.addEventListener('click', () => void openFilePreview(file.path))
     list.appendChild(button)
   }
+}
+
+/** 打开回答内嵌图片的大图预览。 */
+function openImagePreview(src, alt = '') {
+  const dialog = $('image-preview')
+  const image = $('image-preview-img')
+  image.src = src
+  image.alt = alt
+  if (!dialog.open) dialog.showModal()
 }
 
 /** 打开文件预览弹层。 */
@@ -2268,6 +2552,12 @@ function regenerateMessage(index) {
 
 /** 消息区点击：知识引用 / 编辑 / 重新生成。 */
 function onMessageAreaClick(event) {
+  const image = event.target.closest?.('img.msg-image')
+  if (image) {
+    const src = image.getAttribute('src')
+    if (typeof src === 'string' && src.length > 0) openImagePreview(src, image.getAttribute('alt') ?? '')
+    return
+  }
   const cite = event.target.closest?.('a.knowledge-cite')
   if (cite) {
     event.preventDefault()
@@ -2800,6 +3090,8 @@ function handleEvent(conv, stream, event, userMessage) {
         conv.id = event.sessionId
         activeId = event.sessionId
         localStorage.setItem(ACTIVE_KEY, event.sessionId)
+        // 会话落库后同步地址栏会话参数，刷新与分享都能定位到它
+        syncSessionUrl(event.sessionId)
         saveConversations()
       }
       // 服务端把上传图片转成了可持久化的附件引用：替换本地预览地址。
@@ -3726,13 +4018,20 @@ function automationNode(entry) {
   toggle.title = entry.enabled ? '暂停' : '恢复'
   toggle.textContent = entry.enabled ? '暂停' : '恢复'
   toggle.addEventListener('click', () => void toggleAutomation(entry))
+  const edit = document.createElement('button')
+  edit.type = 'button'
+  edit.className = 'panel-act'
+  edit.title = '编辑'
+  edit.textContent = '编辑'
+  edit.disabled = automationRunningId === entry.id
+  edit.addEventListener('click', () => startAutomationEdit(entry))
   const remove = document.createElement('button')
   remove.type = 'button'
   remove.className = 'panel-act danger'
   remove.title = '删除'
   remove.textContent = '✕'
   remove.addEventListener('click', () => void deleteAutomation(entry))
-  actions.append(run, toggle, remove)
+  actions.append(run, toggle, edit, remove)
   el.appendChild(actions)
   return el
 }
@@ -3806,6 +4105,40 @@ async function deleteAutomation(entry) {
   await loadAutomations()
 }
 
+/** 打开表单并回填一条自动化，切换到编辑模式。 */
+function startAutomationEdit(entry) {
+  automationEditingId = entry.id
+  $('automation-create').open = true
+  $('automation-kind').value = entry.kind
+  $('automation-title').value = entry.title
+  $('automation-url').value = entry.url ?? ''
+  $('automation-keywords').value = Array.isArray(entry.keywords) ? entry.keywords.join(', ') : ''
+  $('automation-prompt').value = entry.prompt ?? ''
+  $('automation-schedule-kind').value = entry.schedule.kind
+  $('automation-interval').value = String(entry.schedule.kind === 'interval' ? entry.schedule.everyMinutes : 60)
+  $('automation-at').value = entry.schedule.kind === 'interval' ? '08:30' : entry.schedule.at
+  $('automation-weekday').value = String(entry.schedule.kind === 'weekly' ? entry.schedule.weekday : 1)
+  $('automation-email').checked = entry.email === true
+  $('automation-create').querySelector('summary').textContent = '编辑自动化'
+  $('automation-submit').textContent = '保存修改'
+  $('automation-cancel-edit').hidden = false
+  setAutomationResult('')
+  syncAutomationForm()
+  $('automation-create').scrollIntoView({ behavior: 'smooth', block: 'start' })
+  $('automation-title').focus({ preventScroll: true })
+}
+
+/** 退出编辑模式并恢复新建表单。 */
+function resetAutomationForm() {
+  automationEditingId = null
+  $('automation-form').reset()
+  $('automation-create').querySelector('summary').textContent = '新建自动化'
+  $('automation-submit').textContent = '创建'
+  $('automation-cancel-edit').hidden = true
+  setAutomationResult('')
+  syncAutomationForm()
+}
+
 function syncAutomationForm() {
   const kind = $('automation-kind').value
   const scheduleKind = $('automation-schedule-kind').value
@@ -3842,15 +4175,17 @@ async function submitAutomation(event) {
     if (scheduleKind === 'weekly') body.weekday = Number($('automation-weekday').value)
   }
   try {
-    const data = await api('/sv/api/automations', { method: 'POST', body })
-    setAutomationResult(`已创建：${data.automation?.title ?? title}`, true)
-    $('automation-title').value = ''
-    $('automation-url').value = ''
-    $('automation-keywords').value = ''
-    $('automation-prompt').value = ''
+    const editingId = automationEditingId
+    const data = await api(
+      editingId === null ? '/sv/api/automations' : `/sv/api/automations/${encodeURIComponent(editingId)}`,
+      { method: editingId === null ? 'POST' : 'PATCH', body },
+    )
+    const savedTitle = data.automation?.title ?? title
+    resetAutomationForm()
+    setAutomationResult(editingId === null ? `已创建：${savedTitle}` : `已保存：${savedTitle}`, true)
     await loadAutomations()
   } catch (error) {
-    setAutomationResult(`创建失败：${error?.message ?? error}`, false)
+    setAutomationResult(`${automationEditingId === null ? '创建' : '保存'}失败：${error?.message ?? error}`, false)
   }
 }
 
@@ -5467,6 +5802,10 @@ $('knowledge-detail-close').addEventListener('click', closeKnowledgeDetail)
 $('schedule-refresh').addEventListener('click', () => void loadSchedules())
 $('automation-refresh').addEventListener('click', () => void loadAutomations())
 $('automation-form').addEventListener('submit', submitAutomation)
+$('automation-cancel-edit').addEventListener('click', () => {
+  resetAutomationForm()
+  $('automation-create').open = false
+})
 $('automation-kind').addEventListener('change', syncAutomationForm)
 $('automation-schedule-kind').addEventListener('change', syncAutomationForm)
 $('automation-global-form').addEventListener('submit', saveAutomationConfig)
@@ -5492,11 +5831,35 @@ $('connector-event-search').addEventListener('input', (event) => {
   void loadConnectors()
 })
 renderConnectorFields()
+$('open-conv-search').addEventListener('click', openConvSearch)
 $('conv-search').addEventListener('input', onConvSearchInput)
-$('conv-search-clear').addEventListener('click', () => {
-  $('conv-search').value = ''
-  $('conv-search-clear').hidden = true
-  renderConvSearchResults([], '')
+$('conv-search-close').addEventListener('click', closeConvSearch)
+// ⌘K / Ctrl+K 快捷打开搜索弹窗（再按一次关闭）
+document.addEventListener('keydown', (event) => {
+  if (event.key.toLowerCase() !== 'k' || event.altKey) return
+  if (!event.metaKey && !event.ctrlKey) return
+  event.preventDefault()
+  if ($('conv-search-dialog').open) {
+    closeConvSearch()
+    return
+  }
+  openConvSearch()
+})
+$('conv-search-new').addEventListener('click', () => {
+  closeConvSearch()
+  newConversation()
+})
+$('conv-search-tabs').addEventListener('click', (event) => {
+  const tab = event.target.closest('.search-tab')
+  if (tab) setConvSearchScope(tab.dataset.scope ?? 'all')
+})
+$('conv-search-dialog').addEventListener('click', (event) => {
+  // 点击遮罩（dialog 自身）关闭；点击内容区域不关闭
+  if (event.target === event.currentTarget) closeConvSearch()
+})
+$('conv-search-dialog').addEventListener('close', () => {
+  clearTimeout(convSearchTimer)
+  convSearchTimer = null
 })
 $('messages').addEventListener('click', onMessageAreaClick)
 $('data-refresh').addEventListener('click', () => void loadDataStatus())
@@ -5562,6 +5925,16 @@ $('file-preview-close').addEventListener('click', () => $('file-preview').close(
 $('file-preview').addEventListener('click', (event) => {
   if (event.target === $('file-preview')) $('file-preview').close()
 })
+// 图片大图预览：点击任意位置关闭；关闭后释放 src，避免继续占用解码资源
+$('image-preview').addEventListener('click', () => $('image-preview').close())
+$('image-preview').addEventListener('close', () => $('image-preview-img').removeAttribute('src'))
+// 图片加载失败时隐藏，避免留下破图占位
+$('messages').addEventListener('error', (event) => {
+  const target = event.target
+  if (target instanceof HTMLImageElement && target.classList.contains('msg-image')) {
+    target.classList.add('broken')
+  }
+}, true)
 $('mail-quick-settings').addEventListener('click', () => void openSettings())
 // 待办页快捷开关：只改总开关，其余策略在设置弹窗里；未配置 SMTP 时引导去配置
 $('mail-quick-toggle').addEventListener('change', async event => {
@@ -5698,6 +6071,12 @@ applyView('chat')
 $('input').focus()
 // 从服务端索引补齐侧边栏（清缓存/换浏览器后仍能看到历史会话列表）
 void syncConversations().then(() => {
+  // 分享链接：?session=<id> 直接定位到对应会话
+  const sharedSession = readSessionDeepLink()
+  if (sharedSession !== null) {
+    openSessionDeepLink(sharedSession)
+    return
+  }
   const conv = activeConversation()
   if (conv !== null && conv.id !== null && conv.messages.length === 0) void hydrateConversation(conv.id)
 })

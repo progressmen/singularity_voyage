@@ -79,6 +79,17 @@ export interface AutomationCreateInput {
   email?: boolean
 }
 
+/** 校验后的创建/更新输入：只保留当前类型需要的可选字段。 */
+interface NormalizedAutomationInput {
+  title: string
+  kind: AutomationKind
+  schedule: AutomationSchedule
+  url?: string
+  keywords?: string[]
+  prompt?: string
+  email: boolean
+}
+
 /** 运行记录。 */
 export interface AutomationRun {
   id: string
@@ -217,6 +228,46 @@ export function normalizeSchedule(value: AutomationSchedule): AutomationSchedule
   throw new Error('调度规则非法')
 }
 
+/** 校验并规范化创建/更新输入；与类型无关的字段会被丢弃。 */
+function normalizeAutomationInput(input: AutomationCreateInput): NormalizedAutomationInput {
+  const title = input.title.trim()
+  if (title.length === 0) throw new Error('自动化标题不能为空')
+  if (!isKind(input.kind)) throw new Error('自动化类型非法')
+  const schedule = normalizeSchedule(input.schedule)
+  const url = input.url?.trim()
+  const keywords = input.keywords?.map(keyword => keyword.trim()).filter(keyword => keyword.length > 0)
+  const prompt = input.prompt?.trim()
+
+  if (input.kind === 'web' || input.kind === 'keyword' || input.kind === 'rss') {
+    if (url === undefined || url.length === 0) throw new Error('监控网页必须提供 URL')
+    if (url.length > MAX_URL) throw new Error('URL 过长')
+    if (!isHttpUrl(url)) throw new Error('URL 必须是 http(s) 地址')
+  } else if (url !== undefined && url.length > MAX_URL) {
+    throw new Error('URL 过长')
+  }
+  if (input.kind === 'keyword') {
+    if (keywords === undefined || keywords.length === 0) throw new Error('关键词监控至少提供一个关键词')
+    if (keywords.length > MAX_KEYWORDS) throw new Error(`关键词最多 ${MAX_KEYWORDS} 个`)
+    if (keywords.some(keyword => keyword.length > MAX_KEYWORD)) throw new Error(`单个关键词不能超过 ${MAX_KEYWORD} 字符`)
+  }
+  if (input.kind === 'prompt') {
+    if (prompt === undefined || prompt.length === 0) throw new Error('定时任务必须填写任务描述')
+    if (prompt.length > MAX_PROMPT) throw new Error(`任务描述不能超过 ${MAX_PROMPT} 字符`)
+  }
+
+  return {
+    title: clip(title, MAX_TITLE),
+    kind: input.kind,
+    schedule,
+    ...(input.kind === 'web' || input.kind === 'keyword' || input.kind === 'rss'
+      ? url === undefined ? {} : { url }
+      : {}),
+    ...(input.kind === 'keyword' && keywords !== undefined ? { keywords: [...new Set(keywords)] } : {}),
+    ...(input.kind === 'prompt' && prompt !== undefined ? { prompt } : {}),
+    email: input.email === true,
+  }
+}
+
 interface AutomationsFile {
   version: 1
   automations: Automation[]
@@ -287,47 +338,59 @@ export class AutomationStore {
   /** 创建自动化；nextRunAt 从当前时刻计算。 */
   async create(input: AutomationCreateInput): Promise<Automation> {
     if (this.entries.size >= MAX_AUTOMATIONS) throw new Error(`自动化数量已达上限（${MAX_AUTOMATIONS}）`)
-    const title = input.title.trim()
-    if (title.length === 0) throw new Error('自动化标题不能为空')
-    if (!isKind(input.kind)) throw new Error('自动化类型非法')
-    const schedule = normalizeSchedule(input.schedule)
+    const normalized = normalizeAutomationInput(input)
     const now = Date.now()
-    const url = input.url?.trim()
-    const keywords = input.keywords?.map(keyword => keyword.trim()).filter(keyword => keyword.length > 0)
-    const prompt = input.prompt?.trim()
-
-    if (input.kind === 'web' || input.kind === 'keyword' || input.kind === 'rss') {
-      if (url === undefined || url.length === 0) throw new Error('监控网页必须提供 URL')
-      if (url.length > MAX_URL) throw new Error('URL 过长')
-      if (!isHttpUrl(url)) throw new Error('URL 必须是 http(s) 地址')
-    } else if (url !== undefined && url.length > MAX_URL) {
-      throw new Error('URL 过长')
-    }
-    if (input.kind === 'keyword') {
-      if (keywords === undefined || keywords.length === 0) throw new Error('关键词监控至少提供一个关键词')
-      if (keywords.length > MAX_KEYWORDS) throw new Error(`关键词最多 ${MAX_KEYWORDS} 个`)
-      if (keywords.some(keyword => keyword.length > MAX_KEYWORD)) throw new Error(`单个关键词不能超过 ${MAX_KEYWORD} 字符`)
-    }
-    if (input.kind === 'prompt') {
-      if (prompt === undefined || prompt.length === 0) throw new Error('定时任务必须填写任务描述')
-      if (prompt.length > MAX_PROMPT) throw new Error(`任务描述不能超过 ${MAX_PROMPT} 字符`)
-    }
-
     const entry: Automation = {
       id: randomUUID(),
-      title: clip(title, MAX_TITLE),
-      kind: input.kind,
+      ...normalized,
       enabled: true,
-      schedule,
-      ...(url === undefined || url.length === 0 ? {} : { url }),
-      ...(keywords === undefined || keywords.length === 0 ? {} : { keywords: [...new Set(keywords)] }),
-      ...(prompt === undefined || prompt.length === 0 ? {} : { prompt }),
-      email: input.email === true,
-      nextRunAt: nextRunAt(schedule, now),
+      nextRunAt: nextRunAt(normalized.schedule, now),
       createdAt: now,
       updatedAt: now,
     }
     this.entries.set(entry.id, entry)
+    await this.persistAutomations()
+    return entry
+  }
+
+  /**
+   * 修改自动化定义：保留启用状态与运行历史，按新调度重排下次运行。
+   * 类型、URL 或关键词变化时清空旧指纹，避免用旧基线上报变化。
+   */
+  async update(id: string, input: AutomationCreateInput): Promise<Automation | undefined> {
+    const entry = this.entries.get(id)
+    if (entry === undefined) return undefined
+    const normalized = normalizeAutomationInput(input)
+    const now = Date.now()
+    const previousKind = entry.kind
+    const previousUrl = entry.url
+    const previousKeywords = entry.keywords?.join('\u0000') ?? ''
+    const previousSchedule = entry.schedule
+    const nextKeywords = normalized.keywords?.join('\u0000') ?? ''
+    const targetChanged = previousKind !== normalized.kind
+      || previousUrl !== normalized.url
+      || previousKeywords !== nextKeywords
+    const scheduleChanged = JSON.stringify(previousSchedule) !== JSON.stringify(normalized.schedule)
+
+    entry.title = normalized.title
+    entry.kind = normalized.kind
+    entry.schedule = normalized.schedule
+    entry.email = normalized.email
+    delete entry.url
+    delete entry.keywords
+    delete entry.prompt
+    if (normalized.url !== undefined) entry.url = normalized.url
+    if (normalized.keywords !== undefined) entry.keywords = normalized.keywords
+    if (normalized.prompt !== undefined) entry.prompt = normalized.prompt
+    if (targetChanged) {
+      delete entry.lastHash
+      delete entry.lastText
+      delete entry.lastMatch
+    }
+    if (scheduleChanged || entry.nextRunAt <= now) {
+      entry.nextRunAt = nextRunAt(normalized.schedule, now)
+    }
+    entry.updatedAt = now
     await this.persistAutomations()
     return entry
   }

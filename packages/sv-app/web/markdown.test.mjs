@@ -59,3 +59,11 @@ test('snake_case 不会被斜体化', () => {
   assert.ok(!html.includes('<em>'))
   assert.ok(html.includes('snake_case_name'))
 })
+
+test('图片：仅渲染 http(s) 地址，且先于链接处理', () => {
+  const html = render('![示意图](https://example.com/a.png)')
+  assert.match(html, /<img src="https:\/\/example.com\/a.png" alt="示意图" class="md-image" loading="lazy" referrerpolicy="no-referrer">/)
+  assert.ok(!html.includes('<a '))
+  const unsafe = render('![x](javascript:alert(1))')
+  assert.ok(!unsafe.includes('<img'))
+})

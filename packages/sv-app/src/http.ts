@@ -22,6 +22,7 @@ import {
   AUTOMATION_KINDS,
   AUTOMATION_SCHEDULE_KINDS,
   automationView,
+  type AutomationCreateInput,
   type AutomationSchedule,
   type AutomationStore,
 } from './automation-store.ts'
@@ -185,6 +186,43 @@ async function readJson(req: IncomingMessage, limit = BODY_LIMIT): Promise<Recor
   const parsed: unknown = JSON.parse(raw)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('请求体必须是 JSON 对象')
   return parsed as Record<string, unknown>
+}
+
+/** 解析自动化创建/更新请求体（POST 与 PATCH 共用）。 */
+function parseAutomationInput(body: Record<string, unknown>): AutomationCreateInput {
+  const kind = String(body.kind ?? '')
+  if (!(AUTOMATION_KINDS as readonly string[]).includes(kind)) {
+    throw new Error('kind 必须是 web / keyword / prompt / rss')
+  }
+  const title = typeof body.title === 'string' ? body.title.trim() : ''
+  if (title.length === 0) throw new Error('title 不能为空')
+  const scheduleKind = String(body.scheduleKind ?? '')
+  if (!(AUTOMATION_SCHEDULE_KINDS as readonly string[]).includes(scheduleKind)) {
+    throw new Error('scheduleKind 必须是 interval / daily / weekly')
+  }
+  const schedule: AutomationSchedule = scheduleKind === 'interval'
+    ? { kind: 'interval', everyMinutes: Number(body.everyMinutes) }
+    : scheduleKind === 'daily'
+      ? { kind: 'daily', at: String(body.at ?? '').trim() }
+      : { kind: 'weekly', weekday: Number(body.weekday), at: String(body.at ?? '').trim() }
+  let keywords: string[] | undefined
+  if (body.keywords !== undefined) {
+    if (!Array.isArray(body.keywords)) throw new Error('keywords 必须是字符串数组')
+    keywords = body.keywords
+      .filter((keyword): keyword is string => typeof keyword === 'string')
+      .map(keyword => keyword.trim())
+      .filter(keyword => keyword.length > 0)
+  }
+  if (body.email !== undefined && typeof body.email !== 'boolean') throw new Error('email 必须是布尔值')
+  return {
+    title,
+    kind: kind as (typeof AUTOMATION_KINDS)[number],
+    schedule,
+    ...(typeof body.url === 'string' && body.url.trim().length > 0 ? { url: body.url.trim() } : {}),
+    ...(keywords === undefined ? {} : { keywords }),
+    ...(typeof body.prompt === 'string' && body.prompt.trim().length > 0 ? { prompt: body.prompt.trim() } : {}),
+    email: body.email === true,
+  }
 }
 
 /** 解析聊天请求里的图片上传；格式与体积先做快速校验，解码校验交给附件服务。 */
@@ -1005,39 +1043,7 @@ export function registerSvRoutes(
     if (req.method === 'POST' && path === '/sv/api/automations') {
       try {
         const body = await readJson(req)
-        const kind = String(body.kind ?? '')
-        if (!(AUTOMATION_KINDS as readonly string[]).includes(kind)) {
-          throw new Error('kind 必须是 web / keyword / prompt / rss')
-        }
-        const title = typeof body.title === 'string' ? body.title.trim() : ''
-        if (title.length === 0) throw new Error('title 不能为空')
-        const scheduleKind = String(body.scheduleKind ?? '')
-        if (!(AUTOMATION_SCHEDULE_KINDS as readonly string[]).includes(scheduleKind)) {
-          throw new Error('scheduleKind 必须是 interval / daily / weekly')
-        }
-        const schedule: AutomationSchedule = scheduleKind === 'interval'
-          ? { kind: 'interval', everyMinutes: Number(body.everyMinutes) }
-          : scheduleKind === 'daily'
-            ? { kind: 'daily', at: String(body.at ?? '').trim() }
-            : { kind: 'weekly', weekday: Number(body.weekday), at: String(body.at ?? '').trim() }
-        let keywords: string[] | undefined
-        if (body.keywords !== undefined) {
-          if (!Array.isArray(body.keywords)) throw new Error('keywords 必须是字符串数组')
-          keywords = body.keywords
-            .filter((keyword): keyword is string => typeof keyword === 'string')
-            .map(keyword => keyword.trim())
-            .filter(keyword => keyword.length > 0)
-        }
-        if (body.email !== undefined && typeof body.email !== 'boolean') throw new Error('email 必须是布尔值')
-        const entry = await automations.create({
-          title,
-          kind: kind as (typeof AUTOMATION_KINDS)[number],
-          schedule,
-          ...(typeof body.url === 'string' && body.url.trim().length > 0 ? { url: body.url.trim() } : {}),
-          ...(keywords === undefined ? {} : { keywords }),
-          ...(typeof body.prompt === 'string' && body.prompt.trim().length > 0 ? { prompt: body.prompt.trim() } : {}),
-          email: body.email === true,
-        })
+        const entry = await automations.create(parseAutomationInput(body))
         sendJson(res, 200, { automation: automationView(entry) })
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
@@ -1061,12 +1067,21 @@ export function registerSvRoutes(
 
     const automationMatch = /^\/sv\/api\/automations\/([A-Za-z0-9-]{1,64})$/.exec(path)
 
-    // PATCH /sv/api/automations/:id —— 暂停/恢复
+    // PATCH /sv/api/automations/:id —— 修改定义，或仅切换启用状态
     if (req.method === 'PATCH' && automationMatch !== null) {
       try {
         const body = await readJson(req)
-        if (typeof body.enabled !== 'boolean') throw new Error('enabled 必须是布尔值')
-        const entry = await automations.setEnabled(automationMatch[1]!, body.enabled)
+        const id = automationMatch[1]!
+        if (typeof body.enabled === 'boolean' && Object.keys(body).every(key => key === 'enabled')) {
+          const entry = await automations.setEnabled(id, body.enabled)
+          if (entry === undefined) {
+            sendJson(res, 404, { error: '自动化不存在' })
+            return
+          }
+          sendJson(res, 200, { automation: automationView(entry) })
+          return
+        }
+        const entry = await automations.update(id, parseAutomationInput(body))
         if (entry === undefined) {
           sendJson(res, 404, { error: '自动化不存在' })
           return

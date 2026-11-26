@@ -24,6 +24,7 @@ import {
   type KnowledgeStore,
 } from './knowledge-store.ts'
 import { fetchUrlPage } from './knowledge-source.ts'
+import { searchImages } from './image-search.ts'
 import { MEMORY_KINDS, memoryView, type MemoryEntry, type MemoryStore, type MemoryKind } from './memory-store.ts'
 import { TASK_RECURRENCES, taskView, type TaskEntry, type TasksStore } from './tasks-store.ts'
 
@@ -507,6 +508,48 @@ function automationToolView(entry: Automation): {
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
   }
+}
+
+/** 注册配图检索工具：从相关网页提取可直接嵌入回答的图片地址。 */
+export function registerImageTools(ctx: Context): void {
+  ctx.tools.register(defineTool({
+    name: 'image_search',
+    description: '搜索可直接用于回答配图的网络图片：检索相关网页并提取封面图/正文图，返回可写进 Markdown 的图片地址。回答涉及产品外观、菜品、人物、地点、场景等更适合看图说明的内容时，先调用它再配图。',
+    parameters: {
+      query: { type: 'string', required: true, description: '图片主题（尽量包含主体与限定词）' },
+      count: { type: 'integer', description: '返回图片数，默认 4，最多 8' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          images: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                url: { type: 'string', required: true },
+                pageUrl: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, exec) {
+      return {
+        images: await searchImages(ctx, args.query, {
+          ...(args.count === undefined ? {} : { count: args.count }),
+          signal: exec.signal,
+        }),
+      }
+    },
+  }))
 }
 
 /** 注册自动化工具。 */

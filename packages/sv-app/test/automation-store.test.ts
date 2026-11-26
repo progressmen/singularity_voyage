@@ -99,6 +99,40 @@ test('create：nextRunAt 在未来，列表按新建在前', async () => {
   assert.equal(store.list().length, 2)
 })
 
+test('update：修改类型与调度，清理旧目标字段并保留运行历史', async () => {
+  const store = new AutomationStore(dir)
+  await store.load()
+  const entry = await store.create({
+    title: '待修改',
+    kind: 'web',
+    url: 'https://example.com/before',
+    schedule: { kind: 'interval', everyMinutes: 10 },
+  })
+  await store.finishRun(entry.id, { at: Date.now(), summary: '基线', hash: 'abc', text: 'old' })
+  const updated = await store.update(entry.id, {
+    title: '已修改',
+    kind: 'prompt',
+    schedule: { kind: 'daily', at: '08:30' },
+    prompt: '生成科技日报',
+    email: true,
+  })
+  assert.ok(updated !== undefined)
+  assert.equal(updated.title, '已修改')
+  assert.equal(updated.kind, 'prompt')
+  assert.equal(updated.prompt, '生成科技日报')
+  assert.equal(updated.url, undefined)
+  assert.equal(updated.email, true)
+  assert.equal(updated.schedule.kind, 'daily')
+  assert.equal(updated.lastSummary, '基线')
+  assert.ok(updated.nextRunAt > Date.now())
+  assert.equal(await store.update('missing-id', {
+    title: '不存在',
+    kind: 'prompt',
+    schedule: { kind: 'daily', at: '08:30' },
+    prompt: 'x',
+  }), undefined)
+})
+
 test('setEnabled：暂停不推进时间，恢复时重排未来时间', async () => {
   const store = new AutomationStore(dir)
   await store.load()

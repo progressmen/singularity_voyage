@@ -48,7 +48,7 @@ import { createSuperAgentRuntime } from './superagent-runtime.ts'
 import { SuperAgentRunStore } from './superagent-store.ts'
 import { TasksStore, formatTaskTime } from './tasks-store.ts'
 import { UsageStore } from './usage-store.ts'
-import { registerAutomationTools, registerDesktopGuard, registerInboxTools, registerKnowledgeTools, registerMemoryTools, registerTaskTools } from './tools.ts'
+import { registerAutomationTools, registerDesktopGuard, registerImageTools, registerInboxTools, registerKnowledgeTools, registerMemoryTools, registerTaskTools } from './tools.ts'
 
 /** 技能注册表的最小结构；不把 sv-app 绑死到具体 skill 包的版本。 */
 interface SkillSummaryLike {
@@ -432,8 +432,17 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
   registerTaskTools(ctx, tasks)
   registerInboxTools(ctx, inbox)
   registerKnowledgeTools(ctx, knowledge)
+  registerImageTools(ctx)
   registerAutomationTools(ctx, automations)
   registerDesktopGuard(ctx)
+
+  // 回答配图：先调用 image_search 拿可靠图片，再用 https 地址嵌入；宁可不配图也不放失效链接。
+  ctx.systemPrompt.section({
+    name: 'sv:answer-images',
+    order: 9530,
+    interpolate: false,
+    text: () => '回答配图：正文涉及产品外观、菜品、人物、地点、场景、图表截图等更适合看图说明的内容时，先调用 image_search 搜索相关图片，再从返回结果里挑选 1-3 张，用 Markdown 图片语法 ![中文短语说明](图片地址) 插到相关段落后。image_search 没有返回结果时就只写文字，不要自己编造、拼接或猜测图片地址，也不要引用需要登录的地址。',
+  })
 
   // 每轮 Prompt 组装时注入记忆与待办（system-prompt 注册表，作用于全部会话）。
   const recallQuery = (context: { agent?: { id: unknown } }): string =>

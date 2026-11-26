@@ -34,6 +34,11 @@ function renderInline(raw) {
 
   text = escapeHtml(text)
 
+  // 图片先于链接处理，避免 ![说明](地址) 被当成普通链接；只允许 http(s)。
+  text = text.replace(
+    /!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, alt, url) => `<img src="${url}" alt="${alt}" class="md-image" loading="lazy" referrerpolicy="no-referrer">`,
+  )
   text = text.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g,
     (_, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`,
