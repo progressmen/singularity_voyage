@@ -14,5 +14,5 @@ logs/
 .trae/
 .screenshots/
 # 生成的调研与报告（保留本地文件，不纳入版本库）
-reports/
 research/
+outputs/

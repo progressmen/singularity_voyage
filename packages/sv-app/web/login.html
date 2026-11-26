@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · Singularity Voyage</title>
+  <link rel="icon" type="image/png" sizes="180x180" href="/sv/icon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/sv/icon.png">
+  <script>
+    // 首屏渲染前应用主题，避免深/浅色闪烁（与主页面一致）
+    (function () {
+      try {
+        var pref = localStorage.getItem('sv.theme')
+        var light = pref === 'light' || (pref !== 'dark' && window.matchMedia('(prefers-color-scheme: light)').matches)
+        document.documentElement.dataset.theme = light ? 'light' : 'dark'
+        document.documentElement.style.colorScheme = light ? 'light' : 'dark'
+      } catch (error) { /* localStorage 不可用时保持默认深色 */ }
+    })()
+  </script>
+  <link rel="stylesheet" href="/sv/app.css">
+  <style>
+    body.login-body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+      background:
+        radial-gradient(900px 480px at 50% -8%, var(--accent-soft), transparent 62%),
+        var(--bg);
+    }
+
+    .login-card {
+      width: min(390px, 100%);
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 34px 30px 26px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.3);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      animation: login-in 0.35s ease both;
+    }
+
+    @keyframes login-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    .login-brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      text-align: center;
+    }
+
+    .login-brand img {
+      width: 54px;
+      height: 54px;
+      border-radius: 14px;
+    }
+
+    .login-brand h1 {
+      margin: 0;
+      font-size: 19px;
+      font-weight: 600;
+      color: var(--text-strong);
+      letter-spacing: 0.2px;
+    }
+
+    .login-brand p {
+      margin: 0;
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    .login-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    .login-field input {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .login-field input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    .login-field[hidden] { display: none; }
+
+    .login-error {
+      margin: 0;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: rgba(229, 83, 75, 0.12);
+      border: 1px solid rgba(229, 83, 75, 0.35);
+      color: var(--danger);
+      font-size: 13px;
+    }
+
+    .login-error[hidden] { display: none; }
+
+    .login-submit {
+      width: 100%;
+      padding: 10px 14px;
+      font-weight: 600;
+    }
+
+    .login-hint {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text-dim);
+      text-align: center;
+    }
+
+    @media (max-width: 480px) {
+      .login-card { padding: 28px 22px 22px; }
+    }
+  </style>
+</head>
+<body class="login-body">
+  <form class="login-card" id="login-form" autocomplete="on">
+    <div class="login-brand">
+      <img src="/sv/icon.png" alt="Singularity Voyage">
+      <h1>Singularity Voyage</h1>
+      <p id="login-sub">登录以继续</p>
+    </div>
+
+    <label class="login-field">
+      <span>账号</span>
+      <input id="login-username" name="username" type="text" autocomplete="username" spellcheck="false" required autofocus>
+    </label>
+    <label class="login-field">
+      <span>密码</span>
+      <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <label class="login-field" id="login-confirm-field" hidden>
+      <span>确认密码</span>
+      <input id="login-confirm" name="confirm" type="password" autocomplete="new-password">
+    </label>
+
+    <p class="login-error" id="login-error" hidden></p>
+    <button class="btn btn-primary login-submit" id="login-submit" type="submit">登录</button>
+    <p class="login-hint">账号与密码保存在 PostgreSQL，登录状态保持 7 天。</p>
+  </form>
+
+  <script>
+    'use strict'
+
+    var form = document.getElementById('login-form')
+    var sub = document.getElementById('login-sub')
+    var usernameInput = document.getElementById('login-username')
+    var passwordInput = document.getElementById('login-password')
+    var confirmField = document.getElementById('login-confirm-field')
+    var confirmInput = document.getElementById('login-confirm')
+    var errorBox = document.getElementById('login-error')
+    var submitButton = document.getElementById('login-submit')
+    /** login | setup：没有账号时登录页切换为「创建管理员」。 */
+    var mode = 'login'
+
+    /** 登录成功后的回跳地址：只允许站内 /sv 路径。 */
+    function nextPath() {
+      var value = new URLSearchParams(location.search).get('next') || ''
+      return value.indexOf('/sv') === 0 && value.indexOf('//') !== 0 ? value : '/sv/'
+    }
+
+    function showError(message) {
+      errorBox.hidden = message.length === 0
+      errorBox.textContent = message
+    }
+
+    function setBusy(busy) {
+      submitButton.disabled = busy
+      submitButton.textContent = busy
+        ? (mode === 'setup' ? '创建中…' : '登录中…')
+        : (mode === 'setup' ? '创建并登录' : '登录')
+    }
+
+    /** 读取服务端状态：已登录 / 需要初始化账号 / 未启用登录。 */
+    async function init() {
+      try {
+        var res = await fetch('/sv/api/auth/state', { headers: { accept: 'application/json' } })
+        var state = await res.json()
+        if (state.authEnabled === false || state.authenticated === true) {
+          location.replace(nextPath())
+          return
+        }
+        if (state.needsSetup === true) {
+          mode = 'setup'
+          sub.textContent = '首次使用：创建管理员账号'
+          confirmField.hidden = false
+          passwordInput.autocomplete = 'new-password'
+          submitButton.textContent = '创建并登录'
+        }
+      } catch (error) {
+        showError('无法连接服务，请确认服务已启动')
+      }
+      usernameInput.focus()
+    }
+
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault()
+      showError('')
+      var username = usernameInput.value.trim()
+      var password = passwordInput.value
+      if (username.length === 0) { showError('请输入账号'); return }
+      if (password.length === 0) { showError('请输入密码'); return }
+      if (mode === 'setup' && password !== confirmInput.value) { showError('两次输入的密码不一致'); return }
+      if (mode === 'setup' && password.length < 8) { showError('密码至少 8 个字符'); return }
+
+      setBusy(true)
+      try {
+        var res = await fetch('/sv/api/auth/' + mode, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ username: username, password: password }),
+        })
+        var result = await res.json().catch(function () { return {} })
+        if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status))
+        location.replace(nextPath())
+      } catch (error) {
+        showError(error.message || String(error))
+        setBusy(false)
+      }
+    })
+
+    void init()
+  </script>
+</body>
+</html>

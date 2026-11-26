@@ -12,6 +12,7 @@ import { isAttachmentError } from '@deepseek-ai/dsh-attachment'
 import type { EncodedImageAttachment, ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-schedule'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { AUTH_COOKIE, AUTH_COOKIE_MAX_AGE, type AuthStore, type AuthUser } from './auth.ts'
 import type { ChatManager, SvChatEvent } from './chat.ts'
 import type { ApprovalCenter } from './approval-center.ts'
 import type { AutomationService } from './automation-runtime.ts'
@@ -166,6 +167,31 @@ function sendJson(res: ServerResponse, code: number, value: unknown): void {
   const body = JSON.stringify(value)
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
   res.end(body)
+}
+
+/** 读取请求头里的指定 Cookie（值按 base64url 令牌使用，无需反转义）。 */
+function readCookie(header: string | undefined, name: string): string | undefined {
+  if (header === undefined) return undefined
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=')
+    if (index < 0) continue
+    if (part.slice(0, index).trim() !== name) continue
+    return part.slice(index + 1).trim()
+  }
+  return undefined
+}
+
+/** 写入登录 Cookie；令牌只保存在 HttpOnly Cookie 中。 */
+function setAuthCookie(res: ServerResponse, token: string): void {
+  res.setHeader(
+    'set-cookie',
+    `${AUTH_COOKIE}=${token}; Path=/sv; HttpOnly; SameSite=Lax; Max-Age=${AUTH_COOKIE_MAX_AGE}`,
+  )
+}
+
+/** 清除登录 Cookie（退出登录或令牌失效时使用）。 */
+function clearAuthCookie(res: ServerResponse): void {
+  res.setHeader('set-cookie', `${AUTH_COOKIE}=; Path=/sv; HttpOnly; SameSite=Lax; Max-Age=0`)
 }
 
 async function readBody(req: IncomingMessage, limit = BODY_LIMIT): Promise<string> {
@@ -340,6 +366,8 @@ export function registerSvRoutes(
     connectors: ConnectorService
     connectorStore: ConnectorStore
   },
+  /** 账号与登录态存储；未配置 PostgreSQL 时为 undefined，页面不做登录校验。 */
+  auth?: AuthStore,
 ): void {
   const dataStores: BackupStores = {
     memory,
@@ -420,6 +448,8 @@ export function registerSvRoutes(
         searchProvider: SV_SEARCH_PROVIDER_ID,
         // 图片消息依赖宿主层挂载的附件服务；未挂载时前端禁用图片入口。
         attachments: ctx.get('attachments') !== undefined,
+        // 未配置 PostgreSQL 时不做登录校验，前端隐藏「退出登录」。
+        authEnabled: auth !== undefined,
         ...store.publicState(),
         ...(models === null ? { modelsError } : { models }),
         superAgent: superAgent === undefined
@@ -1653,6 +1683,84 @@ export function registerSvRoutes(
     sendJson(res, 404, { error: 'not found' })
   }
 
+  /** 登录相关接口：/sv/api/auth/{state,setup,login,logout}（无需登录态）。 */
+  const handleAuthApi = async (req: IncomingMessage, res: ServerResponse, path: string): Promise<void> => {
+    const method = req.method ?? 'GET'
+    if (auth === undefined) {
+      if (method === 'GET' && path === '/sv/api/auth/state') {
+        // 未配置 PostgreSQL：登录未启用，前端直接进入主页面。
+        sendJson(res, 200, { authEnabled: false, authenticated: true, needsSetup: false })
+      } else {
+        sendJson(res, 503, { error: '未配置 PostgreSQL，登录未启用' })
+      }
+      return
+    }
+
+    if (method === 'GET' && path === '/sv/api/auth/state') {
+      const token = readCookie(req.headers.cookie, AUTH_COOKIE)
+      const user = token === undefined ? undefined : await auth.sessionUser(token).catch(() => undefined)
+      let needsSetup = false
+      try {
+        needsSetup = !(await auth.hasUsers())
+      } catch {
+        // 数据库暂不可用时不暴露内部错误，按普通登录表单处理。
+      }
+      sendJson(res, 200, {
+        authEnabled: true,
+        authenticated: user !== undefined,
+        needsSetup,
+        ...(user === undefined ? {} : { username: user.username }),
+      })
+      return
+    }
+
+    if (method === 'POST' && path === '/sv/api/auth/setup') {
+      if (await auth.hasUsers()) {
+        sendJson(res, 409, { error: '账号已存在，请直接登录' })
+        return
+      }
+      const body = await readJson(req)
+      const username = typeof body.username === 'string' ? body.username : ''
+      const password = typeof body.password === 'string' ? body.password : ''
+      let user: AuthUser
+      try {
+        user = await auth.createUser(username, password)
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      const token = await auth.createSession(user.id)
+      setAuthCookie(res, token)
+      sendJson(res, 200, { ok: true, username: user.username })
+      return
+    }
+
+    if (method === 'POST' && path === '/sv/api/auth/login') {
+      const body = await readJson(req)
+      const username = typeof body.username === 'string' ? body.username : ''
+      const password = typeof body.password === 'string' ? body.password : ''
+      const user = await auth.verifyCredentials(username, password)
+      if (user === undefined) {
+        sendJson(res, 401, { error: '账号或密码错误' })
+        return
+      }
+      const token = await auth.createSession(user.id)
+      setAuthCookie(res, token)
+      sendJson(res, 200, { ok: true, username: user.username })
+      return
+    }
+
+    if (method === 'POST' && path === '/sv/api/auth/logout') {
+      const token = readCookie(req.headers.cookie, AUTH_COOKIE)
+      if (token !== undefined) await auth.deleteSession(token).catch(() => {})
+      clearAuthCookie(res)
+      sendJson(res, 200, { ok: true })
+      return
+    }
+
+    sendJson(res, 404, { error: 'not found' })
+  }
+
   const route: WebRoute = {
     kind: 'prefix',
     path: '/sv',
@@ -1661,8 +1769,44 @@ export function registerSvRoutes(
       const path = url.pathname
       const startedTs = Date.now()
       try {
+        // 登录态校验：页面与业务 API 需要有效会话；静态资源放行（登录页自身也要加载）。
+        const pagePath = path === '/sv' || path === '/sv/' || path === '/sv/login' || path === '/sv/login.html'
+        const apiPath = path.startsWith('/sv/api/')
+        const needsSession = pagePath || (apiPath && !path.startsWith('/sv/api/auth/'))
+        const token = needsSession ? readCookie(req.headers.cookie, AUTH_COOKIE) : undefined
+        const user = auth !== undefined && token !== undefined
+          ? await auth.sessionUser(token).catch(() => undefined)
+          : undefined
+
+        if (req.method === 'GET' && (path === '/sv/login' || path === '/sv/login.html')) {
+          // 已登录用户访问登录页时直接回到主页面。
+          if (auth !== undefined && user !== undefined) {
+            res.writeHead(302, { location: '/sv/' })
+            res.end()
+            return
+          }
+          await serveStatic(res, 'login.html')
+          return
+        }
+        if (path.startsWith('/sv/api/auth/')) {
+          await handleAuthApi(req, res, path)
+          return
+        }
         if (req.method === 'GET' && (path === '/sv' || path === '/sv/')) {
+          if (auth !== undefined && user === undefined) {
+            res.writeHead(302, { location: '/sv/login' })
+            res.end()
+            return
+          }
           await serveStatic(res, 'index.html')
+          return
+        }
+        if (apiPath) {
+          if (auth !== undefined && user === undefined) {
+            sendJson(res, 401, { error: '未登录' })
+            return
+          }
+          await handleApi(req, res, path)
           return
         }
         if (req.method === 'GET' && path === '/sv/app.js') {
@@ -1683,10 +1827,6 @@ export function registerSvRoutes(
         }
         if (req.method === 'GET' && path === '/sv/icon.png') {
           await serveStatic(res, 'icon.png')
-          return
-        }
-        if (path.startsWith('/sv/api/')) {
-          await handleApi(req, res, path)
           return
         }
         res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })

@@ -22,7 +22,7 @@ PID_FILE="$PID_DIR/sv.pid"
 # 进程控制台输出（追加写入，重启不丢）；结构化运行日志由 sv-app 按天写入 logs/sv-YYYY-MM-DD.log
 LOG_FILE="$LOG_DIR/stdout.log"
 PORT="${PORT:-7001}"
-HEALTH_URL="http://127.0.0.1:${PORT}/sv/api/state"
+HEALTH_URL="http://127.0.0.1:${PORT}/sv/api/auth/state"
 HEALTH_TIMEOUT=30
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────

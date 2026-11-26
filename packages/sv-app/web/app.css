@@ -365,6 +365,9 @@ html, body {
   border-top: 1px solid var(--border);
   padding-top: 12px;
 }
+.sidebar-actions { display: flex; gap: 8px; }
+.sidebar-actions .btn { flex: 1; }
+.sidebar-actions .btn[hidden] { display: none; }
 .status-chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   font-size: 11px;

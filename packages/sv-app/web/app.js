@@ -7,6 +7,18 @@ const STORE_KEY = 'sv.conversations.v1'
 const ACTIVE_KEY = 'sv.active.v1'
 const THEME_KEY = 'sv.theme'
 
+/* 登录态失效时后端返回 401：所有请求（含 SSE 与下载）统一回到登录页。 */
+const nativeFetch = window.fetch.bind(window)
+window.fetch = async (input, init) => {
+  const res = await nativeFetch(input, init)
+  if (res.status === 401) {
+    const next = location.pathname + location.search
+    location.replace('/sv/login?next=' + encodeURIComponent(next))
+    throw new Error('未登录')
+  }
+  return res
+}
+
 /** 系统浅色偏好；跟随系统模式据此解析。 */
 const themeMedia = window.matchMedia('(prefers-color-scheme: light)')
 
@@ -2060,6 +2072,8 @@ async function loadState() {
     // Super-agent 由服务端开关控制：关闭时隐藏导航项，保持原页面结构。
     const saEnabled = state.superAgent?.enabled === true
     $('tab-superagent').hidden = !saEnabled
+    // 未配置 PostgreSQL 时登录校验未启用，隐藏退出入口。
+    $('logout').hidden = state.authEnabled === false
     const storedView = localStorage.getItem(VIEW_KEY)
     // 首屏 applyView 早于本接口返回；若上次停留在 Super Agent，这里补一次恢复。
     if (saEnabled && storedView === 'superagent' && currentView !== 'superagent') applyView('superagent')
@@ -5921,6 +5935,15 @@ async function openSettings() {
   $('settings').showModal()
 }
 $('open-settings').addEventListener('click', openSettings)
+// 退出登录：清掉服务端会话后回到登录页（网络失败也直接跳转）
+$('logout').addEventListener('click', async () => {
+  try {
+    await api('/sv/api/auth/logout', { method: 'POST', body: {} })
+  } catch (error) {
+    // 会话已失效时无需额外处理
+  }
+  location.replace('/sv/login')
+})
 $('file-preview-close').addEventListener('click', () => $('file-preview').close())
 $('file-preview').addEventListener('click', (event) => {
   if (event.target === $('file-preview')) $('file-preview').close()

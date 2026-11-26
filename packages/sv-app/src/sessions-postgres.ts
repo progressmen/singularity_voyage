@@ -9,6 +9,7 @@
  * 单条会话记录超过上限时删除最旧条目。
  */
 import pg from 'pg'
+import { applySchema } from './pg-schema.ts'
 import { countOccurrences, normalizeUsage, searchSnippet, UNTITLED } from './sessions-store.ts'
 import type {
   SessionBackup,
@@ -68,37 +69,12 @@ export class PgSessionStore implements SvSessionStore {
 
   private schema(): Promise<void> {
     if (this.schemaReady === undefined) {
-      this.schemaReady = this.ensureSchema().catch((error: unknown) => {
+      this.schemaReady = applySchema(this.pool).catch((error: unknown) => {
         this.schemaReady = undefined
         throw error
       })
     }
     return this.schemaReady
-  }
-
-  private async ensureSchema(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS sv_sessions (
-        id text PRIMARY KEY,
-        title text NOT NULL,
-        created_at bigint NOT NULL,
-        updated_at bigint NOT NULL,
-        turns integer NOT NULL DEFAULT 0,
-        usage jsonb
-      );
-      ALTER TABLE sv_sessions ADD COLUMN IF NOT EXISTS usage jsonb;
-      CREATE TABLE IF NOT EXISTS sv_messages (
-        id bigserial PRIMARY KEY,
-        session_id text NOT NULL REFERENCES sv_sessions(id) ON DELETE CASCADE,
-        ts bigint NOT NULL,
-        role text NOT NULL,
-        body text NOT NULL,
-        reasoning text,
-        tools jsonb
-      );
-      CREATE INDEX IF NOT EXISTS sv_messages_session_idx
-        ON sv_messages (session_id, ts, id);
-    `)
   }
 
   async load(): Promise<void> {

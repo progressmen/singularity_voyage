@@ -20,6 +20,7 @@ import type {} from '@deepseek-ai/dsh-schedule'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { ApprovalCenter, type HostApprovalRequest } from './approval-center.ts'
+import { AuthStore } from './auth.ts'
 import { ApprovalStore } from './approval-store.ts'
 import { ConnectorService } from './connector-runtime.ts'
 import { ConnectorStore } from './connector-store.ts'
@@ -234,6 +235,24 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     ctx.logger.warn(svLog('index', 'session_index_load_failed', { err: svError(error) }))
   }
   ctx.logger.info(svLog('index', 'session_store_ready', { backend: databaseUrl.length > 0 ? 'postgres' : 'file' }))
+
+  // 账号与登录态同样落在 PostgreSQL；未配置数据库时跳过登录校验（页面隐藏退出入口）。
+  const auth = databaseUrl.length > 0 ? new AuthStore(databaseUrl) : undefined
+  if (auth === undefined) {
+    ctx.logger.warn(svLog('index', 'auth_disabled', { reason: 'SV_DATABASE_URL 未配置' }))
+  } else {
+    ctx.effect(() => () => {
+      void auth.close()
+    })
+    try {
+      await auth.load()
+      ctx.logger.info(svLog('index', 'auth_store_ready'))
+    } catch (error) {
+      // 数据库暂不可用时保留登录校验，下一次登录请求会重试建表。
+      ctx.logger.warn(svLog('index', 'auth_store_load_failed', { err: svError(error) }))
+      ctx.logger.debug(svLog('index', 'auth_store_load_failed_trace', { stack: svErrorTrace(error) }))
+    }
+  }
 
   const memory = new MemoryStore()
   try {
@@ -644,6 +663,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
       connectors: connectorService,
       connectorStore: connectors,
     },
+    auth,
   )
   ctx.logger.info(svLog('index', 'surface_ready', { path: '/sv/' }))
 }
