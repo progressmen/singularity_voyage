@@ -1577,6 +1577,68 @@ dialog.confirm::backdrop { background: rgba(0, 0, 0, 0.55); }
 .automation-run-failed { color: var(--danger); border-color: rgba(255, 107, 107, 0.35); }
 .automation-source { word-break: break-all; }
 
+/* ── 技能管理 ─────────────────────────────────────────── */
+.skill-toolbar { display: flex; gap: 8px; align-items: center; }
+.skill-toolbar .memory-search { flex: 1; width: auto; margin-left: 0; min-width: 0; }
+.skill-filter {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 7px 9px;
+  outline: none;
+  flex: none;
+}
+.skill-filter:focus { border-color: var(--accent); }
+.skill-item.skill-off .skill-name { color: var(--text-dim); }
+.skill-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.skill-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  word-break: break-all;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.skill-status,
+.skill-readonly,
+.skill-source {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.skill-status-enabled { color: var(--ok); border-color: rgba(63, 185, 128, 0.4); }
+.skill-status-model,
+.skill-status-user { color: var(--accent); border-color: rgba(79, 140, 255, 0.4); }
+.skill-source { border-style: dashed; }
+.skill-desc { font-size: 12.5px; line-height: 1.6; color: var(--text); word-break: break-word; }
+.skill-when { font-size: 12px; line-height: 1.55; color: var(--text-dim); word-break: break-word; }
+.skill-path {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.75;
+  word-break: break-all;
+}
+.skill-controls { display: flex; align-items: center; gap: 6px; flex: none; padding-top: 2px; }
+.skill-remove { opacity: 0; transition: opacity 0.12s; }
+.skill-item:hover .skill-remove { opacity: 1; }
+.skill-form textarea {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  outline: none;
+  resize: vertical;
+}
+.skill-form textarea:focus { border-color: var(--accent); }
+
 /* ── 数据与备份 ───────────────────────────────────────── */
 .data-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
 .data-stat {

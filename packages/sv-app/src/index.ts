@@ -30,7 +30,8 @@ import { AutomationService } from './automation-runtime.ts'
 import { AutomationStore } from './automation-store.ts'
 import { ChatManager } from './chat.ts'
 import { ConfigStore, defaultTtsConfig, inferLlmProvider, type SvBriefingConfig, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
-import { registerSvRoutes, type SvSkillView, type SvToolView } from './http.ts'
+import { registerSvRoutes, type SvToolView } from './http.ts'
+import { SkillManager } from './skill-manager.ts'
 import { InboxStore, INBOX_KIND_LABELS } from './inbox-store.ts'
 import { KnowledgeStore } from './knowledge-store.ts'
 import { fetchUrlPage } from './knowledge-source.ts'
@@ -51,20 +52,6 @@ import { TasksStore, formatTaskTime } from './tasks-store.ts'
 import { normalizeTtsUrl, type SvTtsConfig } from './tts.ts'
 import { UsageStore } from './usage-store.ts'
 import { registerAutomationTools, registerDesktopGuard, registerImageTools, registerInboxTools, registerKnowledgeTools, registerMemoryTools, registerTaskTools } from './tools.ts'
-
-/** 技能注册表的最小结构；不把 sv-app 绑死到具体 skill 包的版本。 */
-interface SkillSummaryLike {
-  readonly name: string
-  readonly description: string
-  readonly whenToUse?: string
-  readonly source?: string
-  readonly path?: string
-  readonly invocation?: { readonly userInvocable?: boolean }
-}
-
-interface SkillRegistryLike {
-  list(options?: { cwd?: string }): Promise<readonly SkillSummaryLike[]>
-}
 
 /** Cordis loader 显示的插件名。 */
 export const name = '@singularity-voyage/sv-app'
@@ -617,27 +604,8 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     history: runStore.list().length,
   }))
 
-  // / 斜杠菜单只展示用户可调用的技能；模型可调用但用户禁用的不出现。
-  const listSkills = async (): Promise<SvSkillView[]> => {
-    const registry = ctx.get('skills') as SkillRegistryLike | undefined
-    if (registry === undefined) return []
-    try {
-      const skills = await registry.list({ cwd: process.cwd() })
-      return skills
-        .filter(skill => skill.invocation?.userInvocable === true)
-        .map(skill => ({
-          name: skill.name,
-          description: skill.description,
-          ...skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse },
-          ...skill.source === undefined ? {} : { source: String(skill.source) },
-          ...skill.path === undefined ? {} : { path: skill.path },
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name))
-    } catch (error) {
-      ctx.logger.warn(svLog('index', 'skills_list_failed', { err: svError(error) }))
-      return []
-    }
-  }
+  // 技能管理：列表 / 新建 / 启停 / 删除，数据来自宿主技能注册表。
+  const skillManager = new SkillManager(ctx, process.cwd())
 
   // / 斜杠菜单的工具列表：直接取当前可见工具，包含 computer-use / MCP / 内置工具。
   const listTools = async (): Promise<SvToolView[]> => {
@@ -662,7 +630,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     mailer,
     briefing,
     ctx.schedule,
-    listSkills,
+    skillManager,
     listTools,
     superAgent,
     {

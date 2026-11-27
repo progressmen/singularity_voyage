@@ -54,19 +54,10 @@ import type { MailNotifier } from './mail-notifier.ts'
 import type { ReminderService, SvReminderEvent } from './reminders.ts'
 import { SV_SEARCH_PROVIDER_ID } from './search-provider.ts'
 import type { SvSessionStore } from './sessions-store.ts'
+import type { SkillManager, SvSkillView } from './skill-manager.ts'
 import type { SuperAgentEvent, SuperAgentSurface } from './superagent.ts'
 import { TASK_RECURRENCES, taskView, type TaskRecurrence, type TaskStatus, type TasksStore } from './tasks-store.ts'
 import { MAX_TTS_TEXT, normalizeTtsUrl, synthesizeSpeech } from './tts.ts'
-
-/** `/sv/api/skills` 返回的技能条目（只暴露斜杠菜单需要的元信息）。 */
-export interface SvSkillView {
-  name: string
-  description: string
-  whenToUse?: string
-  source?: string
-  /** 技能指令文件的绝对路径。 */
-  path?: string
-}
 
 /** `/sv/api/tools` 返回的工具条目。 */
 export interface SvToolView {
@@ -352,7 +343,7 @@ export function registerSvRoutes(
   mailer: MailNotifier,
   briefing: BriefingService,
   schedule: Context['schedule'],
-  listSkills: () => Promise<SvSkillView[]>,
+  skills: SkillManager,
   listTools: () => Promise<SvToolView[]>,
   superAgent?: SuperAgentSurface,
   dataHooks?: {
@@ -495,12 +486,56 @@ export function registerSvRoutes(
       return
     }
 
-    // GET /sv/api/skills —— 可供 / 斜杠菜单选择的用户可调用技能
+    // GET /sv/api/skills —— 技能管理页与 / 斜杠菜单共用的技能目录
     if (req.method === 'GET' && path === '/sv/api/skills') {
       try {
-        sendJson(res, 200, { skills: await listSkills() })
+        sendJson(res, 200, { skills: await skills.list() })
       } catch (error) {
         sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // POST /sv/api/skills —— 新建项目技能（.dsh/skills/<name>/SKILL.md）
+    if (req.method === 'POST' && path === '/sv/api/skills') {
+      try {
+        const body = await readJson(req)
+        const skill = await skills.create({
+          name: typeof body.name === 'string' ? body.name : '',
+          description: typeof body.description === 'string' ? body.description : '',
+          ...(typeof body.whenToUse === 'string' ? { whenToUse: body.whenToUse } : {}),
+          content: typeof body.content === 'string' ? body.content : '',
+        })
+        sendJson(res, 200, { skill })
+      } catch (error) {
+        sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    const skillMatch = /^\/sv\/api\/skills\/([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(path)
+    // PATCH /sv/api/skills/:name —— 启用 / 停用（改写 SKILL.md frontmatter）
+    if (req.method === 'PATCH' && skillMatch !== null) {
+      try {
+        const body = await readJson(req)
+        if (typeof body.enabled !== 'boolean') throw new Error('enabled 必须是布尔值')
+        const skill = await skills.setEnabled(skillMatch[1]!, body.enabled)
+        sendJson(res, 200, { skill })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        sendJson(res, message.includes('不存在') ? 404 : 400, { error: message })
+      }
+      return
+    }
+
+    // DELETE /sv/api/skills/:name —— 删除本地技能（内置 / 插件技能只读）
+    if (req.method === 'DELETE' && skillMatch !== null) {
+      try {
+        await skills.remove(skillMatch[1]!)
+        sendJson(res, 200, { removed: true })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        sendJson(res, message.includes('不存在') ? 404 : 400, { error: message })
       }
       return
     }

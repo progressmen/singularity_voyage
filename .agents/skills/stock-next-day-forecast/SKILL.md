@@ -1,6 +1,8 @@
 ---
 name: stock-next-day-forecast
 description: 预测 A 股个股下一个交易日的涨跌概率与结论可靠性，综合近一年/近一周/今日走势、产业消息面与突发风险，输出核心理由、情景与关键价位。用户问「某只股票明天怎么走」「次日涨跌概率」「现在能不能买」时使用。
+disable-model-invocation: true
+user-invocable: false
 ---
 
 # 个股次日走势预测

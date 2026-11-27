@@ -69,15 +69,15 @@ let attachmentsSupported = false
 /* ── 视图切换（对话 / 收件箱 / 知识 / 待办 / 定时任务 / 自动化 / 记忆 / 数据 / 日志） ───── */
 const VIEW_KEY = 'sv.view.v1'
 let currentView = localStorage.getItem(VIEW_KEY) ?? 'chat'
-if (!['chat', 'superagent', 'inbox', 'approvals', 'knowledge', 'tasks', 'schedules', 'automations', 'connectors', 'memory', 'data', 'logs'].includes(currentView)) currentView = 'chat'
+if (!['chat', 'superagent', 'inbox', 'approvals', 'knowledge', 'skills', 'tasks', 'schedules', 'automations', 'connectors', 'memory', 'data', 'logs'].includes(currentView)) currentView = 'chat'
 
 /** 「更多」分组：不常用入口折叠，活跃项在组内时自动展开。 */
 const NAV_MORE_KEY = 'sv.nav.more'
-const MORE_VIEWS = new Set(['superagent', 'schedules', 'automations', 'connectors', 'memory', 'data', 'logs'])
+const MORE_VIEWS = new Set(['superagent', 'schedules', 'automations', 'skills', 'connectors', 'memory', 'data', 'logs'])
 let navMoreExpanded = localStorage.getItem(NAV_MORE_KEY) === '1'
 
 /** 非对话视图的顶栏标题。 */
-const VIEW_TITLES = { superagent: 'Super Agent', inbox: '收件箱', approvals: '审批中心', knowledge: '个人知识', tasks: '待办与提醒', schedules: '定时任务', automations: '自动化', connectors: '连接器', memory: '长期记忆', data: '数据与备份', logs: '运行日志' }
+const VIEW_TITLES = { superagent: 'Super Agent', inbox: '收件箱', approvals: '审批中心', knowledge: '个人知识', skills: '技能', tasks: '待办与提醒', schedules: '定时任务', automations: '自动化', connectors: '连接器', memory: '长期记忆', data: '数据与备份', logs: '运行日志' }
 
 /** 待办、定时任务与记忆数据缓存。 */
 let tasksCache = []
@@ -150,6 +150,7 @@ function applyView(view) {
   $('panel-inbox').hidden = view !== 'inbox'
   $('panel-approvals').hidden = view !== 'approvals'
   $('panel-knowledge').hidden = view !== 'knowledge'
+  $('panel-skills').hidden = view !== 'skills'
   $('panel-tasks').hidden = view !== 'tasks'
   $('panel-schedules').hidden = view !== 'schedules'
   $('panel-automations').hidden = view !== 'automations'
@@ -164,6 +165,7 @@ function applyView(view) {
   if (view === 'inbox') void loadInbox()
   if (view === 'approvals') void loadApprovals()
   if (view === 'knowledge') void loadKnowledge()
+  if (view === 'skills') void loadSkills()
   if (view === 'tasks') void loadTasks()
   if (view === 'schedules') void loadSchedules()
   if (view === 'automations') void loadAutomations()
@@ -3378,6 +3380,8 @@ async function loadSlashData() {
 function slashCandidates(query) {
   const q = query.toLowerCase()
   const skills = (slashData?.skills ?? [])
+    // 禁止用户调用的技能不出现在 / 菜单（停用会同时禁止模型与用户调用）
+    .filter(skill => skill.userInvocable !== false)
     .filter(skill => q.length === 0
       || skill.name.toLowerCase().includes(q)
       || String(skill.description ?? '').toLowerCase().includes(q)
@@ -5323,6 +5327,258 @@ async function submitTask(event) {
   await loadTasks()
 }
 
+/* ── 技能（Skill）管理 ─────────────────────────────────── */
+
+let skillsCache = []
+let skillsQuery = ''
+let skillsFilter = 'all'
+let skillsResultTimer = null
+
+/** 技能状态：模型与用户两个入口均可 / 均不可 / 仅其一。 */
+function skillStatus(skill) {
+  if (skill.modelInvocable === true && skill.userInvocable === true) return 'enabled'
+  if (skill.modelInvocable !== true && skill.userInvocable !== true) return 'disabled'
+  return skill.modelInvocable === true ? 'model' : 'user'
+}
+
+const SKILL_STATUS_LABELS = {
+  enabled: '已启用',
+  disabled: '已停用',
+  model: '仅模型调用',
+  user: '仅 / 菜单调用',
+}
+
+function setSkillsResult(text, ok) {
+  const result = $('skills-result')
+  result.textContent = text
+  result.className = 'test-result' + (ok === true ? ' ok' : ok === false ? ' err' : '')
+  clearTimeout(skillsResultTimer)
+  if (text.length > 0) {
+    skillsResultTimer = setTimeout(() => {
+      result.textContent = ''
+      result.className = 'test-result'
+    }, 4000)
+  }
+}
+
+async function loadSkills() {
+  try {
+    const data = await api('/sv/api/skills')
+    skillsCache = Array.isArray(data.skills) ? data.skills : []
+    renderSkills()
+  } catch (error) {
+    const list = $('skills-list')
+    list.innerHTML = ''
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = `加载失败：${error?.message ?? error}`
+    list.appendChild(empty)
+  }
+}
+
+/** 按搜索词与状态筛选。 */
+function skillMatches(skill) {
+  const status = skillStatus(skill)
+  if (skillsFilter === 'enabled' && status === 'disabled') return false
+  if (skillsFilter === 'disabled' && status !== 'disabled') return false
+  if (skillsFilter === 'readonly' && skill.editable === true) return false
+  const q = skillsQuery.trim().toLowerCase()
+  if (q.length === 0) return true
+  return [skill.name, skill.description, skill.whenToUse, skill.path, skill.sourceLabel, skill.provider]
+    .some(value => String(value ?? '').toLowerCase().includes(q))
+}
+
+function renderSkills() {
+  const list = $('skills-list')
+  list.innerHTML = ''
+  const enabled = skillsCache.filter(skill => skillStatus(skill) !== 'disabled').length
+  $('skills-count').textContent = `${enabled}/${skillsCache.length}`
+  if (skillsCache.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = '还没有发现技能。可以点右上角「新建技能」，或把技能目录放到 .dsh/skills / .agents/skills。'
+    list.appendChild(empty)
+    return
+  }
+  const visible = skillsCache.filter(skillMatches)
+  if (visible.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'panel-empty'
+    empty.textContent = '没有匹配的技能。'
+    list.appendChild(empty)
+    return
+  }
+  for (const skill of visible) list.appendChild(skillNode(skill))
+}
+
+function skillNode(skill) {
+  const status = skillStatus(skill)
+  const el = document.createElement('div')
+  el.className = 'task-item skill-item'
+  if (status === 'disabled') el.classList.add('skill-off')
+
+  const main = document.createElement('div')
+  main.className = 'task-main'
+  const head = document.createElement('div')
+  head.className = 'skill-head'
+  const name = document.createElement('div')
+  name.className = 'skill-name'
+  name.textContent = `/${skill.name}`
+  const badge = document.createElement('span')
+  badge.className = `skill-status skill-status-${status}`
+  badge.textContent = SKILL_STATUS_LABELS[status] ?? status
+  head.append(name, badge)
+  if (skill.editable !== true) {
+    const readonly = document.createElement('span')
+    readonly.className = 'skill-readonly'
+    readonly.textContent = '只读'
+    head.appendChild(readonly)
+  }
+  const source = document.createElement('span')
+  source.className = 'skill-source'
+  source.textContent = skill.sourceLabel ?? skill.source ?? ''
+  head.appendChild(source)
+  main.appendChild(head)
+
+  const desc = document.createElement('div')
+  desc.className = 'skill-desc'
+  desc.textContent = skill.description
+  main.appendChild(desc)
+  if (typeof skill.whenToUse === 'string' && skill.whenToUse.length > 0) {
+    const when = document.createElement('div')
+    when.className = 'skill-when'
+    when.textContent = `何时使用：${skill.whenToUse}`
+    main.appendChild(when)
+  }
+  const meta = document.createElement('div')
+  meta.className = 'task-meta'
+  if (skill.provider) {
+    const provider = document.createElement('span')
+    provider.textContent = skill.provider
+    meta.appendChild(provider)
+  }
+  if (typeof skill.path === 'string' && skill.path.length > 0) {
+    const path = document.createElement('span')
+    path.className = 'skill-path'
+    path.title = skill.path
+    path.textContent = skill.path
+    meta.appendChild(path)
+  }
+  main.appendChild(meta)
+  el.appendChild(main)
+
+  const controls = document.createElement('div')
+  controls.className = 'skill-controls'
+  const toggle = document.createElement('label')
+  toggle.className = 'switch'
+  toggle.title = skill.editable === true
+    ? (status === 'disabled' ? '启用此技能' : '停用此技能')
+    : '内置 / 插件技能只读'
+  const checkbox = document.createElement('input')
+  checkbox.type = 'checkbox'
+  checkbox.checked = status !== 'disabled'
+  checkbox.disabled = skill.editable !== true
+  checkbox.setAttribute('aria-label', `${status === 'disabled' ? '启用' : '停用'} ${skill.name}`)
+  const track = document.createElement('span')
+  track.className = 'switch-track'
+  track.setAttribute('aria-hidden', 'true')
+  toggle.append(checkbox, track)
+  checkbox.addEventListener('change', () => void toggleSkill(skill, checkbox.checked, checkbox))
+  controls.appendChild(toggle)
+  if (skill.editable === true) {
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.className = 'panel-act danger skill-remove'
+    remove.title = '删除技能'
+    remove.textContent = '✕'
+    remove.addEventListener('click', () => void deleteSkill(skill))
+    controls.appendChild(remove)
+  }
+  el.appendChild(controls)
+  return el
+}
+
+/** 启用 / 停用技能：写回 SKILL.md frontmatter，两个入口同时生效。 */
+async function toggleSkill(skill, enabled, checkbox) {
+  checkbox.disabled = true
+  setSkillsResult(`${enabled ? '正在启用' : '正在停用'}「${skill.name}」…`)
+  try {
+    const data = await api(`/sv/api/skills/${encodeURIComponent(skill.name)}`, {
+      method: 'PATCH',
+      body: { enabled },
+    })
+    if (data.skill) Object.assign(skill, data.skill)
+    slashData = null
+    setSkillsResult(`已${enabled ? '启用' : '停用'}「${skill.name}」`, true)
+    renderSkills()
+  } catch (error) {
+    checkbox.checked = !enabled
+    checkbox.disabled = false
+    setSkillsResult(`操作失败：${error?.message ?? error}`, false)
+  }
+}
+
+/** 删除本地技能（内置 / 插件技能没有删除入口）。 */
+async function deleteSkill(skill) {
+  const confirmed = await askConfirm({
+    title: '删除技能',
+    text: `将删除「${skill.name}」的本地技能文件（含同目录资源）。删除后模型与 / 菜单都不再提供它，此操作不可恢复。`,
+    okText: '删除',
+  })
+  if (!confirmed) return
+  try {
+    await api(`/sv/api/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
+    skillsCache = skillsCache.filter(candidate => candidate.name !== skill.name)
+    slashData = null
+    renderSkills()
+    setSkillsResult(`已删除「${skill.name}」`, true)
+    // 目录监听可能需要一点时间，稍后再对齐一次注册表
+    window.setTimeout(() => void loadSkills(), 800)
+  } catch (error) {
+    setSkillsResult(`删除失败：${error?.message ?? error}`, false)
+  }
+}
+
+function openSkillDialog() {
+  const form = $('skill-form')
+  form.reset()
+  $('skill-error').textContent = ''
+  $('skill-dialog').showModal()
+  $('skill-name').focus()
+}
+
+async function submitSkill(event) {
+  event.preventDefault()
+  const form = $('skill-form')
+  if (!form.reportValidity()) return
+  const body = {
+    name: $('skill-name').value.trim(),
+    description: $('skill-description').value.trim(),
+    content: $('skill-content').value.trim(),
+  }
+  const whenToUse = $('skill-when').value.trim()
+  if (whenToUse.length > 0) body.whenToUse = whenToUse
+  $('skill-submit').disabled = true
+  $('skill-error').textContent = ''
+  try {
+    const data = await api('/sv/api/skills', { method: 'POST', body })
+    const created = data.skill
+    if (created) {
+      skillsCache = [...skillsCache.filter(skill => skill.name !== created.name), created]
+        .sort((left, right) => left.name.localeCompare(right.name))
+    }
+    slashData = null
+    $('skill-dialog').close()
+    renderSkills()
+    setSkillsResult(`已创建「${body.name}」`, true)
+    window.setTimeout(() => void loadSkills(), 800)
+  } catch (error) {
+    $('skill-error').textContent = error?.message ?? String(error)
+  } finally {
+    $('skill-submit').disabled = false
+  }
+}
+
 /* ── 定时任务（harness schedule） ───────────────────────── */
 
 /** 规则种类 → 中文标签。 */
@@ -5966,6 +6222,22 @@ $('knowledge-search').addEventListener('keydown', (event) => {
 $('knowledge-search-clear').addEventListener('click', clearKnowledgeSearch)
 $('knowledge-detail-close').addEventListener('click', closeKnowledgeDetail)
 $('schedule-refresh').addEventListener('click', () => void loadSchedules())
+$('skills-refresh').addEventListener('click', () => void loadSkills())
+$('skills-search').addEventListener('input', () => {
+  skillsQuery = $('skills-search').value
+  renderSkills()
+})
+$('skills-filter').addEventListener('change', () => {
+  skillsFilter = $('skills-filter').value
+  renderSkills()
+})
+$('skill-create-open').addEventListener('click', openSkillDialog)
+$('skill-cancel').addEventListener('click', () => $('skill-dialog').close())
+$('skill-form').addEventListener('submit', submitSkill)
+// 点击弹窗外关闭新建技能
+$('skill-dialog').addEventListener('click', (event) => {
+  if (event.target === $('skill-dialog')) $('skill-dialog').close()
+})
 $('automation-refresh').addEventListener('click', () => void loadAutomations())
 $('automation-form').addEventListener('submit', submitAutomation)
 $('automation-cancel-edit').addEventListener('click', () => {
