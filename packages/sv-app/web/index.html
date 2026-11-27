@@ -921,6 +921,37 @@
         <p class="schedule-hint">简报汇总今日待办、昨日对话与未读收件箱；模型不可用时自动回落到模板。</p>
       </section>
 
+      <section class="settings-section">
+        <h3>语音朗读（千问 TTS）</h3>
+        <label class="field">
+          <span>API Key</span>
+          <input id="cfg-tts-key" type="password" placeholder="留空表示不修改" spellcheck="false" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>服务地址（WebSocket）</span>
+          <input id="cfg-tts-base" placeholder="wss://cn-beijing.maas.qianwenaiapi.com/api-ws/v1/inference" spellcheck="false">
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>模型</span>
+            <input id="cfg-tts-model" placeholder="qwen-audio-3.1-tts-flash" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>音色</span>
+            <input id="cfg-tts-voice" placeholder="longanhuan_v3.1" spellcheck="false">
+          </label>
+          <label class="field field-narrow">
+            <span>语速</span>
+            <input id="cfg-tts-rate" type="number" min="0.5" max="2" step="0.1" placeholder="1.0">
+          </label>
+        </div>
+        <div class="section-actions">
+          <button type="button" class="btn btn-ghost" id="test-tts">试听</button>
+          <span class="test-result" id="test-tts-result"></span>
+        </div>
+        <p class="schedule-hint">回答里的朗读按钮使用该在线音色；未配置 API Key 时回落到浏览器自带语音。</p>
+      </section>
+
       <div class="settings-actions">
         <span class="settings-error" id="settings-error"></span>
         <button type="button" class="btn btn-ghost" id="settings-cancel">取消</button>

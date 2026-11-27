@@ -52,8 +52,10 @@ const LLM_PRESETS = {
 let conversations = loadConversations()
 let activeId = localStorage.getItem(ACTIVE_KEY) ?? null
 let streaming = false
-/** 当前正在朗读的回答：{ key, utterance }；用于跨重绘恢复按钮状态。 */
+/** 当前正在朗读的回答：{ key, utterance } / { key, audio, controller }；用于跨重绘恢复按钮状态。 */
 let speechState = null
+/** 是否已配置千问在线语音合成（来自 /sv/api/state 的 tts.hasApiKey）。 */
+let ttsHasApiKey = false
 
 /** 图片消息限制（与后端 /sv/api/chat 的校验保持一致）。 */
 const MAX_IMAGES = 4
@@ -1199,7 +1201,7 @@ function answerActions(text) {
   share.addEventListener('click', () => void shareAnswer(text, share))
   bar.appendChild(share)
 
-  if ('speechSynthesis' in window) {
+  if ('speechSynthesis' in window || ttsHasApiKey) {
     const speak = document.createElement('button')
     speak.type = 'button'
     speak.className = 'icon-btn msg-speak'
@@ -1332,26 +1334,103 @@ function syncSpeechButtons() {
   document.querySelectorAll('.msg-speak').forEach(button => applySpeechButtonState(button))
 }
 
-/** 朗读/停止一条回答；同一时间只播放一条。 */
-function toggleSpeech(text) {
-  if (!('speechSynthesis' in window)) {
-    alert('当前浏览器不支持语音朗读')
-    return
+/** 极短静音 WAV：用户点击后先播一次，避免 Safari 拦截后续异步播放。 */
+const SILENT_AUDIO = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+/** 单块朗读文本上限：分块合成能更快开始播放，中途停止也只影响当前块。 */
+const TTS_CHUNK_MAX = 600
+
+/** 按句子边界把长文本切成若干块（每块不超过 max 字）。 */
+function ttsChunks(text, max = TTS_CHUNK_MAX) {
+  const chunks = []
+  let buffer = ''
+  const flush = () => {
+    const value = buffer.trim()
+    if (value.length > 0) chunks.push(value)
+    buffer = ''
   }
-  const key = speechKey(text)
-  if (speechState !== null && speechState.key === key) {
-    speechState = null
-    window.speechSynthesis.cancel()
-    syncSpeechButtons()
-    return
+  for (const char of text) {
+    buffer += char
+    if ('。！？!?；;\n'.includes(char) && buffer.trim().length >= 150) flush()
+    else if (buffer.length >= max) flush()
   }
-  const plain = speechText(text)
-  if (plain.length === 0) {
-    alert('这条回答没有可朗读的文字')
-    return
+  flush()
+  return chunks
+}
+
+/** 请求一段在线语音合成，返回音频 Blob。config 缺省时用服务端已保存的配置。 */
+async function requestTtsAudio(text, config, signal) {
+  const res = await fetch('/sv/api/tts', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(config === undefined ? { text } : { text, tts: config }),
+    ...(signal === undefined ? {} : { signal }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error ?? `HTTP ${res.status}`)
   }
-  window.speechSynthesis.cancel()
+  return res.blob()
+}
+
+/** 停止当前朗读（浏览器语音与在线音频都处理）。 */
+function stopSpeech() {
+  const current = speechState
   speechState = null
+  if (current !== null) {
+    current.controller?.abort()
+    current.audio?.pause()
+    if (current.utterance !== undefined && 'speechSynthesis' in window) window.speechSynthesis.cancel()
+  }
+  syncSpeechButtons()
+}
+
+/** 在线 TTS：逐块合成、顺序播放；再次点击按钮会中止。 */
+async function playRemoteSpeech(key, plain) {
+  const controller = new AbortController()
+  const audio = new Audio()
+  // 用户点击的同一个手势里先播静音，后续异步拿到音频后仍可继续播放
+  audio.src = SILENT_AUDIO
+  audio.play().catch(() => {})
+  speechState = { key, audio, controller }
+  syncSpeechButtons()
+  try {
+    for (const chunk of ttsChunks(plain)) {
+      if (speechState === null || speechState.key !== key) return
+      const blob = await requestTtsAudio(chunk, undefined, controller.signal)
+      if (speechState === null || speechState.key !== key) return
+      const url = URL.createObjectURL(blob)
+      try {
+        await new Promise((resolve, reject) => {
+          audio.onended = () => resolve()
+          audio.onerror = () => reject(new Error('音频播放失败'))
+          audio.src = url
+          audio.play().catch(reject)
+        })
+      } finally {
+        audio.onended = null
+        audio.onerror = null
+        URL.revokeObjectURL(url)
+      }
+    }
+  } catch (error) {
+    if (error?.name === 'AbortError') return
+    alert(`语音合成失败：${error?.message ?? error}`)
+  } finally {
+    if (speechState !== null && speechState.key === key) {
+      speechState = null
+      audio.pause()
+      syncSpeechButtons()
+    }
+  }
+}
+
+/** 浏览器自带语音（未配置在线 TTS 时的回落）。 */
+function playBrowserSpeech(key, plain) {
+  if (!('speechSynthesis' in window)) {
+    alert('当前浏览器不支持语音朗读，且未配置在线语音合成')
+    return
+  }
   const utterance = new SpeechSynthesisUtterance(plain)
   utterance.lang = /[\u4e00-\u9fff]/.test(plain) ? 'zh-CN' : 'en-US'
   utterance.rate = 1
@@ -1373,6 +1452,26 @@ function toggleSpeech(text) {
   speechState = { key, utterance }
   window.speechSynthesis.speak(utterance)
   syncSpeechButtons()
+}
+
+/** 朗读/停止一条回答；同一时间只播放一条。 */
+function toggleSpeech(text) {
+  const key = speechKey(text)
+  if (speechState !== null && speechState.key === key) {
+    stopSpeech()
+    return
+  }
+  const plain = speechText(text)
+  if (plain.length === 0) {
+    alert('这条回答没有可朗读的文字')
+    return
+  }
+  stopSpeech()
+  if (ttsHasApiKey) {
+    void playRemoteSpeech(key, plain)
+    return
+  }
+  playBrowserSpeech(key, plain)
 }
 
 /**
@@ -2069,6 +2168,8 @@ async function loadState() {
     searchChip.textContent = state.search?.hasApiKey ? `搜索 ${state.search?.provider ?? ''} ✓` : '搜索 ✕'
     searchChip.className = 'chip ' + (state.search?.hasApiKey ? 'on' : 'off')
     renderMailQuick(state.mail)
+    // 在线语音合成是否可用：决定朗读按钮走千问 TTS 还是浏览器语音
+    ttsHasApiKey = state.tts?.hasApiKey === true
     // Super-agent 由服务端开关控制：关闭时隐藏导航项，保持原页面结构。
     const saEnabled = state.superAgent?.enabled === true
     $('tab-superagent').hidden = !saEnabled
@@ -2302,6 +2403,15 @@ function fillSettingsForm(state) {
   $('cfg-brief-time').value = typeof briefing.time === 'string' && briefing.time.length > 0 ? briefing.time : '08:30'
   $('cfg-brief-time').disabled = briefing.enabled !== true
   $('cfg-brief-email').checked = briefing.email === true
+  const tts = state.tts ?? {}
+  ttsHasApiKey = tts.hasApiKey === true
+  $('cfg-tts-key').value = ''
+  $('cfg-tts-key').placeholder = ttsHasApiKey ? '已配置（留空表示不修改）' : '未配置（可选 env: SV_TTS_API_KEY）'
+  $('cfg-tts-base').value = tts.baseURL ?? ''
+  $('cfg-tts-model').value = tts.model ?? ''
+  $('cfg-tts-voice').value = tts.voice ?? ''
+  $('cfg-tts-rate').value = tts.rate ?? 1
+  $('test-tts-result').textContent = ''
   $('brief-run-result').textContent = ''
   $('test-mail-result').textContent = ''
   syncSearchProviderUI()
@@ -2409,6 +2519,13 @@ async function saveSettings() {
     time: $('cfg-brief-time').value.trim() || '08:30',
     email: $('cfg-brief-email').checked,
   }
+  body.tts = {
+    baseURL: $('cfg-tts-base').value.trim(),
+    model: $('cfg-tts-model').value.trim(),
+    voice: $('cfg-tts-voice').value.trim(),
+    rate: Number($('cfg-tts-rate').value || 1),
+  }
+  if ($('cfg-tts-key').value.trim().length > 0) body.tts.apiKey = $('cfg-tts-key').value.trim()
 
   try {
     await api('/sv/api/config', { method: 'POST', body })
@@ -2449,6 +2566,41 @@ async function runTest(target) {
   } catch (error) {
     result.className = 'test-result err'
     result.textContent = error.message ?? String(error)
+  }
+}
+
+/** 设置页表单里的语音合成配置（试听用，不触发保存；密钥留空时用已保存的）。 */
+function currentTtsForm() {
+  const apiKey = $('cfg-tts-key').value.trim()
+  return {
+    baseURL: $('cfg-tts-base').value.trim(),
+    model: $('cfg-tts-model').value.trim(),
+    voice: $('cfg-tts-voice').value.trim(),
+    rate: Number($('cfg-tts-rate').value || 1),
+    ...(apiKey.length > 0 ? { apiKey } : {}),
+  }
+}
+
+/** 设置页试听：用当前表单配置合成一句示例并播放。 */
+async function previewTts() {
+  const result = $('test-tts-result')
+  result.textContent = '合成中…'
+  result.className = 'test-result'
+  const audio = new Audio(SILENT_AUDIO)
+  audio.play().catch(() => {})
+  try {
+    const blob = await requestTtsAudio('你好，这是千问在线语音合成的试听效果。', currentTtsForm())
+    const url = URL.createObjectURL(blob)
+    const cleanup = () => URL.revokeObjectURL(url)
+    audio.onended = cleanup
+    audio.onerror = cleanup
+    audio.src = url
+    await audio.play()
+    result.className = 'test-result ok'
+    result.textContent = '试听播放中'
+  } catch (error) {
+    result.className = 'test-result err'
+    result.textContent = error?.message ?? String(error)
   }
 }
 
@@ -6050,6 +6202,7 @@ $('settings-save').addEventListener('click', saveSettings)
 $('test-llm').addEventListener('click', () => runTest('llm'))
 $('test-search').addEventListener('click', () => runTest('search'))
 $('test-mail').addEventListener('click', () => runTest('mail'))
+$('test-tts').addEventListener('click', () => void previewTts())
 $('fetch-models').addEventListener('click', async () => {
   const result = $('test-llm-result')
   result.textContent = '拉取中…'

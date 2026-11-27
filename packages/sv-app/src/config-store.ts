@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { SUPER_AGENT_DEFAULTS, type SvSuperAgentConfig } from './superagent.ts'
+import { normalizeTtsUrl, type SvTtsConfig } from './tts.ts'
 
 /** LLM 供应商预设 id（决定默认 baseURL 与模型，页面可覆盖）。 */
 export type SvLlmProviderId = 'deepseek' | 'qwen' | 'ark' | 'openai' | 'custom'
@@ -153,6 +154,20 @@ export interface SvUsageConfig {
   monthlyTokenBudget: number
 }
 
+/** 千问在线语音合成（Qwen-Audio-TTS）的默认服务地址。 */
+export const DEFAULT_TTS_BASE_URL = 'wss://cn-beijing.maas.qianwenaiapi.com/api-ws/v1/inference'
+
+/** 语音合成缺省值：服务地址/模型/音色可按部署覆盖，密钥留空表示未配置。 */
+export function defaultTtsConfig(): SvTtsConfig {
+  return {
+    baseURL: DEFAULT_TTS_BASE_URL,
+    model: 'qwen-audio-3.1-tts-flash',
+    voice: 'longanhuan_v3.1',
+    rate: 1,
+    apiKey: '',
+  }
+}
+
 /** 邮件通道配置（SMTP）。 */
 export interface SvMailConfig {  /** 是否启用邮件通道（提醒与摘要都受它控制）。 */
   enabled: boolean
@@ -188,6 +203,8 @@ interface SvStoreShape {
   search: SvSearchConfig
   mail: SvMailConfig
   briefing: SvBriefingConfig
+  /** 语音朗读（千问 TTS）配置。 */
+  tts: SvTtsConfig
   /** 自动化全局设置（暂停 / 静默时段 / 重试）。 */
   automations: SvAutomationConfig
   /** 用量与费用估算配置。 */
@@ -259,6 +276,8 @@ export interface SvPublicState {
     digestAt: string
   }
   briefing: SvBriefingConfig
+  /** 语音朗读（脱敏：不返回密钥明文）。 */
+  tts: { baseURL: string; model: string; voice: string; rate: number; hasApiKey: boolean }
   automations: SvAutomationConfig
   usage: SvUsageConfig
 }
@@ -332,6 +351,7 @@ export class ConfigStore {
     search: SvSearchConfig
     mail?: SvMailConfig
     briefing?: SvBriefingConfig
+    tts?: SvTtsConfig
     automations?: SvAutomationConfig
     usage?: SvUsageConfig
     /** 启动时的 Super-agent 默认值（来自 patch / 环境变量）。 */
@@ -347,6 +367,7 @@ export class ConfigStore {
       search: { ...defaults.search },
       mail: { ...defaultMailConfig(), ...defaults.mail },
       briefing: { ...defaultBriefingConfig(), ...defaults.briefing },
+      tts: { ...defaultTtsConfig(), ...defaults.tts },
       automations: { ...defaultAutomationConfig(), ...defaults.automations },
       usage: { ...defaultUsageConfig(), ...defaults.usage },
     }
@@ -370,6 +391,11 @@ export class ConfigStore {
   /** 每日简报开关、时间与邮件选项。 */
   get briefing(): SvBriefingConfig {
     return this.state.briefing
+  }
+
+  /** 语音朗读（千问 TTS）配置。 */
+  get tts(): SvTtsConfig {
+    return this.state.tts
   }
 
   /** 自动化全局设置（暂停 / 静默时段 / 重试）。 */
@@ -455,6 +481,7 @@ export class ConfigStore {
       search: Partial<SvSearchConfig>
       mail: Partial<SvMailConfig>
       briefing: Partial<SvBriefingConfig>
+      tts: Partial<SvTtsConfig>
       automations: Partial<SvAutomationConfig>
       usage: Partial<SvUsageConfig>
     }>
@@ -572,6 +599,19 @@ export class ConfigStore {
       }
       if (typeof briefing.email === 'boolean') this.state.briefing.email = briefing.email
     }
+    if (typeof record.tts === 'object' && record.tts !== null) {
+      const tts = record.tts
+      if (typeof tts.baseURL === 'string') {
+        const url = normalizeTtsUrl(tts.baseURL)
+        if (url !== undefined) this.state.tts.baseURL = url
+      }
+      if (typeof tts.model === 'string' && tts.model.trim().length > 0) this.state.tts.model = tts.model.trim()
+      if (typeof tts.voice === 'string' && tts.voice.trim().length > 0) this.state.tts.voice = tts.voice.trim()
+      if (typeof tts.rate === 'number' && Number.isFinite(tts.rate) && tts.rate >= 0.5 && tts.rate <= 2) {
+        this.state.tts.rate = tts.rate
+      }
+      if (typeof tts.apiKey === 'string' && tts.apiKey.trim().length > 0) this.state.tts.apiKey = tts.apiKey.trim()
+    }
     if (typeof record.automations === 'object' && record.automations !== null) {
       const automation = record.automations
       if (typeof automation.paused === 'boolean') this.state.automations.paused = automation.paused
@@ -632,6 +672,7 @@ export class ConfigStore {
       digestAt?: unknown
     }
     briefing?: { enabled?: unknown; time?: unknown; email?: unknown }
+    tts?: { baseURL?: unknown; model?: unknown; voice?: unknown; rate?: unknown; apiKey?: unknown }
     automations?: { paused?: unknown; quietStart?: unknown; quietEnd?: unknown; retryAttempts?: unknown }
     usage?: { inputPerMillion?: unknown; outputPerMillion?: unknown; monthlyTokenBudget?: unknown }
   }): Promise<SvPublicState> {
@@ -876,6 +917,36 @@ export class ConfigStore {
         this.state.briefing.email = briefing.email
       }
     }
+    if (patch.tts !== undefined) {
+      const tts = patch.tts
+      if (tts.baseURL !== undefined) {
+        const url = normalizeTtsUrl(String(tts.baseURL ?? ''))
+        if (url === undefined) throw new Error('语音合成服务地址必须是 ws:// 或 wss:// URL')
+        this.state.tts.baseURL = url
+      }
+      if (tts.model !== undefined) {
+        const value = String(tts.model ?? '').trim()
+        if (value.length === 0) throw new Error('语音合成模型不能为空')
+        if (value.length > 200) throw new Error('语音合成模型 id 过长')
+        this.state.tts.model = value
+      }
+      if (tts.voice !== undefined) {
+        const value = String(tts.voice ?? '').trim()
+        if (value.length === 0) throw new Error('音色不能为空')
+        if (value.length > 200) throw new Error('音色 id 过长')
+        this.state.tts.voice = value
+      }
+      if (tts.rate !== undefined) {
+        const value = Number(tts.rate)
+        if (!Number.isFinite(value) || value < 0.5 || value > 2) throw new Error('语速必须是 0.5–2.0 的数字')
+        this.state.tts.rate = value
+      }
+      if (tts.apiKey !== undefined) {
+        const value = String(tts.apiKey ?? '').trim()
+        if (value.length > 4096) throw new Error('API key 过长')
+        this.state.tts.apiKey = value
+      }
+    }
     if (patch.automations !== undefined) {
       const automation = patch.automations
       if (automation.paused !== undefined) {
@@ -955,6 +1026,13 @@ export class ConfigStore {
         digestAt: this.state.mail.digestAt,
       },
       briefing: { ...this.state.briefing },
+      tts: {
+        baseURL: this.state.tts.baseURL,
+        model: this.state.tts.model,
+        voice: this.state.tts.voice,
+        rate: this.state.tts.rate,
+        hasApiKey: this.state.tts.apiKey.length > 0,
+      },
       automations: { ...this.state.automations },
       usage: { ...this.state.usage },
     }

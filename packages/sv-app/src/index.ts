@@ -29,7 +29,7 @@ import { createAutomationPromptRunner } from './automation-agent.ts'
 import { AutomationService } from './automation-runtime.ts'
 import { AutomationStore } from './automation-store.ts'
 import { ChatManager } from './chat.ts'
-import { ConfigStore, inferLlmProvider, type SvBriefingConfig, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
+import { ConfigStore, defaultTtsConfig, inferLlmProvider, type SvBriefingConfig, type SvLlmProviderId, type SvMailConfig } from './config-store.ts'
 import { registerSvRoutes, type SvSkillView, type SvToolView } from './http.ts'
 import { InboxStore, INBOX_KIND_LABELS } from './inbox-store.ts'
 import { KnowledgeStore } from './knowledge-store.ts'
@@ -48,6 +48,7 @@ import { resolveSuperAgentConfig } from './superagent.ts'
 import { createSuperAgentRuntime } from './superagent-runtime.ts'
 import { SuperAgentRunStore } from './superagent-store.ts'
 import { TasksStore, formatTaskTime } from './tasks-store.ts'
+import { normalizeTtsUrl, type SvTtsConfig } from './tts.ts'
 import { UsageStore } from './usage-store.ts'
 import { registerAutomationTools, registerDesktopGuard, registerImageTools, registerInboxTools, registerKnowledgeTools, registerMemoryTools, registerTaskTools } from './tools.ts'
 
@@ -158,6 +159,21 @@ function briefingDefaults(): SvBriefingConfig {
   }
 }
 
+/** 语音合成的部署默认值（页面保存后以 config.json 为准）。 */
+function ttsDefaults(): SvTtsConfig {
+  const base = defaultTtsConfig()
+  const model = (process.env.SV_TTS_MODEL ?? '').trim()
+  const voice = (process.env.SV_TTS_VOICE ?? '').trim()
+  const rate = Number(process.env.SV_TTS_RATE ?? '')
+  return {
+    baseURL: normalizeTtsUrl(process.env.SV_TTS_BASE_URL ?? '') ?? base.baseURL,
+    model: model.length > 0 ? model : base.model,
+    voice: voice.length > 0 ? voice : base.voice,
+    rate: Number.isFinite(rate) && rate >= 0.5 && rate <= 2 ? rate : base.rate,
+    apiKey: process.env.SV_TTS_API_KEY ?? process.env.DASHSCOPE_API_KEY ?? '',
+  }
+}
+
 /** 收件箱条目标题：取文本首行并截断，避免把整段回复塞进列表。 */
 function inboxTitle(prefix: string, text: string): string {
   const line = text.replace(/\s+/g, ' ').trim()
@@ -218,6 +234,7 @@ export async function apply(ctx: Context, config: Partial<Config> = {}): Promise
     },
     mail: mailDefaults(),
     briefing: briefingDefaults(),
+    tts: ttsDefaults(),
     superAgent: superAgentDefaults,
   })
   try {

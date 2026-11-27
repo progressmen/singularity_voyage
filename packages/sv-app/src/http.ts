@@ -56,6 +56,7 @@ import { SV_SEARCH_PROVIDER_ID } from './search-provider.ts'
 import type { SvSessionStore } from './sessions-store.ts'
 import type { SuperAgentEvent, SuperAgentSurface } from './superagent.ts'
 import { TASK_RECURRENCES, taskView, type TaskRecurrence, type TaskStatus, type TasksStore } from './tasks-store.ts'
+import { MAX_TTS_TEXT, normalizeTtsUrl, synthesizeSpeech } from './tts.ts'
 
 /** `/sv/api/skills` 返回的技能条目（只暴露斜杠菜单需要的元信息）。 */
 export interface SvSkillView {
@@ -524,6 +525,53 @@ export function registerSvRoutes(
         sendJson(res, 200, state)
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
+    // POST /sv/api/tts —— 千问在线语音合成（返回 mp3；回答朗读与设置页试听共用）
+    if (req.method === 'POST' && path === '/sv/api/tts') {
+      try {
+        const body = await readJson(req)
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (text.length === 0) throw new Error('待朗读文本不能为空')
+        if (text.length > MAX_TTS_TEXT) throw new Error(`单次朗读文本最多 ${MAX_TTS_TEXT} 字`)
+        const saved = store.tts
+        const raw = body.tts
+        const override = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+          ? raw as Record<string, unknown>
+          : undefined
+        let config = saved
+        if (override !== undefined) {
+          // 设置页试听：用表单里的未保存值；留空的密钥回落到已保存配置
+          const baseURL = typeof override.baseURL === 'string' && override.baseURL.trim().length > 0
+            ? normalizeTtsUrl(override.baseURL)
+            : saved.baseURL
+          if (baseURL === undefined) throw new Error('语音合成服务地址必须是 ws:// 或 wss:// URL')
+          const model = typeof override.model === 'string' && override.model.trim().length > 0
+            ? override.model.trim()
+            : saved.model
+          const voice = typeof override.voice === 'string' && override.voice.trim().length > 0
+            ? override.voice.trim()
+            : saved.voice
+          const rateValue = Number(override.rate)
+          const rate = Number.isFinite(rateValue) && rateValue >= 0.5 && rateValue <= 2 ? rateValue : saved.rate
+          const apiKey = typeof override.apiKey === 'string' && override.apiKey.trim().length > 0
+            ? override.apiKey.trim()
+            : saved.apiKey
+          config = { baseURL, model, voice, rate, apiKey }
+        }
+        const audio = await synthesizeSpeech(config, text)
+        res.writeHead(200, {
+          'content-type': 'audio/mpeg',
+          'content-length': audio.length,
+          'cache-control': 'no-store',
+        })
+        res.end(audio)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (!message.includes('未配置')) ctx.logger.warn(svLog('tts', 'synthesis_failed', { err: svError(error) }))
+        sendJson(res, 400, { error: message })
       }
       return
     }
